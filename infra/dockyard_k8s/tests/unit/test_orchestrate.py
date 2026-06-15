@@ -12,8 +12,8 @@ import pytest
 from omegaconf import OmegaConf
 
 from dockyard_k8s import orchestrate
-from src.dockyard_k8s.config import LoadedConfig
-from src.dockyard_k8s.submitters import SubmissionHandle
+from dockyard_k8s.config import LoadedConfig
+from dockyard_k8s.submitters import SubmissionHandle
 
 
 def _loaded(infra, recipe=None, source_path="examples/configs/grpo_swe.yaml") -> LoadedConfig:
@@ -127,7 +127,7 @@ class _FakeK8s:
 
 class TestSandboxLifecycle:
     def _infra(self, make_infra, **sandbox_over):
-        from src.dockyard_k8s.schema import SandboxSpec
+        from dockyard_k8s.schema import SandboxSpec
 
         sb = SandboxSpec.model_validate({"name": "dockyard-sandbox", **sandbox_over})
         return make_infra(sandbox=sb.model_dump())
@@ -179,7 +179,7 @@ class TestSandboxLifecycle:
 
     # helpers
     def _loaded(self, make_infra):
-        from src.dockyard_k8s.schema import SandboxSpec
+        from dockyard_k8s.schema import SandboxSpec
 
         infra = make_infra(sandbox=SandboxSpec(name="dockyard-sandbox").model_dump())
         return _loaded(infra)

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from src.dockyard_k8s.manifest import (
+from dockyard_k8s.manifest import (
     _MANAGED_BY_LABEL,
     build_pdb,
     build_raycluster_manifest,
@@ -20,7 +20,7 @@ from src.dockyard_k8s.manifest import (
     build_security_contexts,
     sandbox_service_dns,
 )
-from src.dockyard_k8s.schema import (
+from dockyard_k8s.schema import (
     ClusterSpec,
     PDBSpec,
     PodResources,

@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from src.dockyard_k8s.schema import (
+from dockyard_k8s.schema import (
     CheckpointsSpec,
     ClusterSpec,
     CodeSource,

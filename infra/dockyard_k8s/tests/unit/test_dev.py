@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from src.dockyard_k8s.dev import DEFAULT_IMAGE, build_dev_pod_manifest
+from dockyard_k8s.dev import DEFAULT_IMAGE, build_dev_pod_manifest
 
 
 class TestDevPodManifest:

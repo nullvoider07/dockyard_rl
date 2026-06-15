@@ -15,8 +15,8 @@ from click.testing import CliRunner
 from omegaconf import OmegaConf
 
 from dockyard_k8s import cli as cli_mod
-from src.dockyard_k8s.config import LoadedConfig
-from src.dockyard_k8s.schema import InfraConfig
+from dockyard_k8s.config import LoadedConfig
+from dockyard_k8s.schema import InfraConfig
 
 
 @pytest.fixture
@@ -85,7 +85,13 @@ class TestCheck:
         assert set(bundle) == {"infra", "recipe", "manifests"}
         assert bundle["infra"]["namespace"] == "dockyard"
         kinds = [m["kind"] for m in bundle["manifests"]]
-        assert kinds == ["Deployment", "Service", "RayJob"]
+        assert kinds == [
+            "Deployment",
+            "Service",
+            "NetworkPolicy",
+            "PodDisruptionBudget",
+            "RayJob",
+        ]
 
 
 class TestRender:
@@ -95,7 +101,13 @@ class TestRender:
         res = CliRunner().invoke(cli_mod.main, ["render", str(recipe), "--infra", str(infra)])
         assert res.exit_code == 0, res.output
         docs = [d for d in yaml.safe_load_all(res.output) if d]
-        assert [d["kind"] for d in docs] == ["Deployment", "Service", "RayJob"]
+        assert [d["kind"] for d in docs] == [
+            "Deployment",
+            "Service",
+            "NetworkPolicy",
+            "PodDisruptionBudget",
+            "RayJob",
+        ]
 
     def test_render_no_sandbox(self, files, stub_loaded, make_cluster) -> None:
         stub_loaded(_infra(make_cluster, sandbox=None))

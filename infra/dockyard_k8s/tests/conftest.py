@@ -13,7 +13,7 @@ from typing import Any, Callable
 import pytest
 
 from dockyard_k8s import config as config_mod
-from src.dockyard_k8s.schema import ClusterSpec, InfraConfig, SandboxSpec
+from dockyard_k8s.schema import ClusterSpec, InfraConfig, SandboxSpec
 
 
 @pytest.fixture(autouse=True)

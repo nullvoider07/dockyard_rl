@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from src.dockyard_k8s.rayjob import (
+from dockyard_k8s.rayjob import (
     DEFAULT_SUBMISSION_MODE,
     DEFAULT_TTL_SECONDS,
     build_rayjob_manifest,

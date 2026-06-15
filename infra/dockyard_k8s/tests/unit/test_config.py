@@ -12,7 +12,7 @@ import pytest
 from omegaconf import OmegaConf
 
 from dockyard_k8s import config as config_mod
-from src.dockyard_k8s.config import (
+from dockyard_k8s.config import (
     _load_with_inheritance,
     _merge_infra,
     _partition_overrides,

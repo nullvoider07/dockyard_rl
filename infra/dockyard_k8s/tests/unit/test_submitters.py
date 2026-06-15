@@ -4,19 +4,19 @@ from __future__ import annotations
 
 import pytest
 
-from src.dockyard_k8s.submitters import (
+from dockyard_k8s.submitters import (
     SubmissionHandle,
     build_submitter,
     handle_path,
     load_handle,
     save_handle,
 )
-from src.dockyard_k8s.submitters.exec_ import (
+from dockyard_k8s.submitters.exec_ import (
     ExecSubmitter,
     _render_launcher,
     _validate_run_id,
 )
-from src.dockyard_k8s.submitters.portforward import (
+from dockyard_k8s.submitters.portforward import (
     PortForwardSubmitter,
     _prepend_env_exports,
 )

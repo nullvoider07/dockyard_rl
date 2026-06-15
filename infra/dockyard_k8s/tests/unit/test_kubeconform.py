@@ -22,9 +22,9 @@ import pytest
 import yaml
 from omegaconf import OmegaConf
 
-from src.dockyard_k8s.config import LoadedConfig
-from src.dockyard_k8s.render import render_manifests
-from src.dockyard_k8s.schema import InfraConfig
+from dockyard_k8s.config import LoadedConfig
+from dockyard_k8s.render import render_manifests
+from dockyard_k8s.schema import InfraConfig
 
 _KUBECONFORM = shutil.which("kubeconform")
 _REQUIRES_KUBECONFORM = pytest.mark.skipif(

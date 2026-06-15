@@ -15,9 +15,9 @@ from omegaconf import OmegaConf
 from pydantic import ValidationError
 
 from dockyard_k8s import k8s, manifest, orchestrate
-from src.dockyard_k8s.config import LoadedConfig
-from src.dockyard_k8s.render import render_manifests
-from src.dockyard_k8s.schema import DRASpec, InfraConfig
+from dockyard_k8s.config import LoadedConfig
+from dockyard_k8s.render import render_manifests
+from dockyard_k8s.schema import DRASpec, InfraConfig
 
 
 def _worker_with_claims() -> dict:
@@ -104,7 +104,7 @@ class TestManifestBuilders:
 
 class TestRayClusterRewriteGate:
     def test_autocreate_rewrites(self, make_infra) -> None:
-        from src.dockyard_k8s.schema import ClusterSpec
+        from dockyard_k8s.schema import ClusterSpec
 
         infra = make_infra()  # dra.autoCreate defaults True
         rc = manifest.build_raycluster_manifest(
@@ -114,7 +114,7 @@ class TestRayClusterRewriteGate:
         assert claims[0]["resourceClaimTemplateName"] == "compute-domain-dockyard-grpo"
 
     def test_autocreate_off_leaves_untouched(self, make_infra) -> None:
-        from src.dockyard_k8s.schema import ClusterSpec
+        from dockyard_k8s.schema import ClusterSpec
 
         infra = make_infra(dra={"autoCreate": False})
         rc = manifest.build_raycluster_manifest(

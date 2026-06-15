@@ -13,9 +13,9 @@ from pathlib import Path
 import pytest
 from omegaconf import OmegaConf
 
-from src.dockyard_k8s.config import LoadedConfig
-from src.dockyard_k8s.render import render_manifests
-from src.dockyard_k8s.schema import SandboxSpec
+from dockyard_k8s.config import LoadedConfig
+from dockyard_k8s.render import render_manifests
+from dockyard_k8s.schema import SandboxSpec
 
 
 def _loaded(infra) -> LoadedConfig:

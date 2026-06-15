@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from src.dockyard_k8s.workdir import DEFAULT_RAY_UPLOAD_PATHS, stage_workdir
+from dockyard_k8s.workdir import DEFAULT_RAY_UPLOAD_PATHS, stage_workdir
 
 
 def _make_repo(tmp_path: Path) -> Path:

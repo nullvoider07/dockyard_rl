@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from omegaconf import OmegaConf
 
 from dockyard_k8s import inspect as ins
-from src.dockyard_k8s.config import LoadedConfig
+from dockyard_k8s.config import LoadedConfig
 
 
 def _loaded(infra) -> LoadedConfig:
