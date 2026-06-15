@@ -1,0 +1,25 @@
+dockyard_rl
+Copyright 2026 Kartik A (NullVoider)
+
+This product is licensed under the Apache License, Version 2.0 (see the LICENSE
+file).
+
+----------------------------------------------------------------------
+
+Attribution
+
+dockyard_rl was developed with reference to NVIDIA NeMo-RL, a distributed
+reinforcement-learning post-training library by NVIDIA Corporation, licensed
+under the Apache License, Version 2.0.
+
+NeMo-RL was used as a design and implementation reference during the
+development, upgrading, and ongoing evolution of dockyard_rl — including the
+distributed-RL architecture, the GRPO / clipped-policy-gradient formulation,
+and the Ray-based fleet orchestration. dockyard_rl is an independent,
+standalone re-implementation rather than a fork; its lineage traces to NeMo-RL.
+
+I gratefully acknowledge the NeMo-RL authors and NVIDIA Corporation.
+
+  NeMo-RL
+  Copyright NVIDIA Corporation
+  Licensed under the Apache License, Version 2.0

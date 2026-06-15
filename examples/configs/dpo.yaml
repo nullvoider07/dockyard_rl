@@ -1,0 +1,158 @@
+# DPO (Direct Preference Optimization) configuration.
+#
+# Small, single-GPU runnable defaults (Qwen2.5-1.5B on HelpSteer3 preferences).
+# The dtensor_cfg parallelism surface is the same form used at 1B → 10T+ scale;
+# defaults are single-device. Scale by raising tensor/context parallel sizes,
+# num_nodes, and the batch sizes.
+#
+# IMPORTANT: DPO is incompatible with dynamic batching and sequence packing —
+# both reorder samples within a batch and break the chosen/rejected pairing.
+# Both are disabled below and must stay disabled.
+#
+# Usage:
+#   python3 examples/run_dpo.py --config examples/configs/dpo.yaml \
+#     cluster.gpus_per_node=8 policy.model_name=meta-llama/Llama-3.1-8B-Instruct
+
+dpo:
+  max_num_epochs: 1
+  max_num_steps: 1000
+  val_period: 100
+  val_batches: 16
+  val_global_batch_size: 32
+  val_micro_batch_size: 1
+  val_at_start: true
+  val_at_end: true
+  seed: 42
+
+  reference_policy_kl_penalty: 0.1     # DPO β (reward scaling)
+  preference_average_log_probs: false
+  sft_average_log_probs: false
+  preference_loss_weight: 1.0
+  sft_loss_weight: 0.0                 # set >0 for the DPO+SFT blend
+
+  # Preference-loss variant. Default vanilla DPO; the variant hyperparameters
+  # below are identity-valued and only take effect for the matching variant.
+  loss_variant: "dpo"                  # dpo | dpop | cdpo | rdpo | ipo | kto | simpo | orpo
+  # label_smoothing: 0.0               # cDPO ε
+  # dpop_lambda: 0.0                   # DPOP λ
+  # length_penalty: 0.0                # R-DPO α
+  # desirable_weight: 1.0              # KTO λ_D
+  # undesirable_weight: 1.0            # KTO λ_U
+  # simpo_gamma: 0.0                   # SimPO γ (reference-free)
+  # orpo_lambda: 0.0                   # ORPO λ (reference-free)
+
+policy:
+  model_name: "Qwen/Qwen2.5-1.5B-Instruct"
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template: null
+    chat_template_kwargs: null
+  hf_config_overrides: {}
+  train_global_batch_size: 32
+  train_micro_batch_size: 1
+  max_total_sequence_length: 2048
+  precision: "bfloat16"
+  max_grad_norm: 1.0
+  make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
+
+  dtensor_cfg:
+    _v2: true
+    enabled: true
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: false
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    expert_parallel_size: 1
+    dp_replicate_size: 1
+    moe_parallelizer:
+      token_dispatcher: local
+      grouped_gemm: true
+      load_balance_coeff: null
+    custom_parallel_plan: null
+    automodel_kwargs: {}
+    lora_cfg:
+      enabled: false
+      target_modules: []
+      exclude_modules: []
+      match_all_linear: true
+      dim: 8
+      alpha: 32
+      dropout: 0.0
+      dropout_position: "post"
+      lora_A_init: "xavier"
+      use_triton: true
+
+  megatron_cfg:
+    enabled: false
+
+  # Both OFF for DPO (preserve chosen/rejected pairing).
+  dynamic_batching:
+    enabled: false
+  sequence_packing:
+    enabled: false
+
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 5.0e-7
+      weight_decay: 0.0
+      betas: [0.9, 0.999]
+      eps: 1.0e-8
+      foreach: false
+      fused: false
+
+  scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.1
+        end_factor: 1.0
+        total_iters: 20
+    - name: "torch.optim.lr_scheduler.ConstantLR"
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: [20]
+
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  shuffle: true
+  num_workers: 2
+  train:
+    type: "helpsteer3"
+    split: "train"
+  validation:
+    type: "helpsteer3"
+    split: "train"               # HelpSteer3 reserves a validation split internally
+
+logger:
+  log_dir: "logs/dpo"
+  num_val_samples_to_print: 3
+  wandb_enabled: false
+  tensorboard_enabled: true
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: true
+  wandb:
+    project: "dockyard-rl"
+    name: "dpo"
+  tensorboard: {}
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+cluster:
+  gpus_per_node: 1
+  num_nodes: 1
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/dpo"
+  metric_name: "val_accuracy"
+  higher_is_better: true
+  keep_top_k: 3
+  save_period: 100
+  checkpoint_must_save_by: null
+  model_save_format: "safetensors"
+  save_consolidated: false
+  save_optimizer: true

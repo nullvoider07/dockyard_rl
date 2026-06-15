@@ -1,0 +1,140 @@
+# Reward-model (RM) training configuration.
+#
+# Trains a scalar reward model on (chosen, rejected) preference pairs with the
+# Bradley-Terry preference loss. Small, single-GPU runnable defaults
+# (Qwen2.5-1.5B on HelpSteer3). The dtensor_cfg parallelism surface scales
+# unchanged to 1B → 10T+; defaults are single-device.
+#
+# Like DPO, the chosen/rejected pairing must be preserved, so dynamic batching
+# and sequence packing are disabled.
+#
+# Usage:
+#   python3 examples/run_rm.py --config examples/configs/rm.yaml \
+#     cluster.gpus_per_node=8 policy.model_name=meta-llama/Llama-3.1-8B-Instruct
+
+rm:
+  max_num_steps: 1000
+  max_num_epochs: 1
+  val_period: 100
+  val_batches: 16
+  val_global_batch_size: 32
+  val_micro_batch_size: 1
+  val_at_start: true
+  val_at_end: true
+  seed: 42
+
+policy:
+  model_name: "Qwen/Qwen2.5-1.5B-Instruct"
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template: null
+    chat_template_kwargs: null
+  hf_config_overrides: {}
+  train_global_batch_size: 32
+  train_micro_batch_size: 1
+  max_total_sequence_length: 2048
+  precision: "bfloat16"
+  max_grad_norm: 1.0
+  make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
+
+  dtensor_cfg:
+    _v2: true
+    enabled: true
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: false
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    expert_parallel_size: 1
+    dp_replicate_size: 1
+    moe_parallelizer:
+      token_dispatcher: local
+      grouped_gemm: true
+      load_balance_coeff: null
+    custom_parallel_plan: null
+    automodel_kwargs: {}
+    lora_cfg:
+      enabled: false
+      target_modules: []
+      exclude_modules: []
+      match_all_linear: true
+      dim: 8
+      alpha: 32
+      dropout: 0.0
+      dropout_position: "post"
+      lora_A_init: "xavier"
+      use_triton: true
+
+  megatron_cfg:
+    enabled: false
+
+  # Both OFF for RM (preserve chosen/rejected pairing).
+  dynamic_batching:
+    enabled: false
+  sequence_packing:
+    enabled: false
+
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 1.0e-6
+      weight_decay: 0.0
+      betas: [0.9, 0.999]
+      eps: 1.0e-8
+      foreach: false
+      fused: false
+
+  scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.1
+        end_factor: 1.0
+        total_iters: 20
+    - name: "torch.optim.lr_scheduler.ConstantLR"
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: [20]
+
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  shuffle: true
+  num_workers: 2
+  train:
+    type: "helpsteer3"
+    split: "train"
+  validation:
+    type: "helpsteer3"
+    split: "train"               # HelpSteer3 reserves a validation split internally
+
+logger:
+  log_dir: "logs/rm"
+  num_val_samples_to_print: 3
+  wandb_enabled: false
+  tensorboard_enabled: true
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: true
+  wandb:
+    project: "dockyard-rl"
+    name: "rm"
+  tensorboard: {}
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+cluster:
+  gpus_per_node: 1
+  num_nodes: 1
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/rm"
+  metric_name: "val_accuracy"
+  higher_is_better: true
+  keep_top_k: 3
+  save_period: 100
+  checkpoint_must_save_by: null
+  model_save_format: "safetensors"
+  save_consolidated: false
+  save_optimizer: true

@@ -1,0 +1,46 @@
+docker build \
+  --build-arg MAX_JOBS=$(nproc) \
+  --build-arg CONTAINER_ID=dev \
+  --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --build-arg BUILD_ID=local-test \
+  --build-arg BUILD_REF=dev \
+  --build-arg BUILD_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo unknown) \
+  -f ubuntu-swe-v2.dockerfile \
+  -t nullvoider/ubuntu-swe:dev \
+  .
+
+
+# ============================================================
+# docker buildx (run from ubuntu-base/; images are amd64-only)
+# One-time: docker buildx create --use --name dockyard 2>/dev/null || true
+# Swap --load (local image store) for --push to publish to the registry.
+# ============================================================
+
+# vLLM image (default backend) — ubuntu-swe-v2.dockerfile
+docker buildx build \
+  --platform linux/amd64 \
+  --build-arg MAX_JOBS=$(nproc) \
+  --build-arg CONTAINER_ID=dev \
+  --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --build-arg BUILD_ID=local-test \
+  --build-arg BUILD_REF=dev \
+  --build-arg BUILD_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo unknown) \
+  -f ubuntu-swe-v2.dockerfile \
+  -t nullvoider/ubuntu-swe:dev \
+  --load \
+  .
+
+# SGLang image — ubuntu-swe-sglang.dockerfile
+docker buildx build \
+  --platform linux/amd64 \
+  --build-arg MAX_JOBS=$(nproc) \
+  --build-arg CONTAINER_ID=dev \
+  --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --build-arg BUILD_ID=local-test \
+  --build-arg BUILD_REF=dev \
+  --build-arg BUILD_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo unknown) \
+  -f ubuntu-swe-sglang.dockerfile \
+  -t nullvoider/ubuntu-swe-sglang:dev \
+  --load \
+  .
+

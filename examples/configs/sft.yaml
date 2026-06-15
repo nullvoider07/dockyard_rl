@@ -1,0 +1,145 @@
+# SFT (supervised fine-tuning) configuration.
+#
+# Small, single-GPU runnable defaults (Qwen2.5-1.5B on SQuAD). The parallelism
+# surface (dtensor_cfg tensor/context/expert parallel, sequence packing) is the
+# SAME form used at 1B → 10T+ scale; the defaults below are single-device. To
+# scale up, raise tensor_parallel_size / context_parallel_size / num_nodes and
+# the batch sizes — the config shape does not change.
+#
+# Usage:
+#   python3 examples/run_sft.py --config examples/configs/sft.yaml \
+#     cluster.gpus_per_node=8 policy.model_name=meta-llama/Llama-3.1-8B
+
+sft:
+  max_num_steps: 1000
+  max_num_epochs: 1
+  val_period: 100
+  val_batches: 16
+  val_global_batch_size: 32
+  val_micro_batch_size: 1
+  val_at_start: true
+  val_at_end: true
+  seed: 42
+
+policy:
+  model_name: "Qwen/Qwen2.5-1.5B-Instruct"
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template: null
+    chat_template_kwargs: null
+  hf_config_overrides: {}
+  train_global_batch_size: 64
+  train_micro_batch_size: 1
+  max_total_sequence_length: 2048
+  precision: "bfloat16"
+  max_grad_norm: 1.0
+  make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
+
+  dtensor_cfg:
+    _v2: true
+    enabled: true
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: false   # enable at long sequence lengths
+    tensor_parallel_size: 1           # raise to shard one layer across GPUs
+    context_parallel_size: 1          # raise to shard the sequence dimension
+    expert_parallel_size: 1           # MoE: routed-expert shard degree (>1 needs alltoall)
+    dp_replicate_size: 1              # HSDP replicate degree (dp_shard fills the rest)
+    moe_parallelizer:
+      token_dispatcher: local         # 'local' (ep=1) | 'alltoall' (ep>1)
+      grouped_gemm: true
+      load_balance_coeff: null
+    custom_parallel_plan: null
+    automodel_kwargs: {}
+    lora_cfg:
+      enabled: false
+      target_modules: []
+      exclude_modules: []
+      match_all_linear: true
+      dim: 8
+      alpha: 32
+      dropout: 0.0
+      dropout_position: "post"
+      lora_A_init: "xavier"
+      use_triton: true
+
+  megatron_cfg:
+    enabled: false
+
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    sequence_length_round: 64
+
+  sequence_packing:
+    enabled: true                     # large throughput win for SFT
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 1.0e-5
+      weight_decay: 0.01
+      betas: [0.9, 0.999]
+      eps: 1.0e-8
+      foreach: false
+      fused: false
+
+  scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.1
+        end_factor: 1.0
+        total_iters: 20
+    - name: "torch.optim.lr_scheduler.ConstantLR"
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: [20]
+
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  shuffle: true
+  num_workers: 2
+  train:
+    dataset_name: "squad"
+    split: "train"
+  validation:
+    dataset_name: "squad"
+    split: "validation"
+  default:
+    processor: "sft_processor"
+
+logger:
+  log_dir: "logs/sft"
+  num_val_samples_to_print: 3
+  wandb_enabled: false
+  tensorboard_enabled: true
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: true
+  wandb:
+    project: "dockyard-rl"
+    name: "sft"
+  tensorboard: {}
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+cluster:
+  gpus_per_node: 1
+  num_nodes: 1
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/sft"
+  metric_name: "val_loss"
+  higher_is_better: false
+  keep_top_k: 3
+  save_period: 100
+  checkpoint_must_save_by: null
+  model_save_format: "safetensors"
+  save_consolidated: false
+  save_optimizer: true

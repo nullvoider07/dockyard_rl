@@ -1,0 +1,23 @@
+[Unit]
+Description=OSWorld guest server (control-center backend evaluator/setup bridge)
+After=network.target gdm.service
+Wants=network.target
+
+[Service]
+Type=simple
+# Run as the session user (UID 1001 in ubuntu-desktop-code; the username is
+# renamed per-container but the UID is stable) so screenshots, pyautogui, and
+# AT-SPI run inside the live X/GNOME session.
+User=1001
+Group=1001
+WorkingDirectory=/opt/osworld/desktop_env/server
+ExecStart=/usr/bin/python3 /opt/osworld/desktop_env/server/main.py
+Environment="DISPLAY=:0"
+Environment="XDG_RUNTIME_DIR=/run/user/1001"
+Environment="XAUTHORITY=/run/user/1001/gdm/Xauthority"
+Environment="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1001/bus"
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

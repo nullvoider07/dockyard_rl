@@ -1,0 +1,274 @@
+# GRPO configuration for SWE-bench coding agent training — JAX trainer backend.
+#
+# Mirrors grpo_swe.yaml but selects the JAX trainer (Flax NNX + jax.sharding +
+# optax) via policy.jax_cfg.enabled instead of the torch DTensor backend. The
+# inference (vLLM) and sandbox fleets are unchanged (torch). See
+# handoff/jax-trainer-replatform-plan.md.
+#
+# Constraints (JAX backend, current phase):
+#   - Qwen3 dense only (Gemma3/Llama dense and MoE land in later phases).
+#   - sequence_packing / dynamic_batching are NOT supported by the JAX worker
+#     (it uses plain rectangular microbatching) — both disabled below.
+#   - The async data-plane (*_from_meta) path is not wired for the JAX worker;
+#     use the colocated sync path.
+#
+# Usage:
+#   python3 examples/run_grpo_swe.py \
+#     --config examples/configs/grpo_swe_jax.yaml \
+#     cluster.gpus_per_node=8 cluster.num_nodes=4
+
+grpo:
+  num_prompts_per_step: 16
+  num_generations_per_prompt: 8
+  max_rollout_turns: 1
+  max_num_epochs: 1
+  max_num_steps: 2000
+  normalize_rewards: true
+  use_leave_one_out_baseline: true
+  val_period: 50
+  val_at_start: true
+  val_at_end: true
+  max_val_samples: 64
+  val_batch_size: 8
+  seed: 42
+  use_dynamic_sampling: false
+  dynamic_sampling_max_gen_batches: 10
+  batch_multiplier: 1
+  overlong_filtering: true
+  seq_logprob_error_threshold: 1.5
+
+  adv_estimator:
+    name: "grpo"
+    normalize_rewards: ${grpo.normalize_rewards}
+    use_leave_one_out_baseline: ${grpo.use_leave_one_out_baseline}
+    minus_baseline: true
+
+  reward_shaping:
+    enabled: true
+    overlong_buffer_length: 256
+    overlong_buffer_penalty: 1.0
+    max_response_length: ${policy.max_total_sequence_length}
+    stop_properly_penalty_coef: null
+
+  reward_scaling:
+    enabled: false
+    source_min: 0.0
+    source_max: 1.0
+    target_min: 0.0
+    target_max: 1.0
+
+  invalid_action_penalty:
+    enabled: false
+    invalid_action_penalty: 0.0
+    malformed_thinking_penalty: 0.0
+    use_environment_flags: true
+    invalid_tool_call_patterns: []
+    thinking_tags: ["<think>", "</think>"]
+    reward_floor: null
+
+  structured_tool_use:
+    enabled: false
+    backend: vllm
+    thinking_style: paired
+    decode_skip_special_tokens: null
+    constrained_tools: ["submit_patch"]
+
+  # Synchronous GRPO: the JAX worker does not implement the async data-plane
+  # (*_from_meta) path yet. Use the colocated sync trainer loop.
+  async_grpo:
+    enabled: false
+    max_trajectory_age_steps: 2
+    in_flight_weight_updates: false
+    recompute_kv_cache_after_weight_updates: true
+
+loss_fn:
+  reference_policy_kl_penalty: 0.01
+  reference_policy_kl_type: "k3"
+  kl_input_clamp_value: 20.0
+  kl_output_clamp_value: 10.0
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.2
+  ratio_clip_c: null
+  use_on_policy_kl_approximation: false
+  # Sync GRPO: IS correction optional (must be true only for async).
+  use_importance_sampling_correction: false
+  truncated_importance_sampling_type: null
+  truncated_importance_sampling_ratio: null
+  truncated_importance_sampling_ratio_min: null
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+  force_on_policy_ratio: false
+  use_kl_in_reward: false
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/grpo-swe-jax"
+  metric_name: "val:accuracy"
+  higher_is_better: true
+  keep_top_k: 3
+  save_period: 50
+  checkpoint_must_save_by: null
+  model_save_format: "safetensors"
+  save_consolidated: false
+  save_optimizer: true
+
+policy:
+  model_name: "Qwen/Qwen3-8B"        # Qwen3 dense (JAX backend supports Qwen3 dense)
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template: null
+    chat_template_kwargs: null
+  hf_config_overrides: {}
+  train_global_batch_size: 128
+  train_micro_batch_size: 2
+  logprob_batch_size: ${policy.train_micro_batch_size}
+  max_total_sequence_length: 8192
+  precision: "bfloat16"
+  logprob_chunk_size: null
+  offload_optimizer_for_logprob: false
+  max_grad_norm: 1.0
+  make_sequence_length_divisible_by: ${policy.jax_cfg.tensor_parallel_size}
+
+  # JAX trainer backend (mirrors dtensor_cfg; see models/jax/config.py).
+  jax_cfg:
+    enabled: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    data_parallel_replicate_size: 1
+    expert_parallel_size: 1          # MoE (J8); dense path = 1
+    moe_token_dispatcher: local      # "local" (EP=1) or "alltoall" (EP>1, needs ep mesh)
+    moe_load_balance_coeff: null     # aux-loss-free bias step size (>0 enables); null = off
+    param_dtype: ${policy.precision}
+    # Merged over DEFAULT_TRAINER_ENV (XLA_PYTHON_CLIENT_PREALLOCATE=false).
+    env_vars: {}
+
+  megatron_cfg:
+    enabled: false
+
+  draft:
+    enabled: false
+    model_name: null
+    loss_weight: 0.1
+    num_layers: null
+    aux_layer_indices: null
+
+  # The JAX worker uses plain rectangular microbatching — packing/dynamic
+  # batching are not consumed by it; keep both disabled.
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    sequence_length_round: 64
+
+  sequence_packing:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
+  optimizer:
+    name: "torch.optim.AdamW"          # the JAX optimizer builder reads the suffix (AdamW)
+    kwargs:
+      lr: 3.0e-7
+      weight_decay: 0.01
+      betas: [0.9, 0.999]
+      eps: 1.0e-8
+      foreach: false
+      fused: false
+
+  scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.1
+        end_factor: 1.0
+        total_iters: 20
+    - name: "torch.optim.lr_scheduler.ConstantLR"
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: [20]
+
+  generation:
+    backend: "vllm"
+    max_new_tokens: ${policy.max_total_sequence_length}
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    vllm_cfg:
+      async_engine: false
+      precision: ${policy.precision}
+      kv_cache_dtype: "auto"
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.85
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: false
+      enable_prefix_caching: true
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 1.0
+    vllm_kwargs: {}
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 1
+
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  shuffle: true
+  num_workers: 2
+  use_multiple_dataloader: false
+
+  train:
+    dataset_name: "swe_bench"
+    hf_dataset_name: "princeton-nlp/SWE-bench_Lite"
+    split: "test"
+    max_prompt_length: 4096
+    verified_only: false
+    shuffle_seed: ${grpo.seed}
+
+  validation:
+    dataset_name: "swe_bench"
+    hf_dataset_name: "princeton-nlp/SWE-bench_Lite"
+    split: "test"
+    max_prompt_length: 4096
+    verified_only: false
+    subset_size: 64
+
+  default:
+    processor: "swe_bench_data_processor"
+    env_name: "code"
+
+env:
+  code:
+    num_workers: 16
+    reward_mode: "binary"
+    integrity_check: true
+    structured_tools: false
+    task_timeout: 300
+    sandbox_urls:
+      - "http://localhost:9090"
+
+logger:
+  log_dir: "logs/grpo-swe-jax"
+  num_val_samples_to_print: 3
+  wandb_enabled: false
+  tensorboard_enabled: true
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: true
+  wandb:
+    project: "dockyard-rl"
+    name: "grpo-swe-jax"
+  tensorboard: {}
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 4

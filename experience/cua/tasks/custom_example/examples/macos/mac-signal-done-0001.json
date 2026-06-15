@@ -1,0 +1,14 @@
+{
+  "id": "mac-signal-done-0001",
+  "instruction": "Open Spotlight search (press Command+Space), then once you have completed opening it, signal DONE.",
+  "config": [],
+  "related_apps": ["spotlight"],
+  "evaluator": {
+    "func": "final_action_match",
+    "options": {
+      "control": "done"
+    }
+  },
+  "snapshot": "base",
+  "proxy": false
+}

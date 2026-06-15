@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "dockyard-rl"
+version = "0.1.0.dev0"
+description = "Distributed RL infrastructure for Project Dockyard"
+requires-python = ">=3.12"
+
+# Runtime dependencies are baked into the ubuntu-swe image.
+# This list covers local-dev / CI environments only.
+dependencies = [
+    "ray[default]>=2.10",
+    "numpy>=1.26",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+# FP8 weight quantisation — install on inference-fleet workers only.
+# TurboQuant KV-cache compression requires no separate package; it is
+# integrated into the vLLM build that ships with the ubuntu-swe image.
+modelopt = ["nvidia-modelopt[torch]"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["dockyard_rl*"]
+
+[tool.setuptools.package-data]
+"dockyard_rl" = ["py.typed"]

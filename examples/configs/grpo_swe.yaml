@@ -1,0 +1,318 @@
+# GRPO configuration for SWE-bench coding agent training.
+#
+# Inherits all defaults from the base config.  Only keys that differ from
+# defaults are listed here.
+#
+# Topology: non-collocated, async GRPO, vLLM async engine.
+# Target hardware: 4 nodes × 8 GPUs (3 trainer + 1 inference).
+# Model: Qwen/Qwen2.5-7B-Instruct (adjust policy.model_name as needed).
+#
+# Usage:
+#   python3 examples/run_grpo_swe.py \
+#     --config examples/configs/grpo_swe.yaml \
+#     cluster.gpus_per_node=8 \
+#     cluster.num_nodes=4
+
+grpo:
+  num_prompts_per_step: 16           # prompts pulled from replay buffer per step
+  num_generations_per_prompt: 8      # rollouts per prompt (RL group size)
+  max_rollout_turns: 1               # single-shot: agent emits one patch, then scored
+  max_num_epochs: 1
+  max_num_steps: 2000
+  normalize_rewards: true
+  use_leave_one_out_baseline: true
+  val_period: 50
+  val_at_start: true
+  val_at_end: true
+  max_val_samples: 64
+  val_batch_size: 8
+  seed: 42
+  use_dynamic_sampling: false
+  dynamic_sampling_max_gen_batches: 10
+  batch_multiplier: 1
+  overlong_filtering: true           # zero reward for truncated responses
+  seq_logprob_error_threshold: 1.5
+
+  adv_estimator:
+    name: "grpo"
+    normalize_rewards: ${grpo.normalize_rewards}
+    use_leave_one_out_baseline: ${grpo.use_leave_one_out_baseline}
+    minus_baseline: true
+
+  reward_shaping:
+    enabled: true
+    overlong_buffer_length: 256
+    overlong_buffer_penalty: 1.0
+    max_response_length: ${policy.max_total_sequence_length}
+    stop_properly_penalty_coef: null
+
+  reward_scaling:
+    enabled: false
+    source_min: 0.0
+    source_max: 1.0
+    target_min: 0.0
+    target_max: 1.0
+
+  # Native invalid-action / malformed-thinking reward penalty (#2656).
+  # Disabled is a strict no-op (no detection runs, rewards untouched).
+  invalid_action_penalty:
+    enabled: false
+    invalid_action_penalty: 0.0       # reward subtracted per invalid-action turn
+    malformed_thinking_penalty: 0.0   # reward subtracted per malformed-thinking turn
+    use_environment_flags: true       # tier 1: env-authoritative per-turn verdicts
+    invalid_tool_call_patterns: []    # tier 2 generic fallback (empty = off)
+    thinking_tags: ["<think>", "</think>"]
+    reward_floor: null                # optional clamp on post-penalty reward
+
+  # Structured tool-use protocol (native Hermes <tool_call> for Qwen). Disabled
+  # is a strict no-op: the fenced-text rollout/prompt/parse path runs
+  # byte-identically. When enabled, the env's tool registry is advertised in the
+  # prompt, the agent emits typed <tool_call> JSON, the rollout wraps tool
+  # results in the Qwen turn envelope, and the schema validator feeds the #2656
+  # invalid_action signal. To activate end-to-end, also set the matching env's
+  # `structured_tools: true` (env.code.structured_tools below for this SWE config).
+  structured_tool_use:
+    enabled: false
+    backend: vllm                     # v1 scopes to the vLLM backend
+    thinking_style: paired            # "paired" (Qwen2.5/older Qwen3) | "closing_only" (Qwen3.5)
+    decode_skip_special_tokens: null  # null = auto-detect from the tokenizer
+                                      #   (keeps special tokens only if it marks
+                                      #   <tool_call> special); true/false override
+    # Tools constrained via vLLM structural_tag (RL-safe: scaffolding only,
+    # grammar-forced tokens loss-masked, argument values + thinking stay free).
+    # Empty = pure free-gen + post-hoc validation everywhere. Recommended
+    # default: constrain only the single-shot patch submission.
+    constrained_tools: ["submit_patch"]
+
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 2      # trajectories stay valid for 2 optimizer steps
+    in_flight_weight_updates: true   # vLLM async engine: update weights while generating
+    recompute_kv_cache_after_weight_updates: true
+
+loss_fn:
+  reference_policy_kl_penalty: 0.01
+  reference_policy_kl_type: "k3"
+  kl_input_clamp_value: 20.0
+  kl_output_clamp_value: 10.0
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.2
+  ratio_clip_c: null
+  use_on_policy_kl_approximation: false
+  # async GRPO requires IS correction — must be true when async_grpo.enabled=true
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: null
+  truncated_importance_sampling_ratio: null
+  truncated_importance_sampling_ratio_min: null
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+  force_on_policy_ratio: false
+  use_kl_in_reward: false
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/grpo-swe"
+  metric_name: "val:accuracy"
+  higher_is_better: true
+  keep_top_k: 3
+  save_period: 50
+  checkpoint_must_save_by: null
+  model_save_format: "safetensors"
+  save_consolidated: false
+  save_optimizer: true
+
+policy:
+  model_name: "Qwen/Qwen2.5-7B-Instruct"
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template: null              # use model's default chat template
+    chat_template_kwargs: null
+  hf_config_overrides: {}
+  train_global_batch_size: 128       # num_prompts_per_step * num_generations_per_prompt
+  train_micro_batch_size: 2
+  logprob_batch_size: ${policy.train_micro_batch_size}
+  max_total_sequence_length: 8192    # prompt + max agent response
+  precision: "bfloat16"
+  logprob_chunk_size: null
+  offload_optimizer_for_logprob: true  # non-collocated: offload before logprob pass
+  max_grad_norm: 1.0
+  make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
+
+  dtensor_cfg:
+    _v2: true
+    enabled: true
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: true   # required at 8K+ sequence lengths
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    # Expert parallelism (MoE). Defaults below reproduce the dense path exactly
+    # (ep=1, dp_replicate=1, local dispatch), so non-MoE runs are unchanged.
+    # TRAINER-side — distinct from the inference-side
+    # generation.vllm_cfg.expert_parallel_size below.
+    expert_parallel_size: 1          # routed-expert shard degree; carved from dp_shard*cp*tp
+    dp_replicate_size: 1             # HSDP replicate degree (dp_shard derived to fill world)
+    moe_parallelizer:
+      token_dispatcher: local        # 'local' (ep=1) | 'alltoall' (ep>1; HV-10, not yet built)
+      grouped_gemm: true             # routed experts via torch._grouped_mm (only true supported)
+      load_balance_coeff: null       # aux-loss-free routing-bias step size (DeepSeek 2408.15664); null = off
+    custom_parallel_plan: null
+    automodel_kwargs: {}
+    lora_cfg:
+      enabled: false
+      target_modules: []
+      exclude_modules: []
+      match_all_linear: true
+      dim: 8
+      alpha: 32
+      dropout: 0.0
+      dropout_position: "post"
+      lora_A_init: "xavier"
+      use_triton: true
+
+  megatron_cfg:
+    enabled: false
+
+  draft:
+    enabled: false
+    model_name: null
+    loss_weight: 0.1
+    num_layers: null
+    aux_layer_indices: null
+
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    sequence_length_round: 64
+
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 3.0e-7                     # lower LR than math — coding tasks have longer credit horizon
+      weight_decay: 0.01
+      betas: [0.9, 0.999]
+      eps: 1.0e-8
+      foreach: false
+      fused: false
+
+  scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.1
+        end_factor: 1.0
+        total_iters: 20
+    - name: "torch.optim.lr_scheduler.ConstantLR"
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: [20]
+
+  generation:
+    backend: "vllm"
+    max_new_tokens: ${policy.max_total_sequence_length}
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    vllm_cfg:
+      async_engine: true             # required for async GRPO
+      precision: ${policy.precision}  # bf16 here; set to "fp8" to serve in FP8 (training stays bf16)
+      kv_cache_dtype: "auto"         # "fp8"/"fp8_e4m3" allowed only when precision=="fp8"
+      # FP8 inference serving (cost lever — Phase 3b). Off while precision != "fp8";
+      # block-wise (128x128) FP8 weights are quantized on each refit from the bf16
+      # master weights (quantization/fp8.py), incl. the per-expert MoE path. The
+      # knobs below are optional (safe defaults); shown for discoverability:
+      #   pow2_weight_scaling_factors: false      # E8M0 pow2 weight scales (research)
+      #   pow2_activation_scaling_factors: false  # E8M0 pow2 activation scales (research)
+      #   num_first_layers_in_bf16: 0             # keep first N layers in bf16
+      #   num_last_layers_in_bf16: 0              # keep last N layers in bf16
+      #   use_deep_gemm: false                    # route block-FP8 GEMMs through DeepGEMM
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.85   # higher than default — inference fleet owns its GPUs fully
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: false
+      enable_prefix_caching: true    # beneficial for multi-turn coding episodes
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 1.0
+    vllm_kwargs: {}
+    colocated:
+      enabled: false                 # non-collocated: dedicated inference fleet
+      resources:
+        gpus_per_node: 8
+        num_nodes: 1                 # 1 of the 4 nodes dedicated to inference
+
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  shuffle: true
+  num_workers: 2
+  use_multiple_dataloader: false     # async GRPO does not support multiple dataloaders
+
+  train:
+    dataset_name: "swe_bench"                       # DATASET_REGISTRY key → SWEBenchDataset
+    hf_dataset_name: "princeton-nlp/SWE-bench_Lite"  # HF path passed to the loader
+    split: "test"
+    max_prompt_length: 4096
+    verified_only: false
+    shuffle_seed: ${grpo.seed}
+
+  validation:
+    dataset_name: "swe_bench"
+    hf_dataset_name: "princeton-nlp/SWE-bench_Lite"
+    split: "test"
+    max_prompt_length: 4096
+    verified_only: false
+    subset_size: 64                  # further capped by grpo.max_val_samples
+
+  default:
+    processor: "swe_bench_data_processor"
+    env_name: "code"
+
+env:
+  code:
+    # Number of parallel scoring workers.
+    num_workers: 16
+    # "binary" → 1.0 when resolved else 0.0; "test_pass_rate" → pass fraction.
+    reward_mode: "binary"
+    # Zero the reward when the agent patch modifies a held-out test file.
+    integrity_check: true
+    # Parse the solution as a structured submit_patch tool call (Hermes
+    # <tool_call>) instead of the ```diff fence / <patch> tag. Pair with
+    # grpo.structured_tool_use.enabled: true. Off → byte-identical.
+    structured_tools: false
+    # Per-task test wall-clock timeout (seconds), enforced executor-side.
+    task_timeout: 300
+    # Task-executor endpoints for /task/submit, round-robined across the batch.
+    # Deployment-specific; can also be set via DOCKYARD_SANDBOX_URLS.
+    sandbox_urls:
+      - "http://localhost:9090"
+
+logger:
+  log_dir: "logs/grpo-swe"
+  num_val_samples_to_print: 3
+  wandb_enabled: false
+  tensorboard_enabled: true
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: true
+  wandb:
+    project: "dockyard-rl"
+    name: "grpo-swe"
+  tensorboard: {}
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 4

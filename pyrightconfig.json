@@ -1,0 +1,8 @@
+{
+  "extraPaths": ["."],
+  "exclude": ["**/__pycache__", "**/node_modules", "**/.*"],
+  "reportMissingModuleSource": "none",
+  "venvPath": ".",
+  "venv": ".venv",
+  "reportPrivateImportUsage": "none"
+}

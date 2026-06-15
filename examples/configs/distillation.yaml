@@ -1,0 +1,204 @@
+# On-policy distillation configuration.
+#
+# The student generates rollouts against an environment; the frozen teacher
+# scores them via top-k logits; the student is trained to match the teacher
+# distribution (DistillationLossFn). This reuses the GRPO rollout + environment
+# infrastructure, so any registered environment works — this example uses the
+# `math` environment (in-process math verifier, NO sandbox executor required),
+# the lightest registered default. Swap data + env (e.g. to `code`/swe_bench)
+# to retarget.
+#
+# Small student default (Qwen2.5-1.5B) distilled from a larger teacher
+# (Qwen2.5-7B). The dtensor_cfg parallelism surface scales unchanged to
+# 1B → 10T+; raise tensor/context/expert parallel sizes + num_nodes to scale.
+#
+# Usage:
+#   python3 examples/run_distillation.py --config examples/configs/distillation.yaml \
+#     cluster.gpus_per_node=8 cluster.num_nodes=2 \
+#     policy.model_name=Qwen/Qwen2.5-1.5B-Instruct \
+#     teacher_policy.model_name=Qwen/Qwen2.5-32B-Instruct
+
+distillation:
+  max_num_steps: 1000
+  max_num_epochs: 1
+  val_period: 100
+  val_batches: 16
+  val_global_batch_size: 32
+  val_micro_batch_size: 1
+  val_at_start: true
+  val_at_end: true
+  seed: 42
+  # Top-k teacher logits transferred per token (memory vs. fidelity; 512–4096).
+  num_topk_logits: 512
+
+policy:
+  model_name: "Qwen/Qwen2.5-1.5B-Instruct"     # student
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template: null
+    chat_template_kwargs: null
+  hf_config_overrides: {}
+  train_global_batch_size: 32
+  train_micro_batch_size: 1
+  logprob_batch_size: ${policy.train_micro_batch_size}
+  max_total_sequence_length: 4096
+  precision: "bfloat16"
+  max_grad_norm: 1.0
+  make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
+
+  dtensor_cfg:
+    _v2: true
+    enabled: true
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    expert_parallel_size: 1
+    dp_replicate_size: 1
+    moe_parallelizer:
+      token_dispatcher: local
+      grouped_gemm: true
+      load_balance_coeff: null
+    custom_parallel_plan: null
+    automodel_kwargs: {}
+    lora_cfg:
+      enabled: false
+      target_modules: []
+      exclude_modules: []
+      match_all_linear: true
+      dim: 8
+      alpha: 32
+      dropout: 0.0
+      dropout_position: "post"
+      lora_A_init: "xavier"
+      use_triton: true
+
+  megatron_cfg:
+    enabled: false
+
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    sequence_length_round: 64
+
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 1.0e-5
+      weight_decay: 0.01
+      betas: [0.9, 0.999]
+      eps: 1.0e-8
+      foreach: false
+      fused: false
+
+  scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.1
+        end_factor: 1.0
+        total_iters: 20
+    - name: "torch.optim.lr_scheduler.ConstantLR"
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: [20]
+
+  generation:
+    backend: "vllm"
+    max_new_tokens: ${policy.max_total_sequence_length}
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    vllm_cfg:
+      async_engine: false
+      precision: ${policy.precision}
+      kv_cache_dtype: "auto"
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.6
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: false
+      enable_prefix_caching: true
+    vllm_kwargs: {}
+    colocated:
+      enabled: true                  # student generation colocated with training
+      resources:
+        gpus_per_node: null
+        num_nodes: null
+
+# Frozen teacher policy (separate resources; only model_name/resources/dtype differ
+# from the student policy above).
+teacher_policy:
+  model_name: "Qwen/Qwen2.5-7B-Instruct"
+  dtype: "bfloat16"
+  resources:
+    gpus_per_node: 1
+    num_nodes: 1
+
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  shuffle: true
+  num_workers: 2
+  # OpenMathInstruct-2 (HF) — one source split into train + validation via
+  # split_validation_size. No sandbox needed; the math env verifies in-process.
+  train:
+    dataset_name: "OpenMathInstruct-2"
+    split: "train"
+    split_validation_size: 0.02
+    seed: ${distillation.seed}
+  validation:
+    dataset_name: "OpenMathInstruct-2"
+    split: "train"
+    split_validation_size: 0.02
+    seed: ${distillation.seed}
+  default:
+    processor: "math_hf_data_processor"
+    env_name: "math"
+
+env:
+  math:
+    num_workers: 8
+    verifier_type: "math"
+
+logger:
+  log_dir: "logs/distillation"
+  num_val_samples_to_print: 3
+  wandb_enabled: false
+  tensorboard_enabled: true
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: true
+  wandb:
+    project: "dockyard-rl"
+    name: "distillation"
+  tensorboard: {}
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+cluster:
+  gpus_per_node: 1
+  num_nodes: 1
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/distillation"
+  metric_name: "val_loss"
+  higher_is_better: false
+  keep_top_k: 3
+  save_period: 100
+  checkpoint_must_save_by: null
+  model_save_format: "safetensors"
+  save_consolidated: false
+  save_optimizer: true

@@ -1,0 +1,246 @@
+# Online / iterative DPO configuration (run_online_dpo.py).
+#
+# GRPO-shaped (run_online_dpo reuses grpo.setup for the policy / generation /
+# weight-sync fleet) plus a `dpo` block (the preference loss) and an
+# `online_dpo` block (the loop). Small/single-GPU defaults; generates against the
+# `math` env (in-process verifier, no sandbox) and labels pairs with the judge.
+#
+# Usage:
+#   python3 examples/run_online_dpo.py --config examples/configs/online_dpo.yaml \
+#     policy.model_name=Qwen/Qwen2.5-7B-Instruct cluster.gpus_per_node=8 \
+#     online_dpo.judge_base_url=... online_dpo.judge_model=...
+
+# The online loop (algorithms/online_dpo.py::online_dpo_train).
+online_dpo:
+  candidates_per_prompt: 4           # K samples generated per prompt
+  score_margin: 0.1                  # drop a pair if |Δscore| < this (judge-noise guard)
+  prefer_verifiable: true            # use a verifiable RewardFunction when applicable
+  regeneration_period: 1             # 1 = fully on-policy (regenerate every step)
+  max_num_steps: 500
+  kl_target: null                    # optional over-optimization monitor threshold
+  # LLM judge transport (OpenAI-compatible). Leave url/model empty to rely purely
+  # on a verifiable reward; otherwise set them (or the DOCKYARD_HLE_JUDGE_* env vars).
+  judge_base_url: null
+  judge_api_key: null
+  judge_model: null
+  judge_timeout: 60.0
+  judge_temperature: 0.0
+
+# The preference loss (algorithms/loss build_preference_loss).
+dpo:
+  loss_variant: "dpo"                # dpo | dpop | cdpo | rdpo | ipo | kto | simpo | orpo
+  reference_policy_kl_penalty: 0.1   # DPO β
+  preference_average_log_probs: false
+  sft_average_log_probs: false
+  preference_loss_weight: 1.0
+  sft_loss_weight: 0.0
+
+# GRPO block — consumed by grpo.setup (the online loop drives its own steps via
+# online_dpo.max_num_steps; generation sampling uses these knobs).
+grpo:
+  num_prompts_per_step: 8
+  num_generations_per_prompt: ${online_dpo.candidates_per_prompt}
+  max_rollout_turns: 1
+  max_num_epochs: 1
+  max_num_steps: ${online_dpo.max_num_steps}
+  normalize_rewards: true
+  use_leave_one_out_baseline: true
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+  max_val_samples: 0
+  val_batch_size: null
+  seed: 42
+  use_dynamic_sampling: false
+  overlong_filtering: true
+  seq_logprob_error_threshold: 1.5
+  adv_estimator:
+    name: "grpo"
+    normalize_rewards: ${grpo.normalize_rewards}
+    use_leave_one_out_baseline: ${grpo.use_leave_one_out_baseline}
+    minus_baseline: true
+  reward_shaping:
+    enabled: false
+    overlong_buffer_length: 256
+    overlong_buffer_penalty: 1.0
+    max_response_length: ${policy.max_total_sequence_length}
+    stop_properly_penalty_coef: null
+  reward_scaling:
+    enabled: false
+    source_min: 0.0
+    source_max: 1.0
+    target_min: 0.0
+    target_max: 1.0
+  async_grpo:
+    enabled: false
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  reference_policy_kl_type: "k3"
+  kl_input_clamp_value: 20.0
+  kl_output_clamp_value: 10.0
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.2
+  ratio_clip_c: null
+  use_on_policy_kl_approximation: false
+  use_importance_sampling_correction: false
+  truncated_importance_sampling_type: null
+  truncated_importance_sampling_ratio: null
+  truncated_importance_sampling_ratio_min: null
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+  force_on_policy_ratio: false
+  use_kl_in_reward: false
+
+policy:
+  model_name: "Qwen/Qwen2.5-1.5B-Instruct"
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template: null
+    chat_template_kwargs: null
+  hf_config_overrides: {}
+  train_global_batch_size: 32
+  train_micro_batch_size: 1
+  logprob_batch_size: ${policy.train_micro_batch_size}
+  max_total_sequence_length: 4096
+  precision: "bfloat16"
+  logprob_chunk_size: null
+  offload_optimizer_for_logprob: true
+  max_grad_norm: 1.0
+  make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
+
+  dtensor_cfg:
+    _v2: true
+    enabled: true
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    expert_parallel_size: 1
+    dp_replicate_size: 1
+    moe_parallelizer:
+      token_dispatcher: local
+      grouped_gemm: true
+      load_balance_coeff: null
+    custom_parallel_plan: null
+    automodel_kwargs: {}
+    lora_cfg:
+      enabled: false
+      target_modules: []
+      exclude_modules: []
+      match_all_linear: true
+      dim: 8
+      alpha: 32
+      dropout: 0.0
+      dropout_position: "post"
+      lora_A_init: "xavier"
+      use_triton: true
+
+  megatron_cfg:
+    enabled: false
+
+  # OFF for DPO (preserve chosen/rejected pairing).
+  dynamic_batching:
+    enabled: false
+  sequence_packing:
+    enabled: false
+
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 5.0e-7
+      weight_decay: 0.0
+      betas: [0.9, 0.999]
+      eps: 1.0e-8
+      foreach: false
+      fused: false
+
+  scheduler:
+    - name: "torch.optim.lr_scheduler.ConstantLR"
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: []
+
+  generation:
+    backend: "vllm"
+    max_new_tokens: ${policy.max_total_sequence_length}
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    vllm_cfg:
+      async_engine: false
+      precision: ${policy.precision}
+      kv_cache_dtype: "auto"
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.6
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: false
+      enable_prefix_caching: true
+    vllm_kwargs: {}
+    colocated:
+      enabled: true
+      resources:
+        gpus_per_node: null
+        num_nodes: null
+
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  shuffle: true
+  num_workers: 2
+  use_multiple_dataloader: false
+  train:
+    dataset_name: "OpenMathInstruct-2"
+    split: "train"
+    split_validation_size: 0.02
+    seed: ${grpo.seed}
+  validation:
+    dataset_name: "OpenMathInstruct-2"
+    split: "train"
+    split_validation_size: 0.02
+    seed: ${grpo.seed}
+  default:
+    processor: "math_hf_data_processor"
+    env_name: "math"
+
+env:
+  math:
+    num_workers: 8
+    verifier_type: "math"
+
+logger:
+  log_dir: "logs/online-dpo"
+  num_val_samples_to_print: 3
+  wandb_enabled: false
+  tensorboard_enabled: true
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: true
+  wandb:
+    project: "dockyard-rl"
+    name: "online-dpo"
+  tensorboard: {}
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+cluster:
+  gpus_per_node: 1
+  num_nodes: 1
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/online-dpo"
+  metric_name: "online_dpo/judge_score_mean"
+  higher_is_better: true
+  keep_top_k: 3
+  save_period: 100
+  checkpoint_must_save_by: null
+  model_save_format: "safetensors"
+  save_consolidated: false
+  save_optimizer: true

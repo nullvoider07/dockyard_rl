@@ -1,0 +1,236 @@
+# Standalone evaluation configuration (run_eval.py).
+#
+# A GRPO-shaped config used for evaluation only: run_eval.py calls grpo.setup +
+# grpo.validate (no optimizer step). Defaults are small/single-GPU; evaluates
+# against the `math` env (in-process verifier, no sandbox). Point data + env
+# elsewhere (e.g. code/swe_bench) to evaluate other tasks.
+#
+# Usage:
+#   python3 examples/run_eval.py --config examples/configs/eval.yaml \
+#     policy.model_name=Qwen/Qwen2.5-7B-Instruct cluster.gpus_per_node=8
+
+# Eval-dataset mode: load a benchmark from EVAL_DATASET_REGISTRY and score it
+# with a verifier env. Remove this block to fall back to response/env mode (the
+# `data` + `env` sections below). Available dataset `type`s: math, aime,
+# aime_2024, aime_2025, gpqa, gpqa_diamond, mmlu, mmlu_pro, mmau, local_math.
+eval:
+  task_name: "math"
+  env_name: "math"               # verifier env (must be in ENV_REGISTRY)
+  prompt_file: null              # optional prompt template applied to each question
+  system_prompt_file: null
+  dataset:
+    type: "math"                 # MATH-500 (HuggingFaceH4/MATH-500)
+    split: "test"
+  # Multiple-choice benchmarks (gpqa/mmlu/mmlu_pro/mmau) need a multiple-choice
+  # verifier (env.math.verifier_type: english_multichoice) plus a system prompt
+  # that forces the "Answer: X" format. See examples/configs/gpqa.yaml and
+  # examples/configs/mmlu.yaml for ready-to-run multiple-choice configs.
+
+grpo:
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 4      # samples per prompt during eval generation
+  max_rollout_turns: 1
+  max_num_epochs: 1
+  max_num_steps: 0                   # evaluation only — no optimizer steps
+  normalize_rewards: true
+  use_leave_one_out_baseline: true
+  val_period: 1
+  val_at_start: true
+  val_at_end: false
+  max_val_samples: 64                # number of prompts scored
+  val_batch_size: 8
+  seed: 42
+  use_dynamic_sampling: false
+  overlong_filtering: true
+  seq_logprob_error_threshold: 1.5
+  adv_estimator:
+    name: "grpo"
+    normalize_rewards: ${grpo.normalize_rewards}
+    use_leave_one_out_baseline: ${grpo.use_leave_one_out_baseline}
+    minus_baseline: true
+  reward_shaping:
+    enabled: false
+    overlong_buffer_length: 256
+    overlong_buffer_penalty: 1.0
+    max_response_length: ${policy.max_total_sequence_length}
+    stop_properly_penalty_coef: null
+  reward_scaling:
+    enabled: false
+    source_min: 0.0
+    source_max: 1.0
+    target_min: 0.0
+    target_max: 1.0
+  async_grpo:
+    enabled: false
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  reference_policy_kl_type: "k3"
+  kl_input_clamp_value: 20.0
+  kl_output_clamp_value: 10.0
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.2
+  ratio_clip_c: null
+  use_on_policy_kl_approximation: false
+  use_importance_sampling_correction: false
+  truncated_importance_sampling_type: null
+  truncated_importance_sampling_ratio: null
+  truncated_importance_sampling_ratio_min: null
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+  force_on_policy_ratio: false
+  use_kl_in_reward: false
+
+policy:
+  model_name: "Qwen/Qwen2.5-1.5B-Instruct"
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template: null
+    chat_template_kwargs: null
+  hf_config_overrides: {}
+  train_global_batch_size: 32
+  train_micro_batch_size: 1
+  logprob_batch_size: ${policy.train_micro_batch_size}
+  max_total_sequence_length: 4096
+  precision: "bfloat16"
+  logprob_chunk_size: null
+  offload_optimizer_for_logprob: true
+  max_grad_norm: 1.0
+  make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
+
+  dtensor_cfg:
+    _v2: true
+    enabled: true
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: false
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    expert_parallel_size: 1
+    dp_replicate_size: 1
+    moe_parallelizer:
+      token_dispatcher: local
+      grouped_gemm: true
+      load_balance_coeff: null
+    custom_parallel_plan: null
+    automodel_kwargs: {}
+    lora_cfg:
+      enabled: false
+      target_modules: []
+      exclude_modules: []
+      match_all_linear: true
+      dim: 8
+      alpha: 32
+      dropout: 0.0
+      dropout_position: "post"
+      lora_A_init: "xavier"
+      use_triton: true
+
+  megatron_cfg:
+    enabled: false
+
+  dynamic_batching:
+    enabled: false
+  sequence_packing:
+    enabled: false
+
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 1.0e-6
+      weight_decay: 0.0
+      betas: [0.9, 0.999]
+      eps: 1.0e-8
+      foreach: false
+      fused: false
+
+  scheduler:
+    - name: "torch.optim.lr_scheduler.ConstantLR"
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: []
+
+  generation:
+    backend: "vllm"
+    max_new_tokens: ${policy.max_total_sequence_length}
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    vllm_cfg:
+      async_engine: false
+      precision: ${policy.precision}
+      kv_cache_dtype: "auto"
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.85
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: false
+      enable_prefix_caching: true
+    vllm_kwargs: {}
+    colocated:
+      enabled: true
+      resources:
+        gpus_per_node: null
+        num_nodes: null
+
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  shuffle: false
+  num_workers: 2
+  use_multiple_dataloader: false
+  # train/validation/default below are used only in response/env mode (no `eval`
+  # block); in eval-dataset mode the benchmark comes from the `eval` block above.
+  train:
+    dataset_name: "OpenMathInstruct-2"
+    split: "train"
+    split_validation_size: 0.02
+    seed: ${grpo.seed}
+  validation:
+    dataset_name: "OpenMathInstruct-2"
+    split: "train"
+    split_validation_size: 0.02
+    seed: ${grpo.seed}
+  default:
+    processor: "math_hf_data_processor"
+    env_name: "math"
+
+env:
+  math:
+    num_workers: 8
+    verifier_type: "math"
+
+logger:
+  log_dir: "logs/eval"
+  num_val_samples_to_print: 5
+  wandb_enabled: false
+  tensorboard_enabled: true
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: true
+  wandb:
+    project: "dockyard-rl"
+    name: "eval"
+  tensorboard: {}
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+cluster:
+  gpus_per_node: 1
+  num_nodes: 1
+
+checkpointing:
+  enabled: false
+  checkpoint_dir: "results/eval"
+  metric_name: "val:accuracy"
+  higher_is_better: true
+  keep_top_k: 1
+  save_period: 1000000
+  checkpoint_must_save_by: null
+  model_save_format: "safetensors"
+  save_consolidated: false
+  save_optimizer: false

@@ -1,0 +1,14 @@
+{
+  "id": "win-open-notepad-0001",
+  "instruction": "Open the Notepad application so that an empty Notepad window is visible and focused on the screen.",
+  "config": [],
+  "related_apps": ["notepad"],
+  "evaluator": {
+    "func": "screenshot_judge",
+    "options": {
+      "rubric": "Score 1.0 if a Notepad window is open and focused in the foreground (title bar reads 'Untitled - Notepad' or similar), otherwise 0.0."
+    }
+  },
+  "snapshot": "base",
+  "proxy": false
+}

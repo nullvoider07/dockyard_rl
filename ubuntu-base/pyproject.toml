@@ -1,0 +1,51 @@
+[project]
+name = "ubuntu-swe-rl-env"
+version = "0.1.0"
+description = "AI Agent SWE RL Environment dependencies"
+requires-python = ">=3.12"
+dependencies = [
+    # Task Executor API
+    "flask",
+    "waitress",
+    # gRPC / agent controller compat
+    "grpcio",
+    "grpcio-tools",
+    "click",
+    "PyJWT",
+    "psutil",
+    "pyyaml",
+    # Test frameworks
+    "pytest",
+    "pytest-xdist",
+    # Python linters & type checkers
+    "ruff",
+    "mypy",
+    "flake8",
+    "pylint",
+    # Distributed RL orchestration
+    "ray[default]",
+    # JAX Ecosystem
+    "jax[cuda12]",
+    "flax",
+    "optax",
+    "orbax-checkpoint",
+    "rlax",
+    "chex",
+    "einops",
+    # PyTorch & Inference
+    "torch",
+    "torchvision",
+    "torchaudio",
+    "vllm"
+]
+
+# Configure uv to fetch PyTorch from the specific cu124 wheel index
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+torchvision = { index = "pytorch-cu124" }
+torchaudio = { index = "pytorch-cu124" }

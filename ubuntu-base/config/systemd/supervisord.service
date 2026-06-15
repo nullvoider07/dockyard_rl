@@ -1,0 +1,12 @@
+[Unit]
+Description=Supervisor Process Manager
+After=network.target avahi-setup.service
+
+[Service]
+ExecStart=/usr/bin/supervisord -c /etc/supervisor/supervisord.conf
+Restart=always
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

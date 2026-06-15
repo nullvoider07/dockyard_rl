@@ -1,0 +1,70 @@
+# Default `infra:` block shipped with dockyard-k8s.
+#
+# Override any field with:
+#   1. A recipe-level `infra:` mapping (or a `--infra <file>.yaml`)
+#   2. A per-user file at ~/.config/dockyard-k8s/defaults.yaml
+#   3. CLI Hydra-style overrides: `infra.scheduler.queue=my-queue`
+#
+# Priority (low -> high): this file < user defaults < recipe/infra file < CLI.
+infra:
+  # namespace and image are REQUIRED per deployment; no default is sensible.
+  # namespace auto-infers from the active kube context when left unset.
+  # image must be the single ubuntu-swe GPU image used by every fleet.
+  # namespace: ""
+  # image: ""
+  imagePullSecrets: []
+  rayVersion: null
+  serviceAccount: null
+  scheduler:
+    kind: default
+    queue: null
+  placement:
+    nodeSelector: {}
+    tolerations: []
+  networking:
+    hostNetwork: false
+    gloo_socket_ifname: null
+    nccl_socket_ifname: null
+    nccl_ib_disable: false
+    nccl_net: null
+    extra_env: {}
+  workspace:
+    kind: rayUpload
+    pvcName: null
+    mountPath: /mnt/dockyard
+    repoSubdir: workdirs
+    size: null
+    hostPath: null
+  hf_cache:
+    kind: none
+    pvcName: null
+    mountPath: /root/.cache/huggingface
+  checkpoints:
+    kind: none
+    pvcName: null
+    mountPath: /mnt/dockyard/checkpoints
+  submit:
+    kind: sdk
+    portForward: auto
+    localDashboardPort: 18265
+    # portForward = Ray Job SDK via kubectl port-forward; exec = kubectl exec + nohup.
+    submitter: portForward
+    execTmpDir: /tmp
+  launch:
+    # rayjob (default) = ephemeral cluster per run; bringup = long-lived; attach = existing.
+    mode: rayjob
+    # interactive (default) = port-forward + upload + tail; batch = exec + image + no-wait.
+    runMode: interactive
+    attach: null
+    # upload (default, Ray SDK), image (baked at codePath), or lustre (mounted at codePath).
+    codeSource: upload
+    codePath: null
+    env: {}
+  # The single GPU Ray cluster (trainer + inference worker groups). Must be set
+  # per deployment — see the examples for a full RayCluster spec.
+  kuberay: null
+  # The sandbox executor pool (GPU-free Deployment + Service). null means an
+  # external sandbox: provide DOCKYARD_SANDBOX_URLS via launch.env.
+  sandbox: null
+  labels: {}
+  annotations: {}

@@ -1,0 +1,320 @@
+# GRPO configuration for GDPval — AGENTIC file-producing path (multi-turn, sandbox).
+#
+# The faithful path of GDPval: the policy drives an ubuntu-swe-gdpval container and
+# uses shell/python tools (openpyxl/python-docx/python-pptx/reportlab/pandas/pypdf,
+# pandoc) to PRODUCE real deliverable files under /workspace/deliverable. On
+# completion the files are extracted to text in-container (manifest + content) and
+# graded by the same judgmental GDPvalRubricReward against the task's rubric_json.
+# Unlike the text path (grpo_gdpval.yaml), file/format rubric criteria are
+# demonstrable, so scores are not artificially depressed.
+#
+# IMPORTANT:
+#   - A JUDGE IS REQUIRED (no deterministic rubric fallback). Set
+#     DOCKYARD_GDPVAL_JUDGE_BASE_URL + DOCKYARD_GDPVAL_JUDGE_MODEL (+ _API_KEY),
+#     or env.gdpval_agentic.judge_*. Falls back to the shared DOCKYARD_HLE_JUDGE_*.
+#   - A SANDBOX IS REQUIRED. Point env.gdpval_agentic.sandbox_urls (or
+#     DOCKYARD_SANDBOX_URLS) at task-executor endpoints serving the GDPval image,
+#     and set the image ref in both data.train/validation.image and the env block.
+#   - The GDPval file-tooling image is ubuntu-base/ubuntu-swe-gdpval.dockerfile.
+#   - By default only no-reference-file tasks are kept (provision_reference_files
+#     stages inline binary inputs when set, but most rows ship reference files via
+#     URI that need separate fetching — left as a follow-on).
+#
+# Usage:
+#   DOCKYARD_GDPVAL_JUDGE_BASE_URL=... DOCKYARD_GDPVAL_JUDGE_MODEL=... \
+#   DOCKYARD_SANDBOX_URLS=http://host:9090 \
+#   python3 examples/run_grpo_swe.py --config examples/configs/grpo_gdpval_agentic.yaml \
+#     cluster.gpus_per_node=8 cluster.num_nodes=2
+
+grpo:
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 8
+  max_rollout_turns: 32              # multi-turn: keep above the per-task max_turns
+  max_num_epochs: 1
+  max_num_steps: 1000
+  normalize_rewards: true
+  use_leave_one_out_baseline: true
+  val_period: 50
+  val_at_start: true
+  val_at_end: true
+  max_val_samples: 32
+  val_batch_size: 8
+  seed: 42
+  use_dynamic_sampling: false
+  dynamic_sampling_max_gen_batches: 10
+  batch_multiplier: 1
+  overlong_filtering: true
+  seq_logprob_error_threshold: 1.5
+
+  adv_estimator:
+    name: "grpo"
+    normalize_rewards: ${grpo.normalize_rewards}
+    use_leave_one_out_baseline: ${grpo.use_leave_one_out_baseline}
+    minus_baseline: true
+
+  reward_shaping:
+    enabled: true
+    overlong_buffer_length: 256
+    overlong_buffer_penalty: 1.0
+    max_response_length: ${policy.max_total_sequence_length}
+    stop_properly_penalty_coef: null
+
+  reward_scaling:
+    enabled: false
+    source_min: 0.0
+    source_max: 1.0
+    target_min: 0.0
+    target_max: 1.0
+
+  # Native invalid-action penalty (#2656). The multi-turn session env stamps
+  # invalid_action per turn (a turn with no shell command and no TASK_COMPLETE);
+  # disabled by default — set enabled=true and a penalty to activate.
+  invalid_action_penalty:
+    enabled: false
+    invalid_action_penalty: 0.0
+    malformed_thinking_penalty: 0.0
+    use_environment_flags: true
+    invalid_tool_call_patterns: []
+    thinking_tags: ["<think>", "</think>"]
+    reward_floor: null
+
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 2
+    in_flight_weight_updates: true
+    recompute_kv_cache_after_weight_updates: true
+
+loss_fn:
+  reference_policy_kl_penalty: 0.01
+  reference_policy_kl_type: "k3"
+  kl_input_clamp_value: 20.0
+  kl_output_clamp_value: 10.0
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.2
+  ratio_clip_c: null
+  use_on_policy_kl_approximation: false
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: null
+  truncated_importance_sampling_ratio: null
+  truncated_importance_sampling_ratio_min: null
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+  force_on_policy_ratio: false
+  use_kl_in_reward: false
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/grpo-gdpval-agentic"
+  metric_name: "val:accuracy"
+  higher_is_better: true
+  keep_top_k: 3
+  save_period: 50
+  checkpoint_must_save_by: null
+  model_save_format: "safetensors"
+  save_consolidated: false
+  save_optimizer: true
+
+policy:
+  model_name: "Qwen/Qwen2.5-7B-Instruct"
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template: null
+    chat_template_kwargs: null
+  hf_config_overrides: {}
+  train_global_batch_size: 64
+  train_micro_batch_size: 1
+  logprob_batch_size: ${policy.train_micro_batch_size}
+  # Multi-turn tool transcripts (prompt + many turns of command output) — size
+  # generously for the full episode.
+  max_total_sequence_length: 32768
+  precision: "bfloat16"
+  logprob_chunk_size: null
+  offload_optimizer_for_logprob: true
+  max_grad_norm: 1.0
+  make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
+
+  dtensor_cfg:
+    _v2: true
+    enabled: true
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+    automodel_kwargs: {}
+    lora_cfg:
+      enabled: false
+      target_modules: []
+      exclude_modules: []
+      match_all_linear: true
+      dim: 8
+      alpha: 32
+      dropout: 0.0
+      dropout_position: "post"
+      lora_A_init: "xavier"
+      use_triton: true
+
+  megatron_cfg:
+    enabled: false
+
+  draft:
+    enabled: false
+    model_name: null
+    loss_weight: 0.1
+    num_layers: null
+    aux_layer_indices: null
+
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    sequence_length_round: 64
+
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 3.0e-7
+      weight_decay: 0.01
+      betas: [0.9, 0.999]
+      eps: 1.0e-8
+      foreach: false
+      fused: false
+
+  scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.1
+        end_factor: 1.0
+        total_iters: 20
+    - name: "torch.optim.lr_scheduler.ConstantLR"
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: [20]
+
+  generation:
+    backend: "vllm"
+    max_new_tokens: 4096
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    vllm_cfg:
+      async_engine: true
+      precision: ${policy.precision}
+      kv_cache_dtype: "auto"
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.85
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: false
+      enable_prefix_caching: true
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 1.0
+    vllm_kwargs: {}
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 1
+
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  shuffle: true
+  num_workers: 2
+  use_multiple_dataloader: false
+
+  train:
+    dataset_name: "gdpval_agentic"                  # DATASET_REGISTRY key → GDPvalAgenticDataset
+    hf_dataset_name: "openai/gdpval"
+    split: "train"
+    require_no_reference_files: true
+    provision_reference_files: false
+    # The file-tooling sandbox image (build ubuntu-swe-gdpval.dockerfile, push, set the ref).
+    image: "ubuntu-swe-gdpval:latest"
+    deliverable_dir: "/workspace/deliverable"
+    reference_dir: "/workspace/reference"
+    max_turns: 24
+    exec_timeout_sec: 180
+    max_prompt_length: 8192
+    shuffle_seed: ${grpo.seed}
+
+  validation:
+    dataset_name: "gdpval_agentic"
+    hf_dataset_name: "openai/gdpval"
+    split: "train"
+    require_no_reference_files: true
+    provision_reference_files: false
+    image: "ubuntu-swe-gdpval:latest"
+    deliverable_dir: "/workspace/deliverable"
+    reference_dir: "/workspace/reference"
+    max_turns: 24
+    exec_timeout_sec: 180
+    max_prompt_length: 8192
+
+  default:
+    processor: "gdpval_agentic_data_processor"
+    env_name: "gdpval_agentic"
+
+env:
+  gdpval_agentic:
+    # "weighted" → weighted fraction of rubric criteria met; "binary" → all met.
+    reward_mode: "weighted"
+    # Default per-episode turn budget when a task row omits max_turns.
+    max_turns: 24
+    # Where the agent writes its deliverable (extracted from here at grading).
+    deliverable_dir: "/workspace/deliverable"
+    reference_dir: "/workspace/reference"
+    # File-tooling image (a task row may override via metadata "image").
+    image: "ubuntu-swe-gdpval:latest"
+    # Block container network access.
+    block_network: false
+    # Max bytes of stdout/stderr returned per agent command observation.
+    output_limit: 8192
+    # Char cap on the extracted deliverable bundle handed to the judge.
+    extraction_char_limit: 200000
+    # Timeout (s) for the in-container extraction step.
+    extraction_timeout: 300
+    # Actor concurrency for parallel step() calls (async rollout path).
+    max_concurrency: 64
+    # Task-executor endpoints (falls back to DOCKYARD_SANDBOX_URLS).
+    sandbox_urls:
+      - "http://localhost:9090"
+    # Bearer token (falls back to DOCKYARD_SANDBOX_API_TOKEN).
+    api_token: null
+    # Judge (REQUIRED — no deterministic fallback). null → DOCKYARD_GDPVAL_JUDGE_*
+    # env vars, then the shared DOCKYARD_HLE_JUDGE_* vars.
+    judge_base_url: null
+    judge_api_key: null
+    judge_model: null
+    judge_timeout: 120
+
+logger:
+  log_dir: "logs/grpo-gdpval-agentic"
+  num_val_samples_to_print: 3
+  wandb_enabled: false
+  tensorboard_enabled: true
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: true
+  wandb:
+    project: "dockyard-rl"
+    name: "grpo-gdpval-agentic"
+  tensorboard: {}
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 2

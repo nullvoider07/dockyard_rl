@@ -1,0 +1,311 @@
+# Monolithic RL JobSet: one Ray cluster expressed as raw Jobs instead of a
+# KubeRay RayJob. Use this when you want JobSet-native failure cascading and
+# predictable DNS names without the KubeRay operator.
+#
+# Four ReplicatedJobs:
+#   head              — Ray head daemon (CPU-only), long-running
+#   trainer-workers   — GPU workers tagged dockyard_fleet_trainer
+#   inference-workers — GPU workers tagged dockyard_fleet_inference (vLLM)
+#   driver            — submits the GRPO recipe via `ray job submit`, gates success
+#
+# Trainer and inference attach to the same head so the trainer->inference NCCL
+# weight sync is co-resident; the dockyard_rl runtime carves them into per-fleet
+# placement groups by the `dockyard_fleet_<role>` Ray resource tag. The sandbox
+# executor pool is a separate Deployment (sandbox-pool.yaml), reached over HTTP
+# via DOCKYARD_SANDBOX_URLS.
+#
+# Image: the `image:` fields below use the vLLM build
+# (nullvoider/ubuntu-swe:latest). For the SGLang backend, set every `image:` to
+# nullvoider/ubuntu-swe-sglang:latest AND set policy.generation.backend: sglang
+# in the recipe — the GPU image must match the configured backend.
+#
+# KAI gang-schedules all pods in the JobSet together (one PodGroup), so
+# dependsOn cannot be used (it would deadlock). Workers instead use init
+# containers to wait for the head, same pattern as KubeRay.
+#
+# DNS names (auto-created by the JobSet headless service):
+#   head:               dockyard-grpo-swe-head-0-0.dockyard-grpo-swe
+#   trainer-workers:    dockyard-grpo-swe-trainer-workers-0-{0,1,...}.dockyard-grpo-swe
+#   inference-workers:  dockyard-grpo-swe-inference-workers-0-0.dockyard-grpo-swe
+#   driver:             dockyard-grpo-swe-driver-0-0.dockyard-grpo-swe
+#
+# This first pass intentionally omits the GB300/AWS DRA machinery
+# (ComputeDomain + RoCE ResourceClaimTemplate); add it back as resourceClaims
+# on the GPU worker pods if you need NVLink/RoCE topology placement.
+#
+# Prerequisites:
+#   JobSet controller installed (helmfile sync installs it)
+#   kubectl apply -f kai-queue.yaml
+#   kubectl apply -f sandbox-pool.yaml
+#   `regcred` image pull secret + `dockyard-rl` ServiceAccount present.
+#   The dockyard_rl repo baked into the image at /opt/dockyard_rl.
+#
+# Usage:
+#   kubectl apply -f jobset-monolithic.yaml
+#   kubectl get jobset dockyard-grpo-swe -w
+
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: dockyard-grpo-swe
+  labels:
+    kai.scheduler/queue: rl
+    app.kubernetes.io/managed-by: dockyard-k8s
+spec:
+  network:
+    enableDNSHostnames: true
+    publishNotReadyAddresses: true
+
+  coordinator:
+    replicatedJob: head
+    jobIndex: 0
+    podIndex: 0
+
+  # JobSet succeeds when the driver exits 0.
+  successPolicy:
+    operator: All
+    targetReplicatedJobs: [driver]
+
+  # Any failure tears down everything.
+  failurePolicy:
+    maxRestarts: 0
+    rules:
+    - name: head_crash
+      action: FailJobSet
+      targetReplicatedJobs: [head]
+    - name: driver_crash
+      action: FailJobSet
+      targetReplicatedJobs: [driver]
+    - name: trainer_crash
+      action: FailJobSet
+      targetReplicatedJobs: [trainer-workers]
+    - name: inference_crash
+      action: FailJobSet
+      targetReplicatedJobs: [inference-workers]
+
+  replicatedJobs:
+  # Ray head (CPU-only)
+  - name: head
+    replicas: 1
+    template:
+      spec:
+        backoffLimit: 0
+        completions: 1
+        parallelism: 1
+        template:
+          spec:
+            schedulerName: kai-scheduler
+            serviceAccountName: dockyard-rl
+            imagePullSecrets:
+            - name: regcred
+            tolerations:
+            - { operator: Exists }
+            containers:
+            - name: ray-head
+              image: nullvoider/ubuntu-swe:latest
+              command: ["/bin/bash", "-c"]
+              args:
+              - |
+                ulimit -n 65536
+                ray start --head --port=6379 \
+                  --dashboard-host=0.0.0.0 \
+                  --num-gpus=0 \
+                  --object-store-memory=200000000 \
+                  --block
+              ports:
+              - { containerPort: 6379, name: gcs-server }
+              - { containerPort: 8265, name: dashboard }
+              - { containerPort: 10001, name: client }
+              readinessProbe:
+                exec: { command: ["ray", "health-check"] }
+                initialDelaySeconds: 10
+                periodSeconds: 5
+                timeoutSeconds: 5
+              resources:
+                requests: { cpu: "16", memory: "64Gi" }
+                limits:   { cpu: "32", memory: "128Gi" }
+              env:
+              - { name: RAY_ADDRESS, value: "127.0.0.1:6379" }
+              - { name: RAY_ENABLE_UV_RUN_RUNTIME_ENV, value: "0" }
+              - { name: RAY_memory_monitor_refresh_ms, value: "0" }
+              volumeMounts:
+              - { name: dshm, mountPath: /dev/shm }
+            volumes:
+            - name: dshm
+              emptyDir: { medium: Memory, sizeLimit: 16Gi }
+
+  # Trainer GPU workers (tagged dockyard_fleet_trainer)
+  - name: trainer-workers
+    replicas: 1
+    template:
+      spec:
+        backoffLimit: 0
+        completions: 1
+        parallelism: 1
+        template:
+          spec:
+            schedulerName: kai-scheduler
+            serviceAccountName: dockyard-rl
+            imagePullSecrets:
+            - name: regcred
+            tolerations:
+            - { operator: Exists }
+            initContainers:
+            - name: wait-for-head
+              image: nullvoider/ubuntu-swe:latest
+              command: ["/bin/bash", "-c"]
+              args:
+              - |
+                HEAD=dockyard-grpo-swe-head-0-0.dockyard-grpo-swe
+                echo "Waiting for head at ${HEAD}:6379..."
+                until ray health-check --address ${HEAD}:6379 >/dev/null 2>&1; do
+                  sleep 5
+                done
+                echo "Head is ready."
+              resources:
+                requests: { cpu: "200m", memory: "256Mi" }
+            containers:
+            - name: ray-worker
+              image: nullvoider/ubuntu-swe:latest
+              command: ["/bin/bash", "-c"]
+              args:
+              - |
+                ulimit -n 65536
+                HEAD=dockyard-grpo-swe-head-0-0.dockyard-grpo-swe
+                ray start --address=${HEAD}:6379 \
+                  --num-gpus=2 \
+                  --object-store-memory=200000000 \
+                  --resources='{"worker_units": 2, "dockyard_managed_ray_cluster": 1, "dockyard_fleet_trainer": 1}' \
+                  --block
+              resources:
+                requests: { cpu: "16", memory: "128Gi", nvidia.com/gpu: "2" }
+                limits:   { cpu: "32", memory: "192Gi", nvidia.com/gpu: "2" }
+              env:
+              - { name: RAY_ADDRESS, value: "dockyard-grpo-swe-head-0-0.dockyard-grpo-swe:6379" }
+              - { name: DOCKYARD_FLEET_ROLE, value: trainer }
+              - { name: RAY_ENABLE_UV_RUN_RUNTIME_ENV, value: "0" }
+              - { name: DOCKYARD_SANDBOX_URLS, value: "http://dockyard-sandbox:9090" }
+              - { name: RAY_memory_monitor_refresh_ms, value: "0" }
+              - { name: NCCL_DEBUG, value: WARN }
+              volumeMounts:
+              - { name: dshm, mountPath: /dev/shm }
+            volumes:
+            - name: dshm
+              emptyDir: { medium: Memory, sizeLimit: 64Gi }
+
+  # Inference GPU workers (tagged dockyard_fleet_inference; vLLM)
+  - name: inference-workers
+    replicas: 1
+    template:
+      spec:
+        backoffLimit: 0
+        completions: 1
+        parallelism: 1
+        template:
+          spec:
+            schedulerName: kai-scheduler
+            serviceAccountName: dockyard-rl
+            imagePullSecrets:
+            - name: regcred
+            tolerations:
+            - { operator: Exists }
+            initContainers:
+            - name: wait-for-head
+              image: nullvoider/ubuntu-swe:latest
+              command: ["/bin/bash", "-c"]
+              args:
+              - |
+                HEAD=dockyard-grpo-swe-head-0-0.dockyard-grpo-swe
+                echo "Waiting for head at ${HEAD}:6379..."
+                until ray health-check --address ${HEAD}:6379 >/dev/null 2>&1; do
+                  sleep 5
+                done
+                echo "Head is ready."
+              resources:
+                requests: { cpu: "200m", memory: "256Mi" }
+            containers:
+            - name: ray-worker
+              image: nullvoider/ubuntu-swe:latest
+              command: ["/bin/bash", "-c"]
+              args:
+              - |
+                ulimit -n 65536
+                HEAD=dockyard-grpo-swe-head-0-0.dockyard-grpo-swe
+                ray start --address=${HEAD}:6379 \
+                  --num-gpus=1 \
+                  --object-store-memory=200000000 \
+                  --resources='{"worker_units": 1, "dockyard_managed_ray_cluster": 1, "dockyard_fleet_inference": 1}' \
+                  --block
+              resources:
+                requests: { cpu: "16", memory: "128Gi", nvidia.com/gpu: "1" }
+                limits:   { cpu: "32", memory: "192Gi", nvidia.com/gpu: "1" }
+              env:
+              - { name: RAY_ADDRESS, value: "dockyard-grpo-swe-head-0-0.dockyard-grpo-swe:6379" }
+              - { name: DOCKYARD_FLEET_ROLE, value: inference }
+              - { name: RAY_ENABLE_UV_RUN_RUNTIME_ENV, value: "0" }
+              - { name: DOCKYARD_SANDBOX_URLS, value: "http://dockyard-sandbox:9090" }
+              - { name: RAY_memory_monitor_refresh_ms, value: "0" }
+              - { name: NCCL_DEBUG, value: WARN }
+              volumeMounts:
+              - { name: dshm, mountPath: /dev/shm }
+            volumes:
+            - name: dshm
+              emptyDir: { medium: Memory, sizeLimit: 64Gi }
+
+  # Driver (submits the GRPO recipe, gates JobSet success)
+  - name: driver
+    replicas: 1
+    template:
+      spec:
+        backoffLimit: 0
+        completions: 1
+        parallelism: 1
+        template:
+          spec:
+            schedulerName: kai-scheduler
+            serviceAccountName: dockyard-rl
+            imagePullSecrets:
+            - name: regcred
+            tolerations:
+            - { operator: Exists }
+            initContainers:
+            - name: wait-for-head
+              image: nullvoider/ubuntu-swe:latest
+              command: ["/bin/bash", "-c"]
+              args:
+              - |
+                HEAD=dockyard-grpo-swe-head-0-0.dockyard-grpo-swe
+                echo "Waiting for head at ${HEAD}:6379..."
+                until ray health-check --address ${HEAD}:6379 >/dev/null 2>&1; do
+                  sleep 5
+                done
+                echo "Head is ready."
+              resources:
+                requests: { cpu: "200m", memory: "256Mi" }
+            containers:
+            - name: driver
+              image: nullvoider/ubuntu-swe:latest
+              command: ["/bin/bash", "-c"]
+              args:
+              - |
+                set -eo pipefail
+                HEAD=dockyard-grpo-swe-head-0-0.dockyard-grpo-swe
+                SUBMISSION_ID="grpo-swe-$(date +%s)"
+                ray job submit --address http://${HEAD}:8265 \
+                  --submission-id ${SUBMISSION_ID} \
+                  --runtime-env-json '{"env_vars": {"RAY_ENABLE_UV_RUN_RUNTIME_ENV": "0", "DOCKYARD_SANDBOX_URLS": "http://dockyard-sandbox:9090"}}' \
+                  -- bash -c "
+                    cd /opt/dockyard_rl
+                    python3 -u examples/run_grpo_swe.py \
+                      --config examples/configs/grpo_swe.yaml \
+                      env.code.sandbox_urls=null \
+                      cluster.gpus_per_node=2 \
+                      cluster.num_nodes=1 \
+                      logger.wandb_enabled=false \
+                      logger.tensorboard_enabled=true
+                  " 2>&1
+              resources:
+                requests: { cpu: "500m", memory: "2Gi" }
+                limits:   { cpu: "2", memory: "8Gi" }
+              env:
+              - { name: RAY_ADDRESS, value: "dockyard-grpo-swe-head-0-0.dockyard-grpo-swe:6379" }

@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dockyard-k8s"
+version = "0.1.0.dev0"
+description = "Kubernetes deployment CLI for Project Dockyard's dockyard_rl GRPO stack"
+requires-python = ">=3.12"
+
+# Laptop / ops-host dependencies. This is a build/deploy-time tool that runs
+# on an operator's machine (or an in-cluster ops pod), never inside a Ray
+# training actor — so installing it with pip/uv-tool carries none of the
+# runtime-venv concerns that apply to the cluster image. The training image
+# (ubuntu-swe) bakes its own deps via build-time uv.
+dependencies = [
+    "click>=8.1",
+    "omegaconf>=2.3",
+    "pydantic>=2.7",
+    "kubernetes>=29",
+    "ray[default]>=2.10",
+    "tenacity>=8.2",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+dockyard-k8s = "dockyard_k8s.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"dockyard_k8s" = ["defaults/*.yaml"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-ra"
+
+# Mirror the pytest pythonpath so Pylance/pyright resolves `dockyard_k8s.*`
+# from the src layout without an installed wheel.
+[tool.pyright]
+extraPaths = ["src"]

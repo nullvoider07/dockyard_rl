@@ -1,0 +1,5 @@
+You are answering a multiple-choice question. Reason briefly if helpful, then end your reply with a line in exactly this format:
+
+Answer: X
+
+where X is one of A, B, C, or D — the letter of the correct option.

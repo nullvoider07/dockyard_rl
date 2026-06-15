@@ -1,0 +1,8 @@
+# Dev config: mount a local dockyard_rl checkout into the kind nodes so pods
+# can reach the code via hostPath: /opt/dockyard_rl (codeSource: lustre/host).
+workers:
+- devices: all
+extraMounts:
+# Edit hostPath to point to your local dockyard_rl checkout.
+- hostPath: /home/you/dockyard_rl
+  containerPath: /opt/dockyard_rl

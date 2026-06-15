@@ -1,0 +1,147 @@
+# Sandbox executor pool: a GPU-free Deployment of ubuntu-swe task executors
+# fronted by a ClusterIP Service for stable in-cluster DNS.
+#
+# Each pod runs scripts/tools/task_executor.py (waitress on 0.0.0.0:9090,
+# routes POST /task/submit, GET /task/<id>, GET /task/<id>/result). It clones
+# the target repo, applies the agent patch + gold test_patch, runs the tests
+# with plain subprocess, and returns a verdict. No GPU, no privileged mode,
+# no docker-in-docker is needed at runtime.
+#
+# The GPU RayJob/RayCluster reaches this pool over HTTP via the env var
+#   DOCKYARD_SANDBOX_URLS=http://dockyard-sandbox:9090
+# (the Service load-balances across replicas). The recipe must be launched
+# with `env.code.sandbox_urls=null` so the env var wins over the recipe's
+# localhost default.
+#
+# The ubuntu-swe image is shared with the GPU fleets — use the same build they
+# do: nullvoider/ubuntu-swe:latest (vLLM) or nullvoider/ubuntu-swe-sglang:latest
+# (SGLang). The sandbox runs no inference engine, so either works; matching the
+# GPU fleets keeps one image per deployment. "CPU-only" here describes only this
+# pool's resource request.
+#
+# Usage:
+#   kubectl apply -f sandbox-pool.yaml
+#   kubectl rollout status deploy/dockyard-sandbox
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dockyard-sandbox
+  labels:
+    app.kubernetes.io/name: dockyard-sandbox
+    app.kubernetes.io/managed-by: dockyard-k8s
+spec:
+  replicas: 8
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: dockyard-sandbox
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: dockyard-sandbox
+        app.kubernetes.io/managed-by: dockyard-k8s
+    spec:
+      imagePullSecrets:
+      - name: regcred
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: task-executor
+        image: nullvoider/ubuntu-swe:latest
+        # The image entrypoint launches the task executor; if yours does not,
+        # uncomment to start it explicitly:
+        # command: ["python3", "/opt/dockyard_rl/ubuntu-base/scripts/tools/task_executor.py"]
+        ports:
+        - { containerPort: 9090, name: http }
+        env:
+        - { name: DOCKYARD_FLEET_ROLE, value: sandbox }
+        - { name: API_PORT, value: "9090" }
+        resources:
+          # Requests are the per-replica scheduler reservation — keep them small
+          # so replicas x request actually fits on the nodes (8 x 8 CPU / 32Gi
+          # would leave the pool Pending). Limits give burst headroom for a heavy
+          # test run; ephemeral-storage reserves disk for repo checkouts so a
+          # large clone cannot trigger node disk-pressure eviction.
+          requests: { cpu: "1", memory: "2Gi", ephemeral-storage: "10Gi" }
+          limits:   { cpu: "4", memory: "8Gi", ephemeral-storage: "20Gi" }
+        # Hardening baseline for untrusted agent code. runAsNonRoot /
+        # readOnlyRootFilesystem are omitted: the executor writes checkouts to
+        # disk and the image's default user is root — enable them only with an
+        # image that supports it (and a writable workdir volume for read-only FS).
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+          seccompProfile:
+            type: RuntimeDefault
+        # No /health route — probe the TCP port instead.
+        readinessProbe:
+          tcpSocket: { port: 9090 }
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 6
+        livenessProbe:
+          tcpSocket: { port: 9090 }
+          initialDelaySeconds: 30
+          periodSeconds: 20
+          timeoutSeconds: 5
+          failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dockyard-sandbox
+  labels:
+    app.kubernetes.io/name: dockyard-sandbox
+    app.kubernetes.io/managed-by: dockyard-k8s
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: dockyard-sandbox
+  ports:
+  - name: http
+    port: 9090
+    targetPort: 9090
+    protocol: TCP
+---
+# Network isolation: the executor runs untrusted agent code, so restrict who can
+# reach it. Ingress is limited to port 9090 from pods in this namespace (the GPU
+# fleets, via the Service); cross-namespace and external ingress are denied.
+# Egress stays open because the executor clones repos over HTTPS — to lock it
+# down, drop the open `{}` egress rule and allow only DNS + your repo CIDRs.
+# Requires a CNI that enforces NetworkPolicy (inert no-op otherwise).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: dockyard-sandbox-netpol
+  labels:
+    app.kubernetes.io/name: dockyard-sandbox
+    app.kubernetes.io/managed-by: dockyard-k8s
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: dockyard-sandbox
+  policyTypes: [Ingress, Egress]
+  ingress:
+  - from:
+    - podSelector: {}            # any pod in this namespace
+    ports:
+    - { protocol: TCP, port: 9090 }
+  egress:
+  - {}                           # unrestricted egress (repo cloning needs it)
+---
+# Protect the pool from voluntary disruption (node drain / upgrade).
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: dockyard-sandbox-pdb
+  labels:
+    app.kubernetes.io/name: dockyard-sandbox
+    app.kubernetes.io/managed-by: dockyard-k8s
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: dockyard-sandbox

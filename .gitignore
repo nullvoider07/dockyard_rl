@@ -1,0 +1,13 @@
+.vscode/settings.json
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Local-only working directories (not published)
+.claude/
+handoff/
+session-history/

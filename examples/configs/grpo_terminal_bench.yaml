@@ -1,0 +1,285 @@
+# GRPO configuration for Terminal-Bench 2.1 multi-turn terminal-agent training.
+#
+# Each episode is an interactive terminal session driven by the executor session
+# API (start/exec/finish), graded on the final container state. Prerequisites on
+# the sandbox fleet:
+#   - terminal_bench_setup.sh has populated the task tree (set
+#     DOCKYARD_TERMINAL_BENCH_TASKS_DIR or data.train.tasks_dir).
+#   - the sandbox container runs privileged (dockerd-in-container) with scratch
+#     for /var/lib/docker; image cache via DOCKYARD_SANDBOX_IMAGE_CACHE_MAX_GB /
+#     DOCKYARD_SANDBOX_IMAGE_PULL_TIMEOUT. Tasks with a prebuilt docker_image are
+#     pulled; the rest are built once from environment/Dockerfile and cached.
+#
+# Multi-turn note: the environment self-terminates with the verifier score on the
+# last allowed turn, so grpo.max_rollout_turns is set just above the per-task
+# env.terminal_bench.max_turns. The running conversation accumulates terminal
+# output (each command bounded by env.terminal_bench.output_limit); size
+# policy.max_total_sequence_length for roughly max_turns × output tokens.
+#
+# Topology: non-collocated, async GRPO, vLLM async engine.
+# Target hardware: 4 nodes × 8 GPUs (3 trainer + 1 inference).
+#
+# Usage:
+#   python3 examples/run_grpo_swe.py \
+#     --config examples/configs/grpo_terminal_bench.yaml \
+#     cluster.gpus_per_node=8 \
+#     cluster.num_nodes=4
+
+grpo:
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 8
+  max_rollout_turns: 22              # one above env.terminal_bench.max_turns (21 forces verifier)
+  max_num_epochs: 1
+  max_num_steps: 2000
+  normalize_rewards: true
+  use_leave_one_out_baseline: true
+  val_period: 50
+  val_at_start: true
+  val_at_end: true
+  max_val_samples: 32
+  val_batch_size: 8
+  seed: 42
+  use_dynamic_sampling: false
+  dynamic_sampling_max_gen_batches: 10
+  batch_multiplier: 1
+  overlong_filtering: true
+  seq_logprob_error_threshold: 1.5
+
+  adv_estimator:
+    name: "grpo"
+    normalize_rewards: ${grpo.normalize_rewards}
+    use_leave_one_out_baseline: ${grpo.use_leave_one_out_baseline}
+    minus_baseline: true
+
+  reward_shaping:
+    enabled: true
+    overlong_buffer_length: 256
+    overlong_buffer_penalty: 1.0
+    max_response_length: ${policy.max_total_sequence_length}
+    stop_properly_penalty_coef: null
+
+  reward_scaling:
+    enabled: false
+    source_min: 0.0
+    source_max: 1.0
+    target_min: 0.0
+    target_max: 1.0
+
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 2
+    in_flight_weight_updates: true
+    recompute_kv_cache_after_weight_updates: true
+
+loss_fn:
+  reference_policy_kl_penalty: 0.01
+  reference_policy_kl_type: "k3"
+  kl_input_clamp_value: 20.0
+  kl_output_clamp_value: 10.0
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.2
+  ratio_clip_c: null
+  use_on_policy_kl_approximation: false
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: null
+  truncated_importance_sampling_ratio: null
+  truncated_importance_sampling_ratio_min: null
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+  force_on_policy_ratio: false
+  use_kl_in_reward: false
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/grpo-terminal-bench"
+  metric_name: "val:accuracy"
+  higher_is_better: true
+  keep_top_k: 3
+  save_period: 50
+  checkpoint_must_save_by: null
+  model_save_format: "safetensors"
+  save_consolidated: false
+  save_optimizer: true
+
+policy:
+  model_name: "Qwen/Qwen2.5-7B-Instruct"
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template: null
+    chat_template_kwargs: null
+  hf_config_overrides: {}
+  train_global_batch_size: 64
+  train_micro_batch_size: 1
+  logprob_batch_size: ${policy.train_micro_batch_size}
+  # Multi-turn episodes accumulate the instruction plus up to max_turns rounds of
+  # command + terminal output; size for that budget.
+  max_total_sequence_length: 24576
+  precision: "bfloat16"
+  logprob_chunk_size: null
+  offload_optimizer_for_logprob: true
+  max_grad_norm: 1.0
+  make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
+
+  dtensor_cfg:
+    _v2: true
+    enabled: true
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+    automodel_kwargs: {}
+    lora_cfg:
+      enabled: false
+      target_modules: []
+      exclude_modules: []
+      match_all_linear: true
+      dim: 8
+      alpha: 32
+      dropout: 0.0
+      dropout_position: "post"
+      lora_A_init: "xavier"
+      use_triton: true
+
+  megatron_cfg:
+    enabled: false
+
+  draft:
+    enabled: false
+    model_name: null
+    loss_weight: 0.1
+    num_layers: null
+    aux_layer_indices: null
+
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    sequence_length_round: 64
+
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 3.0e-7
+      weight_decay: 0.01
+      betas: [0.9, 0.999]
+      eps: 1.0e-8
+      foreach: false
+      fused: false
+
+  scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.1
+        end_factor: 1.0
+        total_iters: 20
+    - name: "torch.optim.lr_scheduler.ConstantLR"
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: [20]
+
+  generation:
+    backend: "vllm"
+    # Per-turn cap: one command (with reasoning), not the whole episode budget.
+    max_new_tokens: 2048
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    vllm_cfg:
+      async_engine: true
+      precision: ${policy.precision}
+      kv_cache_dtype: "auto"
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.85
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: false
+      enable_prefix_caching: true
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 1.0
+    vllm_kwargs: {}
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 1
+
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  shuffle: true
+  num_workers: 2
+  use_multiple_dataloader: false
+
+  train:
+    dataset_name: "terminal_bench"                 # DATASET_REGISTRY key → TerminalBenchDataset
+    # Provisioned task tree from terminal_bench_setup.sh. null → read from the
+    # DOCKYARD_TERMINAL_BENCH_TASKS_DIR environment variable.
+    tasks_dir: null
+    max_prompt_length: 8192
+    # Per-episode turn budget; keep grpo.max_rollout_turns above it.
+    max_turns: 21
+    # Per-command wall-clock cap (seconds), enforced executor-side.
+    exec_timeout_sec: 120
+    shuffle_seed: ${grpo.seed}
+
+  validation:
+    # Terminal-Bench 2.1 has no held-out split (~90 tasks); validation reuses the
+    # task set capped by grpo.max_val_samples, so train/val overlap. For a clean
+    # split, pass disjoint data.train.task_ids / data.validation.task_ids.
+    dataset_name: "terminal_bench"
+    tasks_dir: null
+    max_prompt_length: 8192
+    max_turns: 21
+    exec_timeout_sec: 120
+
+  default:
+    processor: "terminal_bench_data_processor"
+    env_name: "terminal_bench"
+
+env:
+  terminal_bench:
+    # "binary" → 1.0 when the verifier passes else 0.0; "test_pass_rate" → frac.
+    reward_mode: "binary"
+    # Default per-episode turn budget when a task row omits max_turns.
+    max_turns: 21
+    # Honour task.toml allow_internet=false (network-off container). Default false:
+    # the verifier installs uv from the network, so network-off breaks grading.
+    respect_allow_internet: false
+    # Max bytes of stdout/stderr returned per command observation.
+    output_limit: 4096
+    # Actor concurrency for parallel step() calls (async rollout path).
+    max_concurrency: 64
+    sandbox_urls:
+      - "http://localhost:9090"
+
+logger:
+  log_dir: "logs/grpo-terminal-bench"
+  num_val_samples_to_print: 3
+  wandb_enabled: false
+  tensorboard_enabled: true
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: true
+  wandb:
+    project: "dockyard-rl"
+    name: "grpo-terminal-bench"
+  tensorboard: {}
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 4

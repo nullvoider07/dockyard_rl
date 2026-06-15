@@ -1,0 +1,157 @@
+# Monolithic RayJob: one GPU RayCluster running the SWE GRPO recipe.
+#
+# KubeRay creates the RayCluster, waits until it is ready, submits the
+# entrypoint over HTTP, polls to completion, then tears the cluster down.
+#
+# Topology: a single Ray cluster with two GPU worker groups —
+#   trainer   — DTensor policy workers, tagged dockyard_fleet_trainer
+#   inference — vLLM async engine, tagged dockyard_fleet_inference
+# Trainer and inference share one cluster because the trainer->inference NCCL
+# weight sync needs them co-resident; the dockyard_rl runtime carves them into
+# per-fleet placement groups by the `dockyard_fleet_<role>` Ray resource tag.
+# The sandbox executor pool is a separate Deployment (sandbox-pool.yaml),
+# reached over HTTP via DOCKYARD_SANDBOX_URLS.
+#
+# Image: the `image:` fields below use the vLLM build
+# (nullvoider/ubuntu-swe:latest). For the SGLang backend, set every `image:` to
+# nullvoider/ubuntu-swe-sglang:latest AND set policy.generation.backend: sglang
+# in the recipe — the GPU image must match the configured backend.
+#
+# This is a small, hand-written example (2 + 1 GPUs). For the full-scale
+# generated equivalent see ../dockyard_k8s/examples/grpo_swe.infra.yaml.
+#
+# Prerequisites:
+#   kubectl apply -f kai-queue.yaml
+#   kubectl apply -f sandbox-pool.yaml
+#   `regcred` image pull secret + `dockyard-rl` ServiceAccount present.
+#   The dockyard_rl repo baked into the image at /opt/dockyard_rl.
+#
+# Usage:
+#   kubectl apply -f rayjob-monolithic.yaml
+#   kubectl get rayjob dockyard-grpo-swe -w
+
+apiVersion: ray.io/v1
+kind: RayJob
+metadata:
+  name: dockyard-grpo-swe
+  labels:
+    kai.scheduler/queue: rl
+    app.kubernetes.io/managed-by: dockyard-k8s
+spec:
+  # `env.code.sandbox_urls=null` makes the recipe fall back to the injected
+  # DOCKYARD_SANDBOX_URLS env var (the sandbox Service DNS).
+  entrypoint: >-
+    cd /opt/dockyard_rl &&
+    python3 -u examples/run_grpo_swe.py
+    --config examples/configs/grpo_swe.yaml
+    env.code.sandbox_urls=null
+    cluster.gpus_per_node=2
+    cluster.num_nodes=1
+    logger.wandb_enabled=false
+    logger.tensorboard_enabled=true
+  submissionMode: HTTPMode     # K8sJobMode breaks KAI gang scheduling
+  shutdownAfterJobFinishes: true
+  ttlSecondsAfterFinished: 3600
+  rayClusterSpec:
+    rayVersion: "2.52.0"
+    enableInTreeAutoscaling: false
+    headGroupSpec:
+      rayStartParams:
+        num-gpus: "0"
+        no-monitor: "true"
+        dashboard-host: "0.0.0.0"
+        object-store-memory: "200000000"
+      template:
+        spec:
+          schedulerName: kai-scheduler
+          serviceAccountName: dockyard-rl
+          imagePullSecrets:
+          - name: regcred
+          containers:
+          - name: ray-head
+            image: nullvoider/ubuntu-swe:latest
+            env:
+            - { name: RAY_ENABLE_UV_RUN_RUNTIME_ENV, value: "0" }
+            - { name: DOCKYARD_SANDBOX_URLS, value: "http://dockyard-sandbox:9090" }
+            - { name: RAY_memory_monitor_refresh_ms, value: "0" }
+            resources:
+              requests: { cpu: "16", memory: "64Gi" }
+              limits:   { cpu: "32", memory: "128Gi" }
+            ports:
+            - { containerPort: 6379, name: gcs-server }
+            - { containerPort: 8265, name: dashboard }
+            - { containerPort: 10001, name: client }
+            volumeMounts:
+            - { name: dshm, mountPath: /dev/shm }
+          volumes:
+          - name: dshm
+            emptyDir: { medium: Memory, sizeLimit: 16Gi }
+    workerGroupSpecs:
+    # Trainer fleet: 1 node x 2 GPUs.
+    - groupName: trainer
+      replicas: 1
+      minReplicas: 1
+      maxReplicas: 1
+      rayStartParams:
+        num-gpus: "2"
+        object-store-memory: "200000000"
+        resources: '{"worker_units": 2, "dockyard_managed_ray_cluster": 1, "dockyard_fleet_trainer": 1}'
+      template:
+        spec:
+          schedulerName: kai-scheduler
+          serviceAccountName: dockyard-rl
+          imagePullSecrets:
+          - name: regcred
+          tolerations:
+          - { operator: Exists }
+          containers:
+          - name: ray-worker
+            image: nullvoider/ubuntu-swe:latest
+            env:
+            - { name: DOCKYARD_FLEET_ROLE, value: trainer }
+            - { name: RAY_ENABLE_UV_RUN_RUNTIME_ENV, value: "0" }
+            - { name: DOCKYARD_SANDBOX_URLS, value: "http://dockyard-sandbox:9090" }
+            - { name: NCCL_DEBUG, value: WARN }
+            - { name: RAY_memory_monitor_refresh_ms, value: "0" }
+            resources:
+              requests: { cpu: "16", memory: "128Gi", nvidia.com/gpu: "2" }
+              limits:   { cpu: "32", memory: "192Gi", nvidia.com/gpu: "2" }
+            volumeMounts:
+            - { name: dshm, mountPath: /dev/shm }
+          volumes:
+          - name: dshm
+            emptyDir: { medium: Memory, sizeLimit: 64Gi }
+    # Inference fleet: 1 node x 1 GPU (vLLM); weights synced from trainer via NCCL.
+    - groupName: inference
+      replicas: 1
+      minReplicas: 1
+      maxReplicas: 1
+      rayStartParams:
+        num-gpus: "1"
+        object-store-memory: "200000000"
+        resources: '{"worker_units": 1, "dockyard_managed_ray_cluster": 1, "dockyard_fleet_inference": 1}'
+      template:
+        spec:
+          schedulerName: kai-scheduler
+          serviceAccountName: dockyard-rl
+          imagePullSecrets:
+          - name: regcred
+          tolerations:
+          - { operator: Exists }
+          containers:
+          - name: ray-worker
+            image: nullvoider/ubuntu-swe:latest
+            env:
+            - { name: DOCKYARD_FLEET_ROLE, value: inference }
+            - { name: RAY_ENABLE_UV_RUN_RUNTIME_ENV, value: "0" }
+            - { name: DOCKYARD_SANDBOX_URLS, value: "http://dockyard-sandbox:9090" }
+            - { name: NCCL_DEBUG, value: WARN }
+            - { name: RAY_memory_monitor_refresh_ms, value: "0" }
+            resources:
+              requests: { cpu: "16", memory: "128Gi", nvidia.com/gpu: "1" }
+              limits:   { cpu: "32", memory: "192Gi", nvidia.com/gpu: "1" }
+            volumeMounts:
+            - { name: dshm, mountPath: /dev/shm }
+          volumes:
+          - name: dshm
+            emptyDir: { medium: Memory, sizeLimit: 64Gi }

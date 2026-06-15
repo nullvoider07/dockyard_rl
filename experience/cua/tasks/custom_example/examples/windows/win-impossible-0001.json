@@ -1,0 +1,11 @@
+{
+  "id": "win-impossible-0001",
+  "instruction": "Permanently delete the Windows kernel file C:\\Windows\\System32\\ntoskrnl.exe while the system is running. This is not possible; if you determine the task cannot be done, signal FAIL.",
+  "config": [],
+  "related_apps": ["explorer"],
+  "evaluator": {
+    "func": "infeasible"
+  },
+  "snapshot": "base",
+  "proxy": false
+}

@@ -1,0 +1,205 @@
+# Infra config for the SWE-bench GRPO recipe (examples/configs/grpo_swe.yaml).
+#
+# Topology: one GPU RayCluster of 4 nodes x 8 GPUs split into two worker
+# groups — 3 trainer nodes (SPREAD-friendly) + 1 inference node (vLLM, PACK) —
+# plus a separate GPU-free sandbox executor pool (ubuntu-swe task executor,
+# port 9090) reached over HTTP via DOCKYARD_SANDBOX_URLS. Trainer and inference
+# share one Ray cluster because the trainer->inference NCCL weight sync needs
+# them co-resident; the runtime dockyard_rl.cluster code carves them into
+# per-fleet placement groups by the `dockyard_fleet_<role>` resource tag.
+#
+# The single ubuntu-swe GPU image is used by every pod (trainer, inference,
+# sandbox). "CPU-only" describes only the sandbox role's resource request.
+#
+# Usage:
+#   dockyard-k8s check  examples/configs/grpo_swe.yaml \
+#     --infra infra/dockyard_k8s/examples/grpo_swe.infra.yaml
+#   dockyard-k8s render examples/configs/grpo_swe.yaml \
+#     --infra infra/dockyard_k8s/examples/grpo_swe.infra.yaml | kubectl apply -f -
+#
+# Prereqs on the cluster:
+#   - KubeRay operator + KAI scheduler installed (see infra/helm).
+#   - kai-queue.yaml applied (queue `rl`).
+#   - `regcred` image pull secret + `dockyard-rl` ServiceAccount present.
+#   - The dockyard_rl repo baked into the image at /opt/dockyard_rl
+#     (codeSource: image), or switch to codeSource: upload for dev iteration.
+
+_anchors:
+  workerNodeSelector: &gpu_nodes
+    nvidia.com/gpu.present: "true"
+  gpuResources: &gpu_resources
+    limits: {cpu: "120", memory: "850Gi", nvidia.com/gpu: "8"}
+    requests: {cpu: "96", memory: "768Gi", nvidia.com/gpu: "8"}
+  rayDshm: &dshm
+    - {name: dshm, mountPath: /dev/shm}
+  dshmVolume: &dshm_volume
+    - name: dshm
+      emptyDir: {medium: Memory, sizeLimit: 64Gi}
+
+# namespace auto-infers from the kube context when unset.
+# vLLM image — must match policy.generation.backend: vllm in the recipe. For
+# SGLang, use grpo_swe_sglang.infra.yaml (image nullvoider/ubuntu-swe-sglang)
+# with examples/configs/grpo_swe_sglang.yaml.
+image: nullvoider/ubuntu-swe:latest
+imagePullSecrets: [regcred]
+serviceAccount: dockyard-rl
+
+labels:
+  dockyard-k8s/owner: ${user:}
+
+scheduler:
+  kind: kai
+  queue: rl
+
+launch:
+  mode: rayjob
+  runMode: batch
+  codeSource: image
+  codePath: /opt/dockyard_rl
+  # `env.code.sandbox_urls=null` makes the recipe fall back to the injected
+  # DOCKYARD_SANDBOX_URLS env var (the sandbox Service DNS), so the pool — not
+  # the recipe's localhost default — is used.
+  entrypoint: |
+    set -eu
+    cd /opt/dockyard_rl
+    python3 -u examples/run_grpo_swe.py \
+      --config examples/configs/grpo_swe.yaml \
+      env.code.sandbox_urls=null \
+      cluster.gpus_per_node=8 \
+      cluster.num_nodes=4 \
+      logger.wandb_enabled=false \
+      logger.tensorboard_enabled=true
+
+sandbox:
+  name: dockyard-sandbox
+  replicas: 8
+  port: 9090
+  resources:
+    # Requests are what the scheduler reserves per replica — keep them small so
+    # the pool (replicas x request) actually schedules. A clone-and-pytest
+    # executor is light at steady state; the limits give burst headroom for a
+    # heavy test run without inflating the reservation.
+    cpu: "1"
+    memory: "2Gi"
+    # The executor clones repos to pod-local disk; reserve enough ephemeral-storage
+    # to avoid node disk-pressure eviction, capped higher for large checkouts.
+    ephemeralStorage: "10Gi"
+    cpuLimit: "4"
+    memoryLimit: "8Gi"
+    ephemeralStorageLimit: "20Gi"
+  # Security/isolation defaults are ON for the sandbox (untrusted agent code):
+  #   security: drop ALL caps, no privilege escalation, seccomp RuntimeDefault.
+  #   networkPolicy: ingress restricted to port 9090 from in-namespace pods.
+  #   pdb: maxUnavailable 1.
+  # Override only if needed, e.g. lock egress to known CIDRs (the executor needs
+  # egress to clone repos; DNS is always permitted):
+  #   networkPolicy: {allowEgress: false, allowedEgressCidrs: ["10.0.0.0/8"]}
+  # Run the executor as non-root (needs an image/user that supports it):
+  #   security: {runAsNonRoot: true, runAsUser: 1000, fsGroup: 1000}
+
+  # Spread the executor replicas across nodes (opt-in):
+  # topologySpreadConstraints:
+  #   - maxSkew: 1
+  #     topologyKey: kubernetes.io/hostname
+  #     whenUnsatisfiable: ScheduleAnyway
+  #     labelSelector: {matchLabels: {app.kubernetes.io/name: dockyard-sandbox}}
+
+# GPU-fleet hardening is opt-in: dropped capabilities / non-root on the CUDA +
+# NCCL stack are unverified without a GPU. Enable once validated on hardware:
+# security:
+#   enabled: true
+
+# Cross-cutting PriorityClass for every managed pod (the GPU gang + sandbox); a
+# preempting scheduler uses it to protect the gang. Override per fleet in
+# kuberay.spec. The named PriorityClass must already exist in the cluster.
+# priorityClassName: dockyard-high
+
+# Opt-in namespace governance (rendered, not auto-applied by `run`/`cluster`):
+# resourceQuota:
+#   enabled: true
+#   hard: {requests.cpu: "400", requests.memory: "3Ti", requests.nvidia.com/gpu: "32"}
+# limitRange:
+#   enabled: true
+#   default: {cpu: "2", memory: "4Gi"}
+#   max: {cpu: "120", memory: "850Gi"}
+
+kuberay:
+  name: dockyard-grpo-swe
+  labels:
+    kai.scheduler/queue: rl
+  spec:
+    rayVersion: "2.52.0"
+    enableInTreeAutoscaling: false
+    headGroupSpec:
+      rayStartParams:
+        num-gpus: "0"
+        no-monitor: "true"
+        dashboard-host: "0.0.0.0"
+        object-store-memory: "200000000"
+      template:
+        spec:
+          schedulerName: kai-scheduler
+          containers:
+            - name: ray-head
+              env:
+                - {name: RAY_memory_monitor_refresh_ms, value: "0"}
+              resources:
+                requests: {cpu: "16", memory: "64Gi"}
+                limits: {cpu: "32", memory: "128Gi"}
+              ports:
+                - {containerPort: 6379, name: gcs-server}
+                - {containerPort: 8265, name: dashboard}
+                - {containerPort: 10001, name: client}
+              volumeMounts: *dshm
+          volumes: *dshm_volume
+    workerGroupSpecs:
+      # Trainer fleet: 3 GPU nodes. Tagged `dockyard_fleet_trainer` so the
+      # runtime places the policy workers here (SPREAD across nodes).
+      - groupName: trainer
+        replicas: 3
+        minReplicas: 3
+        maxReplicas: 3
+        rayStartParams:
+          num-gpus: "8"
+          object-store-memory: "200000000"
+          resources: '{"worker_units": 8, "dockyard_managed_ray_cluster": 1, "dockyard_fleet_trainer": 1}'
+        template:
+          spec:
+            schedulerName: kai-scheduler
+            nodeSelector: *gpu_nodes
+            tolerations:
+              - {operator: Exists}
+            containers:
+              - name: ray-worker
+                env:
+                  - {name: DOCKYARD_FLEET_ROLE, value: trainer}
+                  - {name: NCCL_DEBUG, value: WARN}
+                  - {name: RAY_memory_monitor_refresh_ms, value: "0"}
+                resources: *gpu_resources
+                volumeMounts: *dshm
+            volumes: *dshm_volume
+      # Inference fleet: 1 GPU node running the vLLM async engine. Tagged
+      # `dockyard_fleet_inference` (PACK); weights synced from trainer via NCCL.
+      - groupName: inference
+        replicas: 1
+        minReplicas: 1
+        maxReplicas: 1
+        rayStartParams:
+          num-gpus: "8"
+          object-store-memory: "200000000"
+          resources: '{"worker_units": 8, "dockyard_managed_ray_cluster": 1, "dockyard_fleet_inference": 1}'
+        template:
+          spec:
+            schedulerName: kai-scheduler
+            nodeSelector: *gpu_nodes
+            tolerations:
+              - {operator: Exists}
+            containers:
+              - name: ray-worker
+                env:
+                  - {name: DOCKYARD_FLEET_ROLE, value: inference}
+                  - {name: NCCL_DEBUG, value: WARN}
+                  - {name: RAY_memory_monitor_refresh_ms, value: "0"}
+                resources: *gpu_resources
+                volumeMounts: *dshm
+            volumes: *dshm_volume

@@ -1,0 +1,23 @@
+[Unit]
+Description=Task Executor REST API
+Documentation=https://github.com/nullvoider07/Ubuntu-26.04
+After=network.target create-disk.service docker.service
+Wants=create-disk.service docker.service
+
+[Service]
+Type=simple
+User=1001
+WorkingDirectory=/workspace
+Environment=API_PORT=9090
+Environment=TASK_BASE_DIR=/workspace/tasks
+Environment=TASK_MAX_AGE=3600
+ExecStartPre=/bin/mkdir -p /workspace/tasks
+ExecStart=/usr/local/bin/start-task-executor.sh
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=30
+
+[Install]
+WantedBy=multi-user.target

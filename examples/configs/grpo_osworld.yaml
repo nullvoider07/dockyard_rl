@@ -1,0 +1,391 @@
+# GRPO configuration for OSWorld (benchmark #6) — multimodal computer-use agent.
+#
+# Each episode is a multi-turn GUI desktop task: the agent observes a screenshot,
+# emits pyautogui actions (or WAIT/FAIL/DONE), and is graded host-side by the
+# backend's evaluate() in [0,1]. Phase 1 uses the OFFICIAL backend
+# (desktop_env.DesktopEnv, docker KVM provider) — one VM per episode.
+#
+# Multimodal path: the CUA rollout (experience/cua/rollout.py, selected by
+# grpo.cua_rollout=true) threads each turn's screenshot into the message log as
+# image content and routes the cumulative images to vLLM (multi_modal_data). The
+# policy is a Qwen-VL-class checkpoint and the tokenizer is loaded as an
+# AutoProcessor (policy.tokenizer.use_processor=true).
+#
+# Prerequisites (live run only — needs a KVM host; not runnable in CI):
+#   - desktop_env (xlang-ai/OSWorld, pinned 705623ca…) installed in the env image,
+#     with the docker KVM provider available (/dev/kvm + NET_ADMIN, happysixd/
+#     osworld-docker pullable).
+#   - OSWorld evaluation_examples tree on the env actor host; set data.train.data_dir
+#     or DOCKYARD_OSWORLD_DATA_DIR.
+#
+# Topology: non-collocated, async GRPO, vLLM async engine.
+#
+# Usage:
+#   python3 examples/run_grpo_swe.py \
+#     --config examples/configs/grpo_osworld.yaml \
+#     cluster.gpus_per_node=8 cluster.num_nodes=4
+
+grpo:
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 8
+  # One above env.osworld.max_turns (15 forces grading on the last turn).
+  max_rollout_turns: 16
+  # Select the multimodal computer-use rollout (per-turn screenshots).
+  cua_rollout: true
+  max_num_epochs: 1
+  max_num_steps: 2000
+  normalize_rewards: true
+  use_leave_one_out_baseline: true
+  val_period: 50
+  val_at_start: true
+  val_at_end: true
+  max_val_samples: 32
+  val_batch_size: 8
+  seed: 42
+  use_dynamic_sampling: false
+  dynamic_sampling_max_gen_batches: 10
+  batch_multiplier: 1
+  overlong_filtering: true
+  seq_logprob_error_threshold: 1.5
+
+  adv_estimator:
+    name: "grpo"
+    normalize_rewards: ${grpo.normalize_rewards}
+    use_leave_one_out_baseline: ${grpo.use_leave_one_out_baseline}
+    minus_baseline: true
+
+  reward_shaping:
+    enabled: true
+    overlong_buffer_length: 256
+    overlong_buffer_penalty: 1.0
+    max_response_length: ${policy.max_total_sequence_length}
+    stop_properly_penalty_coef: null
+
+  reward_scaling:
+    enabled: false
+    source_min: 0.0
+    source_max: 1.0
+    target_min: 0.0
+    target_max: 1.0
+
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 2
+    in_flight_weight_updates: true
+    recompute_kv_cache_after_weight_updates: true
+
+loss_fn:
+  reference_policy_kl_penalty: 0.01
+  reference_policy_kl_type: "k3"
+  kl_input_clamp_value: 20.0
+  kl_output_clamp_value: 10.0
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.2
+  ratio_clip_c: null
+  use_on_policy_kl_approximation: false
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: null
+  truncated_importance_sampling_ratio: null
+  truncated_importance_sampling_ratio_min: null
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+  force_on_policy_ratio: false
+  use_kl_in_reward: false
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/grpo-osworld"
+  metric_name: "val:accuracy"
+  higher_is_better: true
+  keep_top_k: 3
+  save_period: 50
+  checkpoint_must_save_by: null
+  model_save_format: "safetensors"
+  save_consolidated: false
+  save_optimizer: true
+
+policy:
+  model_name: "Qwen/Qwen2.5-VL-7B-Instruct"
+  tokenizer:
+    name: ${policy.model_name}
+    # Load the multimodal AutoProcessor (not a bare tokenizer) for the CUA path.
+    use_processor: true
+    chat_template: null
+    chat_template_kwargs: null
+  hf_config_overrides: {}
+  train_global_batch_size: 64
+  train_micro_batch_size: 1
+  logprob_batch_size: ${policy.train_micro_batch_size}
+  # Each turn appends a screenshot; Qwen2.5-VL encodes an image to up to ~1280
+  # tokens, so a 16-turn episode is image-token heavy. Size generously and cap
+  # image resolution via the processor / limit_mm_per_prompt below.
+  max_total_sequence_length: 32768
+  precision: "bfloat16"
+  logprob_chunk_size: null
+  offload_optimizer_for_logprob: true
+  max_grad_norm: 1.0
+  make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
+
+  dtensor_cfg:
+    _v2: true
+    enabled: true
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+    automodel_kwargs: {}
+    lora_cfg:
+      enabled: false
+      target_modules: []
+      exclude_modules: []
+      match_all_linear: true
+      dim: 8
+      alpha: 32
+      dropout: 0.0
+      dropout_position: "post"
+      lora_A_init: "xavier"
+      use_triton: true
+
+  megatron_cfg:
+    enabled: false
+
+  draft:
+    enabled: false
+    model_name: null
+    loss_weight: 0.1
+    num_layers: null
+    aux_layer_indices: null
+
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    sequence_length_round: 64
+
+  # Sequence packing is disabled on the multimodal path: packing interleaves
+  # samples in one sequence, which does not compose with per-sample image
+  # placeholder/pixel alignment. Keep one sample per microbatch.
+  sequence_packing:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 3.0e-7
+      weight_decay: 0.01
+      betas: [0.9, 0.999]
+      eps: 1.0e-8
+      foreach: false
+      fused: false
+
+  scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.1
+        end_factor: 1.0
+        total_iters: 20
+    - name: "torch.optim.lr_scheduler.ConstantLR"
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: [20]
+
+  generation:
+    backend: "vllm"
+    # Per-turn cap: one action (with brief reasoning), not the whole episode.
+    max_new_tokens: 1024
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    vllm_cfg:
+      async_engine: true
+      precision: ${policy.precision}
+      kv_cache_dtype: "auto"
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.85
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: false
+      enable_prefix_caching: true
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 1.0
+    # vLLM defaults to one image per prompt; a CUA episode accumulates one per
+    # turn, so raise the per-prompt image cap to the turn budget.
+    vllm_kwargs:
+      limit_mm_per_prompt:
+        image: ${grpo.max_rollout_turns}
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 1
+
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  shuffle: true
+  num_workers: 2
+  use_multiple_dataloader: false
+
+  train:
+    dataset_name: "osworld"                       # DATASET_REGISTRY key → OSWorldDataset
+    # OSWorld evaluation_examples tree. null → DOCKYARD_OSWORLD_DATA_DIR env var.
+    data_dir: null
+    split_file: "test_all.json"
+    # Optional subset filters (null → all domains/tasks).
+    domains: null
+    task_ids: null
+    include_infeasible: true
+    max_prompt_length: 4096
+    # Per-episode turn budget; keep grpo.max_rollout_turns above it.
+    max_turns: 15
+    screen_width: 1920
+    screen_height: 1080
+    pause_after_action: 2.0
+    shuffle_seed: ${grpo.seed}
+
+  validation:
+    dataset_name: "osworld"
+    data_dir: null
+    split_file: "test_small.json"
+    domains: null
+    task_ids: null
+    include_infeasible: true
+    max_prompt_length: 4096
+    max_turns: 15
+    screen_width: 1920
+    screen_height: 1080
+    pause_after_action: 2.0
+
+  default:
+    processor: "osworld_data_processor"
+    env_name: "osworld"
+
+env:
+  osworld:
+    # Actuation/observation backend:
+    #   "official"       desktop_env.DesktopEnv (docker KVM provider) — reference.
+    #   "control_center" in-house Linux stack: The-Eye + control-center + OSWorld
+    #                    guest server for setup/grading (ubuntu-desktop-code; see
+    #                    experience/cua/image/osworld-guest.dockerfile).
+    #   "windows"        Windows guest: The-Eye + control-center (cmd-file/AHK
+    #                    actuation). No built-in grading — OSWorld tasks are
+    #                    Ubuntu-authored; supply env.osworld.grader for custom
+    #                    Windows task sets (see experience/cua/tasks).
+    #   "macos"          macOS guest (mac15-base / OSX-KVM): The-Eye + control-center
+    #                    (cliclick/osascript actuation). Same custom-only grading as
+    #                    windows — supply env.osworld.grader for custom macOS tasks.
+    # The official backend is the offline-validated default; control_center/windows/
+    # macos need a provisioned container reachable via the host pool (provision below).
+    backend: "official"
+    # DesktopEnv provider: "docker" (KVM-in-container, no snapshot → slow
+    # teardown+boot reset) or "aws" (snapshot-revert, fast reset at scale; build
+    # the OSWorld AMI per upstream, then set region + path_to_vm to the AMI/host).
+    provider_name: "docker"
+    region: null              # aws provider: AWS region (e.g. "us-east-1")
+    path_to_vm: null          # aws provider: AMI/host identifier
+    snapshot_name: "init_state"   # snapshot reverted on reset (aws fast path)
+    # Default per-episode turn budget when a task row omits max_turns.
+    max_turns: 15
+    headless: true
+    # Screenshot-primary; the a11y tree is not dumped as text by default.
+    require_a11y_tree: false
+    include_a11y_text: false
+    require_terminal: false
+    screen_width: 1920
+    screen_height: 1080
+    pause_after_action: 2.0
+    client_password: ""
+    cache_dir: "cache/osworld"
+    # Actor concurrency for parallel begin_episode/step calls (async rollout).
+    # One live container/VM per concurrent episode, so keep max_concurrency <= the
+    # host pool size (provision.pool_size / len(hosts)); beyond that, episodes block
+    # on the provisioner's acquire (intended backpressure, but idle concurrency).
+    # The async collector runs num_prompts_per_step*num_generations_per_prompt
+    # rollouts and stays <= max_trajectory_age_steps weight-versions ahead of train.
+    max_concurrency: 8
+    # Custom Ray resources the env actor requests, to pin it to capable nodes.
+    # The official backend runs a KVM-in-docker DesktopEnv on its own node, so on
+    # a mixed cluster set {kvm: 0.001} to land it only on nodes advertising "kvm"
+    # (auto-declared from /dev/kvm in cluster/bootstrap.py; on multi-node Slurm
+    # add "kvm": <slots> to ray.sub's `ray start --resources`). The control_center
+    # backend only needs network reach to its container hosts, so it can stay {}.
+    node_resources: {}
+
+    # ── control-center backend (set backend: "control_center" to use) ─────────
+    # Address of the provisioned ubuntu-desktop-code container running The-Eye,
+    # control-center, the OSWorld guest server, and the Task Executor.
+    host: null
+    # Service ports on that host.
+    eye_port: 8080            # The-Eye  GET /snapshot.png (observation)
+    cc_port: 50051            # control-center ExecuteCommand (actuation)
+    guest_port: 5000          # OSWorld guest server (setup + grading getters)
+    cc_use_ssl: false
+    # Physical desktop resolution control-center actuates on; the model's
+    # coordinates (in screen_width x screen_height) are scaled to this when they
+    # differ. Defaults to screen_width/height when null.
+    desktop_width: null
+    desktop_height: null
+    display: ":0"             # X display for xdotool inside the container
+    # Host pool (provisioner.py). One env actor at max_concurrency=N needs N
+    # container hosts; acquire blocks when all are busy (backpressure).
+    #   attach       — single host above (pool of one; serializes episodes).
+    #   static_pool  — hosts: [...] below, a warm pool the fleet stands up.
+    #   docker_pool  — pre-boot pool_size containers from docker_image via docker.
+    provision: "attach"
+    hosts: null                          # static_pool: list of container hosts
+    docker_image: null                   # docker_pool: image to pre-boot
+    pool_size: 8                          # docker_pool: containers to boot
+    docker_network: null                 # docker_pool: docker network (per-IP)
+    docker_run_kwargs: {}                # docker_pool: host-specific run opts
+    acquire_timeout: null                # seconds to wait for a free host (null=block)
+    # control-center auth uses its own env vars (not DOCKYARD_-prefixed):
+    #   CONTROL_CENTER_TOKEN  pre-minted bearer (execute scope) — preferred, or
+    #   CC_JWT_SECRET         HS256 secret to mint one (+ JWT_AUDIENCE/JWT_ISSUER)
+    # The-Eye bearer (optional):
+    eye_token: null
+    # ── custom-task grading (windows backend; also usable for custom Linux/mac
+    #    sets) ──────────────────────────────────────────────────────────────
+    # OSWorld's evaluators are Ubuntu-authored and grade via the :5000 guest
+    # server, absent on the Windows/macOS guests. For custom task sets, set
+    # grader to enable the registry-backed dispatch in experience/cua/grading:
+    #   grader: null | false   no grading configured (windows evaluate() raises).
+    #   grader: "custom"       grade via the named evaluator in each task's
+    #                          task_config.evaluator.func (FAIL-gate + conj as in
+    #                          OSWorld). Built-ins: manual, final_action_match,
+    #                          screenshot_judge. Author more with
+    #                          @register_evaluator and list their modules below.
+    grader: null
+    evaluator_modules: []     # dotted module paths to import so task-set
+                              # evaluators self-register (e.g. my_pkg.win_evals)
+    # judge: a callable(image_bytes, instruction, **options) -> float for the
+    # screenshot_judge evaluator. Not YAML-settable (it is a model); inject it
+    # programmatically into the env config when building the run.
+
+logger:
+  log_dir: "logs/grpo-osworld"
+  num_val_samples_to_print: 3
+  wandb_enabled: false
+  tensorboard_enabled: true
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: true
+  wandb:
+    project: "dockyard-rl"
+    name: "grpo-osworld"
+  tensorboard: {}
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 4

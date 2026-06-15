@@ -1,0 +1,483 @@
+#!/bin/bash
+#SBATCH --nodes=2
+#SBATCH --exclusive
+#SBATCH --account=ACCOUNT
+#SBATCH --job-name=JOB_NAME
+#SBATCH --partition=PARTITION
+#SBATCH --time=1:0:0
+#SBATCH --dependency=singleton
+
+# Project Dockyard — Slurm Ray cluster bootstrap script.
+#
+# Adapted from the NVidia RL ray.sub.  Key differences:
+#   - NeMo venv paths (/opt/nemo_rl_venv) replaced with ubuntu-swe
+#     system Python (/usr/local/bin/python3).
+#   - uv venv machinery removed (ubuntu-swe bakes all deps into the
+#     system Python at image build time).
+#   - RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 retained (already set in
+#     ubuntu-swe-v2.dockerfile; keeping it here for defence-in-depth).
+#   - DOCKYARD_FLEET_ROLE exported before ray start so bootstrap.py
+#     reads it correctly on every node.
+#   - Nsight patch updated to find ray in the system site-packages.
+#
+# Usage (Slurm):
+#   CONTAINER=nullvoider/ubuntu-swe:latest \
+#   MOUNTS="$PWD:$PWD" \
+#   COMMAND="python3 examples/run_grpo_swe.py" \
+#   sbatch \
+#     --nodes=4 \
+#     --account=YOUR_ACCOUNT \
+#     --partition=YOUR_PARTITION \
+#     --gres=gpu:8 \
+#     scripts/cluster/ray.sub
+#
+# Environment variables (all optional with defaults):
+#   CONTAINER               Docker image to run (required)
+#   MOUNTS                  Comma-separated host:container mount pairs
+#   COMMAND                 Command to run after cluster is ready.
+#                           If empty, cluster idles and an attach script
+#                           is generated.
+#   GPUS_PER_NODE           GPUs per node (default: 8)
+#   CPUS_PER_WORKER         CPUs per node (default: GPUS_PER_NODE * 16)
+#   PORT                    Ray head port (default: 54514)
+#   DASHBOARD_PORT          Ray dashboard port (default: 8265)
+#   RAY_LOG_SYNC_FREQUENCY  Seconds between Ray log syncs (default: off)
+#   BASE_LOG_DIR            Base directory for logs (default: SLURM_SUBMIT_DIR)
+#   MIN_WORKER_PORT         Ray worker port range min (default: 54001)
+#   MAX_WORKER_PORT         Ray worker port range max (default: 54513)
+
+set -eoux pipefail
+
+# GRES detection and validation
+maybe_gres_arg() {
+    if sinfo -p "$SLURM_JOB_PARTITION" -h -o "%G" | grep -q "gpu:"; then
+        if [[ $GPUS_PER_NODE -ne $(sinfo -p "$SLURM_JOB_PARTITION" -h -o "%G" \
+            | grep "gpu:" | awk -F: '{print $NF}') ]]; then
+            echo "Error: GPUS_PER_NODE=$GPUS_PER_NODE but GRES detected is \
+$(sinfo -p "$SLURM_JOB_PARTITION" -h -o "%G" | grep "gpu:")." >&2
+            exit 1
+        fi
+        echo "--gres=gpu:${GPUS_PER_NODE}"
+        return
+    fi
+    echo ""
+}
+
+# User-defined variables and defaults
+CONTAINER=$CONTAINER
+MOUNTS=$MOUNTS
+COMMAND=${COMMAND:-}
+
+# Port configuration
+NODE_MANAGER_PORT=${NODE_MANAGER_PORT:-53001}
+OBJECT_MANAGER_PORT=${OBJECT_MANAGER_PORT:-53003}
+RUNTIME_ENV_AGENT_PORT=${RUNTIME_ENV_AGENT_PORT:-53005}
+DASHBOARD_AGENT_GRPC_PORT=${DASHBOARD_AGENT_GRPC_PORT:-53007}
+METRICS_EXPORT_PORT=${METRICS_EXPORT_PORT:-53009}
+PORT=${PORT:-54514}
+RAY_CLIENT_SERVER_PORT=${RAY_CLIENT_SERVER_PORT:-10001}
+DASHBOARD_PORT=${DASHBOARD_PORT:-8265}
+DASHBOARD_AGENT_LISTEN_PORT=${DASHBOARD_AGENT_LISTEN_PORT:-52365}
+MIN_WORKER_PORT=${MIN_WORKER_PORT:-54001}
+MAX_WORKER_PORT=${MAX_WORKER_PORT:-54513}
+
+RAY_DEBUGGER_ARGS=
+if [ "${RAY_DEBUG:-}" = "legacy" ]; then
+    RAY_DEBUGGER_ARGS="--ray-debugger-external"
+fi
+
+# Prevent uv venv stampede — ubuntu-swe bakes all deps into system Python.
+export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
+
+# Recommended by Ray best practices for large clusters.
+if [[ $(ulimit -Hn) == "unlimited" ]] || [[ 65535 -lt $(ulimit -Hn) ]]; then
+    ulimit -Sn 65535
+elif [[ $(ulimit -Hn) != "unlimited" ]] && [[ $(ulimit -Hn) -lt 65535 ]]; then
+    echo "[WARNING]: Cannot increase ulimit on file descriptors to 65535 \
+per Ray recommendation. Speak to cluster admins to increase."
+fi
+
+RAY_LOG_SYNC_FREQUENCY=${RAY_LOG_SYNC_FREQUENCY:-}
+
+BASE_LOG_DIR=${BASE_LOG_DIR:-$SLURM_SUBMIT_DIR}
+LOG_DIR="$BASE_LOG_DIR/$SLURM_JOB_ID-logs"
+mkdir -p "$LOG_DIR"
+
+GPUS_PER_NODE=${GPUS_PER_NODE:-8}
+GRES_ARG=$(maybe_gres_arg)
+if [[ -n "$GRES_ARG" ]]; then
+    echo "[INFO] GRES support detected. Using: $GRES_ARG"
+else
+    echo "[INFO] No GRES support detected. Running without --gres flag."
+fi
+
+COMMON_SRUN_ARGS="$GRES_ARG"
+COMMON_SRUN_ARGS+=" --no-container-mount-home"
+COMMON_SRUN_ARGS+=" --mpi=pmix"
+COMMON_SRUN_ARGS+=" --container-mounts=$MOUNTS"
+COMMON_SRUN_ARGS+=" --container-image=$CONTAINER"
+COMMON_SRUN_ARGS+=" --container-workdir=$SLURM_SUBMIT_DIR"
+COMMON_SRUN_ARGS+=" -p $SLURM_JOB_PARTITION"
+COMMON_SRUN_ARGS+=" -A $SLURM_JOB_ACCOUNT"
+
+CPUS_PER_WORKER=${CPUS_PER_WORKER:-$((GPUS_PER_NODE * 16))}
+
+num_retries=3
+
+declare -A SRUN_PIDS
+
+check_srun_processes() {
+    for name in "${!SRUN_PIDS[@]}"; do
+        pid="${SRUN_PIDS[$name]}"
+        if ! kill -0 "$pid" 2>/dev/null; then
+            echo "[ERROR] Background srun '$name' died (pid=$pid). Exiting." >&2
+            touch "$LOG_DIR/ENDED"
+            exit 1
+        fi
+    done
+}
+
+# Node IP resolution
+nodes=$(scontrol show hostnames "$SLURM_JOB_NODELIST")
+nodes_array=($nodes)
+ip_addresses_array=()
+
+for node in $nodes; do
+    echo "[DEBUG] Resolving hostname: $node"
+    ip_address=""
+
+    ip_address=$(host "$node" 2>/dev/null | awk '/has address/ { print $4 }' \
+        | head -1 || true)
+
+    if [[ -z "$ip_address" ]]; then
+        ip_address=$(getent hosts "$node" 2>/dev/null | awk '{ print $1 }' \
+            | head -1 || true)
+    fi
+
+    if [[ -z "$ip_address" ]]; then
+        ip_address=$(nslookup "$node" 2>/dev/null \
+            | awk '/^Address: / { print $2 }' | head -1 || true)
+    fi
+
+    if [[ -z "$ip_address" ]]; then
+        ip_address=$(ping -c 1 "$node" 2>/dev/null \
+            | grep "PING" | sed 's/.*(\([^)]*\)).*/\1/' || true)
+    fi
+
+    if [[ -z "$ip_address" ]]; then
+        echo "[WARNING] Could not resolve IP for $node, using hostname as fallback"
+        ip_address=$node
+    fi
+
+    echo "[INFO] Node: $node -> IP: $ip_address"
+    ip_addresses_array+=("$ip_address")
+done
+
+head_node=${nodes_array[0]}
+head_node_ip=${ip_addresses_array[0]}
+ip_head="$head_node_ip:$PORT"
+
+# Head node command
+head_cmd=$(cat <<EOF
+touch "$LOG_DIR/STARTED_RAY_HEAD"
+env
+
+exit-dramatically() {
+    pkill -P \$\$ || true
+    kill -TERM 0  || true
+    exit 1
+}
+export -f exit-dramatically
+
+monitor-sidecar() {
+    set +x
+    while true; do
+        sleep 60
+        if [[ -f "$LOG_DIR/ENDED" ]]; then
+            echo "Detected ENDED file, terminating..."
+            exit-dramatically
+        fi
+    done
+}
+monitor-sidecar &
+
+log-sync-sidecar() {
+    set +x
+    if [[ -z "$RAY_LOG_SYNC_FREQUENCY" ]]; then
+        echo "RAY_LOG_SYNC_FREQUENCY not set, skipping log sync sidecar"
+        return
+    fi
+    mkdir -p "$LOG_DIR/ray"
+    while true; do
+        sleep "$RAY_LOG_SYNC_FREQUENCY"
+        if ls /tmp/ray/session_[0-9]* > /dev/null 2>&1; then
+            for session_dir in /tmp/ray/session_[0-9]*/; do
+                if [[ -d "\$session_dir/logs" ]]; then
+                    session_name=\$(basename "\$session_dir")
+                    mkdir -p "$LOG_DIR/ray/\$session_name"
+                    if command -v rsync > /dev/null 2>&1; then
+                        rsync -ahP "\$session_dir/logs/" \
+                            "$LOG_DIR/ray/\$session_name/logs/" 2>/dev/null || true
+                    else
+                        cp -r "\$session_dir/logs" "$LOG_DIR/ray/\$session_name/"
+                    fi
+                fi
+            done
+        fi
+        if [[ -f "$LOG_DIR/ENDED" ]]; then
+            echo "Log sync sidecar terminating..."
+            break
+        fi
+    done
+}
+log-sync-sidecar &
+
+# Patch nsight.py to forward the actual python executable instead of
+# appending a bare "python" string — works with ubuntu-swe system Python.
+NSIGHT_PY=\$(python3 -c \
+    "import ray, os; print(os.path.join(os.path.dirname(ray.__file__), \
+    '_private', 'runtime_env', 'nsight.py'))" 2>/dev/null || true)
+if [[ -f "\$NSIGHT_PY" ]]; then
+    sed -i \
+        's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/context.py_executable = " ".join(self.nsight_cmd) + f" {context.py_executable}"/g' \
+        "\$NSIGHT_PY" || true
+fi
+
+# KVM-capable sandbox nodes (OSWorld official backend = KVM-in-docker): append
+# , "kvm": <slots>  to the --resources JSON below so OSWorld env actors that
+# request env.osworld.node_resources={kvm: ...} land only here. Mirrors the local
+# auto-declare in cluster/bootstrap.py (DOCKYARD_KVM_SLOTS, default 8).
+cat <<EOFI | tee /launch-head.sh
+ray start --head \\
+    --disable-usage-stats \\
+    --resources='{"worker_units": $GPUS_PER_NODE, "dockyard_managed_ray_cluster": 1}' \\
+    --node-ip-address="$head_node_ip" \\
+    --port=${PORT} \\
+    --ray-client-server-port=${RAY_CLIENT_SERVER_PORT} \\
+    --dashboard-port=${DASHBOARD_PORT} \\
+    --dashboard-host="$head_node_ip" \\
+    --include-dashboard=True \\
+    --node-manager-port=\$((${NODE_MANAGER_PORT} + 1)) \\
+    --object-manager-port=\$((${OBJECT_MANAGER_PORT} + 1)) \\
+    --runtime-env-agent-port=\$((${RUNTIME_ENV_AGENT_PORT} + 1)) \\
+    --dashboard-agent-grpc-port=\$((${DASHBOARD_AGENT_GRPC_PORT} + 1)) \\
+    --dashboard-agent-listen-port=\$((${DASHBOARD_AGENT_LISTEN_PORT} + 1)) \\
+    --metrics-export-port=\$((${METRICS_EXPORT_PORT} + 1)) \\
+    $RAY_DEBUGGER_ARGS \\
+    --block
+EOFI
+chmod +x /launch-head.sh
+
+count=0
+while [[ \$count -lt $num_retries ]]; do
+    bash /launch-head.sh
+    count=\$((count + 1))
+    echo "Head node failed \$count/$num_retries times, restarting in 5s..."
+    sleep 5
+done
+touch "$LOG_DIR/ENDED"
+exit 1
+EOF
+)
+
+srun $COMMON_SRUN_ARGS \
+    --container-name=ray-head \
+    --nodes=1 --ntasks=1 \
+    --cpus-per-task="$CPUS_PER_WORKER" \
+    -w "$head_node" \
+    -o "$LOG_DIR/ray-head.log" \
+    bash -x -c "$head_cmd" &
+SRUN_PIDS["ray-head"]=$!
+
+NUM_ACTORS=$((GPUS_PER_NODE * SLURM_JOB_NUM_NODES))
+
+# Worker nodes
+for ((i = 1; i < SLURM_JOB_NUM_NODES; i++)); do
+    node_i=${nodes_array[$i]}
+
+    worker_cmd=$(cat <<EOF
+env
+
+exit-dramatically() {
+    pkill -P \$\$ || true
+    kill -TERM 0  || true
+    exit 1
+}
+
+monitor-sidecar() {
+    set +x
+    while true; do
+        sleep 60
+        if [[ -f "$LOG_DIR/ENDED" ]]; then
+            echo "Detected ENDED file, terminating..."
+            exit-dramatically
+        fi
+    done
+}
+monitor-sidecar &
+
+log-sync-sidecar() {
+    set +x
+    if [[ -z "$RAY_LOG_SYNC_FREQUENCY" ]]; then
+        echo "RAY_LOG_SYNC_FREQUENCY not set, skipping log sync sidecar"
+        return
+    fi
+    mkdir -p "$LOG_DIR/ray/$node_i"
+    while true; do
+        sleep "$RAY_LOG_SYNC_FREQUENCY"
+        if ls /tmp/ray/session_[0-9]* > /dev/null 2>&1; then
+            for session_dir in /tmp/ray/session_[0-9]*/; do
+                if [[ -d "\$session_dir/logs" ]]; then
+                    session_name=\$(basename "\$session_dir")
+                    mkdir -p "$LOG_DIR/ray/$node_i/\$session_name"
+                    if command -v rsync > /dev/null 2>&1; then
+                        rsync -ahP "\$session_dir/logs/" \
+                            "$LOG_DIR/ray/$node_i/\$session_name/logs/" 2>/dev/null || true
+                    else
+                        cp -r "\$session_dir/logs" "$LOG_DIR/ray/$node_i/\$session_name/"
+                    fi
+                fi
+            done
+        fi
+        if [[ -f "$LOG_DIR/ENDED" ]]; then
+            echo "Log sync sidecar terminating..."
+            break
+        fi
+    done
+}
+log-sync-sidecar &
+
+NSIGHT_PY=\$(python3 -c \
+    "import ray, os; print(os.path.join(os.path.dirname(ray.__file__), \
+    '_private', 'runtime_env', 'nsight.py'))" 2>/dev/null || true)
+if [[ -f "\$NSIGHT_PY" ]]; then
+    sed -i \
+        's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/context.py_executable = " ".join(self.nsight_cmd) + f" {context.py_executable}"/g' \
+        "\$NSIGHT_PY" || true
+fi
+
+cat <<EOFI | tee /launch-worker.sh
+ray start --address "$ip_head" \\
+    --disable-usage-stats \\
+    --resources='{"worker_units": $GPUS_PER_NODE, "dockyard_managed_ray_cluster": 1}' \\
+    --min-worker-port=${MIN_WORKER_PORT} \\
+    --max-worker-port=${MAX_WORKER_PORT} \\
+    --node-manager-port=${NODE_MANAGER_PORT} \\
+    --object-manager-port=${OBJECT_MANAGER_PORT} \\
+    --runtime-env-agent-port=${RUNTIME_ENV_AGENT_PORT} \\
+    --dashboard-agent-grpc-port=${DASHBOARD_AGENT_GRPC_PORT} \\
+    --dashboard-agent-listen-port=${DASHBOARD_AGENT_LISTEN_PORT} \\
+    --metrics-export-port=${METRICS_EXPORT_PORT} \\
+    $RAY_DEBUGGER_ARGS \\
+    --block
+EOFI
+
+count=0
+while [[ \$count -lt $num_retries ]]; do
+    bash /launch-worker.sh
+    count=\$((count + 1))
+    echo "Worker failed \$count/$num_retries times, restarting in 5s..."
+    sleep 5
+done
+touch "$LOG_DIR/ENDED"
+exit 1
+EOF
+)
+    srun $COMMON_SRUN_ARGS \
+        --container-name="ray-worker-$i" \
+        --exact --nodes=1 --ntasks=1 \
+        --cpus-per-task="$CPUS_PER_WORKER" \
+        -w "$node_i" \
+        -o "$LOG_DIR/ray-worker-$i.log" \
+        bash -x -c "$worker_cmd" &
+    SRUN_PIDS["ray-worker-$i"]=$!
+    sleep 3
+done
+
+# Wait for head, then all workers
+while check_srun_processes && \
+    ! srun --overlap --nodes=1 --ntasks=1 -w "$head_node" \
+        test -f "$LOG_DIR/STARTED_RAY_HEAD"; do
+    echo "[INFO][$(date)] Waiting for head node container to start..."
+    sleep 2
+done
+
+extract_worker_units() {
+    status_output=$(srun --overlap --container-name=ray-head \
+        --nodes=1 --ntasks=1 -w "$head_node" ray status)
+    if echo "$status_output" | grep -q "worker_units"; then
+        echo "$status_output" \
+            | grep "worker_units" \
+            | awk -F'[/. ]' '{print $4}'
+    else
+        echo 0
+    fi
+}
+
+while true; do
+    worker_units=$(extract_worker_units)
+    echo "[INFO] Actors online: $worker_units/$NUM_ACTORS"
+    if [[ "$worker_units" -eq "$NUM_ACTORS" ]]; then
+        break
+    fi
+    check_srun_processes
+    sleep 2
+done
+
+echo "All workers connected!"
+
+CONTAINER_CWD=$(scontrol show job "$SLURM_JOB_ID" \
+    | grep -oP 'WorkDir=\K[^ ]+' | head -1)
+
+if [[ -n "$COMMAND" ]]; then
+    srun --no-container-mount-home --overlap \
+        --container-name=ray-head \
+        --container-workdir="$CONTAINER_CWD" \
+        --nodes=1 --ntasks=1 \
+        -w "$head_node" \
+        -o "$LOG_DIR/ray-driver.log" \
+        bash -c "$COMMAND"
+else
+    echo "[INFO]: Ray Cluster is idled. Run the following to attach:"
+    cat <<EOF > "$SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh"
+WORKER_NUM=\${1:-}
+if [[ -z "\$WORKER_NUM" ]]; then
+    if [[ -n "\${COMMAND:-}" ]]; then
+        srun --no-container-mount-home $GRES_ARG \
+            -A "$SLURM_JOB_ACCOUNT" -p "$SLURM_JOB_PARTITION" \
+            --overlap --container-name=ray-head \
+            --container-workdir="$CONTAINER_CWD" \
+            --nodes=1 --ntasks=1 -w "$head_node" \
+            --jobid "$SLURM_JOB_ID" bash -c "\$COMMAND"
+    else
+        srun --no-container-mount-home $GRES_ARG \
+            -A "$SLURM_JOB_ACCOUNT" -p "$SLURM_JOB_PARTITION" \
+            --overlap --container-name=ray-head \
+            --container-workdir="$CONTAINER_CWD" \
+            --nodes=1 --ntasks=1 -w "$head_node" \
+            --jobid "$SLURM_JOB_ID" --pty bash
+    fi
+else
+    nodes_array=($nodes)
+    if [[ -n "\${COMMAND:-}" ]]; then
+        srun --no-container-mount-home $GRES_ARG \
+            -A "$SLURM_JOB_ACCOUNT" -p "$SLURM_JOB_PARTITION" \
+            --overlap --container-name="ray-worker-\$WORKER_NUM" \
+            --container-workdir="$CONTAINER_CWD" \
+            --nodes=1 --ntasks=1 -w "\${nodes_array[\$WORKER_NUM]}" \
+            --jobid "$SLURM_JOB_ID" bash -c "\$COMMAND"
+    else
+        srun --no-container-mount-home $GRES_ARG \
+            -A "$SLURM_JOB_ACCOUNT" -p "$SLURM_JOB_PARTITION" \
+            --overlap --container-name="ray-worker-\$WORKER_NUM" \
+            --container-workdir="$CONTAINER_CWD" \
+            --nodes=1 --ntasks=1 -w "\${nodes_array[\$WORKER_NUM]}" \
+            --jobid "$SLURM_JOB_ID" --pty bash
+    fi
+fi
+EOF
+    chmod +x "$SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh"
+    echo "  bash $SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh    # attach to head node"
+    echo "  bash $SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh 1  # attach to worker 1"
+    sleep infinity
+fi
