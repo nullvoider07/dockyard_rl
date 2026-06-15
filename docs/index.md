@@ -64,49 +64,13 @@ re-implementation rather than a fork, but its lineage traces to NeMo-RL. See the
 
 ```{toctree}
 :hidden:
-:caption: Getting started
 :maxdepth: 2
 
 getting-started/index
-```
-
-```{toctree}
-:hidden:
-:caption: Architecture
-:maxdepth: 2
-
 architecture/index
-```
-
-```{toctree}
-:hidden:
-:caption: Design docs
-:maxdepth: 2
-
 design-docs/index
-```
-
-```{toctree}
-:hidden:
-:caption: Environments
-:maxdepth: 2
-
 environments/index
-```
-
-```{toctree}
-:hidden:
-:caption: Deployment
-:maxdepth: 2
-
 deployment/index
-```
-
-```{toctree}
-:hidden:
-:caption: Reference
-:maxdepth: 2
-
 glossary
 apidocs/index
 ```
