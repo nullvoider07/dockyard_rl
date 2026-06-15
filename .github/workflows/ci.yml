@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compile:
+    name: Byte-compile (whole tree)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Syntax-level validation of every tracked module. The runtime stack
+      # (torch / JAX / vLLM / Ray) is not installed here, so this is a compile
+      # check, not an import check.
+      - name: compileall
+        run: python -m compileall -q algorithms cluster data data_plane distributed environments evals examples experience models rewards sandbox tool_protocol utils weight_sync modelopt
+
+  lint:
+    name: Lint (ruff, fatal subset)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pipx install ruff==0.12.7
+      # High-signal only: syntax errors, broken comparisons/asserts, misplaced
+      # statements, and undefined names. Style rules are intentionally not gated.
+      - name: ruff check
+        run: ruff check --select E9,F63,F7,F82 .
+
+  infra-tests:
+    name: Infra k8s unit tests + manifest validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dockyard-k8s (+ test extra)
+        run: pip install ./infra/dockyard_k8s[test]
+      - name: pytest
+        run: pytest infra/dockyard_k8s/tests -q
+      - name: Install kubeconform
+        run: |
+          KC_VERSION=v0.6.7
+          curl -fsSL "https://github.com/yannh/kubeconform/releases/download/${KC_VERSION}/kubeconform-linux-amd64.tar.gz" \
+            | tar -xz -C /usr/local/bin kubeconform
+          kubeconform -v
+      - name: Validate manifests
+        run: bash infra/dockyard_k8s/scripts/validate-manifests.sh

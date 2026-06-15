@@ -1,0 +1,42 @@
+version: 2
+
+updates:
+  # Root package — local-dev / CI dependencies (runtime deps are baked into the
+  # ubuntu-swe image, not pinned here).
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels: [dependencies]
+    commit-message:
+      prefix: deps
+
+  # Documentation build toolchain.
+  - package-ecosystem: pip
+    directory: /docs
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels: [dependencies, docs]
+    commit-message:
+      prefix: "deps(docs)"
+
+  # Kubernetes deployment CLI (operator-host tool).
+  - package-ecosystem: pip
+    directory: /infra/dockyard_k8s
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels: [dependencies, infra]
+    commit-message:
+      prefix: "deps(infra)"
+
+  # GitHub Actions used by the workflows below.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    labels: [dependencies, ci]
+    commit-message:
+      prefix: ci

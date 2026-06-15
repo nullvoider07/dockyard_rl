@@ -1,0 +1,3 @@
+# Default owner for everything in the repository.
+# Used to auto-request review and (with branch protection) enforce review.
+*       @nullvoider07

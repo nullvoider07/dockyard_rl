@@ -20,7 +20,7 @@ PREFERENCE_DATASET_REGISTRY: dict[str, str] = {
     "tulu3": "dockyard_rl.data.datasets.preference_datasets.tulu3.Tulu3PreferenceDataset",
 }
 
-def load_preference_dataset(dataset_cfg: PreferenceDataset | BinaryPreferenceDataset) -> "RawDataset":  # type: ignore[name-defined]
+def load_preference_dataset(dataset_cfg: PreferenceDataset | BinaryPreferenceDataset) -> "RawDataset":  # type: ignore[name-defined]  # noqa: F821
     """Instantiate a preference dataset from a config dict.
 
     Args:

@@ -11,8 +11,8 @@ from datetime import datetime
 
 # Project metadata
 project = "dockyard_rl"
-author = "Project Dockyard"
-copyright = f"{datetime.now():%Y}, Project Dockyard"
+author = "Kartik A (NullVoider)"
+copyright = f"{datetime.now():%Y}, Kartik A (NullVoider)"
 release = "0.1.0.dev0"
 version = "0.1"
 
@@ -24,6 +24,7 @@ extensions = [
     "sphinx.ext.intersphinx",
     "sphinx.ext.doctest",
     "sphinx_copybutton",
+    "sphinxcontrib.mermaid",
 ]
 
 # MyST (Markdown) features
@@ -35,6 +36,9 @@ myst_enable_extensions = [
     "attrs_inline",
 ]
 myst_heading_anchors = 3
+# Render ```mermaid fenced blocks via the sphinxcontrib-mermaid directive
+# (client-side mermaid.js in HTML output) instead of as highlighted code.
+myst_fence_as_directive = ["mermaid"]
 
 # autodoc2 — static API extraction from the package source.
 # docs/ lives inside the package directory, so "../" resolves to the

@@ -1,0 +1,46 @@
+name: Bug report
+description: Report a defect in dockyard_rl
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Please do not include credentials, tokens, or
+        internal hostnames. For security issues, use the Security tab instead.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: The bug, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: Minimal steps, config overrides, or a command line.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - algorithms (GRPO / loss)
+        - models (generation / policy / dtensor)
+        - models/jax (Flax NNX backend)
+        - distributed / cluster
+        - data / environments / rewards
+        - sandbox / ubuntu-base
+        - infra (Kubernetes / Slurm)
+        - docs
+        - other
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Backend (torch/JAX), Python, accelerator, Ray version, etc.
+    validations:
+      required: false
