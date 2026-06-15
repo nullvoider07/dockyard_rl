@@ -7,7 +7,7 @@
 ![Trainer](https://img.shields.io/badge/trainer-DTensor%20%7C%20JAX%2FNNX-orange)
 ![Generation](https://img.shields.io/badge/generation-vLLM%20%7C%20SGLang-7E57C2)
 
-[Documentation](docs/index.md) · [Architecture](docs/architecture/overview.md) · [Design docs](docs/design-docs/index.md) · [Environments](docs/environments/index.md)
+[Documentation](https://nullvoider07.github.io/dockyard_rl/) · [Architecture](https://nullvoider07.github.io/dockyard_rl/architecture/overview.html) · [Design docs](https://nullvoider07.github.io/dockyard_rl/design-docs/index.html) · [Environments](https://nullvoider07.github.io/dockyard_rl/environments/index.html)
 
 </div>
 
@@ -75,7 +75,7 @@ What you can expect:
 - **Beyond code** — multi-turn terminal agents, cleanroom program reconstruction,
   file-producing tasks, and full GUI computer-use (multimodal).
 
-See the [design docs](docs/design-docs/index.md) for the architecture and the
+See the [design docs](https://nullvoider07.github.io/dockyard_rl/design-docs/index.html) for the architecture and the
 reasoning behind each subsystem.
 
 ### Training backends
@@ -88,7 +88,7 @@ The trainer backend is selected from the YAML config; both implement the same
 - **JAX / Flax NNX** — `jax.sharding` (GSPMD, XLA's automatic sharding) + optax,
   with Hugging Face (HF) weight parity and the same refit name-map. Selected by
   `policy.jax_cfg.enabled`. See
-  [the JAX trainer design doc](docs/design-docs/jax-trainer.md).
+  [the JAX trainer design doc](https://nullvoider07.github.io/dockyard_rl/design-docs/jax-trainer.html).
 
 ### Generation backends
 
@@ -182,7 +182,7 @@ package and a CPU stack are needed:
 pip install -e .          # lightweight local-dev deps; GPU stack comes from the image
 ```
 
-See [docs/getting-started/installation.md](docs/getting-started/installation.md)
+See the [installation guide](https://nullvoider07.github.io/dockyard_rl/getting-started/installation.html)
 for the full runtime model and environment variables.
 
 ## Quick start
@@ -200,7 +200,7 @@ python3 examples/run_grpo_swe.py \
 ```
 
 Everything after `--config` is a Hydra-style dot-notation override. The
-[quickstart guide](docs/getting-started/quickstart.md) walks through each stage of
+[quickstart guide](https://nullvoider07.github.io/dockyard_rl/getting-started/quickstart.html) walks through each stage of
 what launches.
 
 ## Support matrix
@@ -225,7 +225,7 @@ GRPO replaces the value network of PPO (Proximal Policy Optimization) with a
 group-relative baseline: several rollouts are sampled per prompt, and each
 rollout's advantage is its reward minus the group mean (leave-one-out). The
 design is detailed in
-[docs/design-docs/grpo-and-loss.md](docs/design-docs/grpo-and-loss.md).
+[the GRPO and loss design doc](https://nullvoider07.github.io/dockyard_rl/design-docs/grpo-and-loss.html).
 
 ### Single node
 
@@ -271,7 +271,7 @@ sbatch \
 ```
 
 Each node declares its `DOCKYARD_FLEET_ROLE`; see
-[docs/deployment/slurm.md](docs/deployment/slurm.md) (and `scripts/cluster/` for
+[the Slurm deployment guide](https://nullvoider07.github.io/dockyard_rl/deployment/slurm.html) (and `scripts/cluster/` for
 non-Slurm bare metal).
 
 ### Switching environments
@@ -295,7 +295,7 @@ python3 examples/run_grpo_swe.py --config examples/configs/grpo_osworld.yaml
 ```
 
 Per-environment details (scoring, integrity, provisioning) are in
-[docs/environments/](docs/environments/index.md).
+[the environments docs](https://nullvoider07.github.io/dockyard_rl/environments/index.html).
 
 ## Other algorithms
 
@@ -316,7 +316,7 @@ python3 examples/run_rlaif.py        --config examples/configs/rlaif.yaml
 - **DPO** (`algorithms/dpo.py`) — preference optimization with the configurable
   `DPOLossFn` (DPO/IPO/cDPO/DPOP/R-DPO via one parameterized core, optional
   SFT-blend and reference-free SimPO/ORPO modes). See
-  [docs/design-docs/dpo.md](docs/design-docs/dpo.md).
+  [the DPO design doc](https://nullvoider07.github.io/dockyard_rl/design-docs/dpo.html).
 - **Reward modeling** (`algorithms/rm.py`) — scalar RM on preference pairs
   (Bradley-Terry loss).
 - **On-policy distillation** (`algorithms/distillation.py`) — the student
@@ -360,12 +360,12 @@ Configuration is YAML resolved by OmegaConf with Hydra-style overrides, validate
 into a Pydantic `MasterConfig`. The top-level sections are `policy`, `loss_fn`,
 `grpo`, `env`, `data`, `cluster`, `logger`, `checkpointing`, and an optional
 `data_plane`. The full model — every section and the key knobs — is documented in
-[docs/getting-started/configuration.md](docs/getting-started/configuration.md).
+[the configuration guide](https://nullvoider07.github.io/dockyard_rl/getting-started/configuration.html).
 
 ## Deployment
 
 - **Slurm** — `ray.sub` + `scripts/cluster/`. See
-  [docs/deployment/slurm.md](docs/deployment/slurm.md).
+  [the Slurm deployment guide](https://nullvoider07.github.io/dockyard_rl/deployment/slurm.html).
 - **Kubernetes** — `infra/dockyard_k8s`, a config-driven launcher that renders the
   sandbox `Deployment`/`Service` and a `RayJob`/`RayCluster` from a recipe + infra
   spec (in active development). Sandbox pods ship hardened by default
@@ -373,7 +373,7 @@ into a Pydantic `MasterConfig`. The top-level sections are `policy`, `loss_fn`,
   burst limits), with opt-in `priorityClassName` / `ResourceQuota` / `LimitRange`
   and offline `kubeconform` validation; see
   [`infra/README.md`](infra/README.md#production-hardening). Full guide:
-  [docs/deployment/kubernetes.md](docs/deployment/kubernetes.md).
+  [the Kubernetes deployment guide](https://nullvoider07.github.io/dockyard_rl/deployment/kubernetes.html).
 
 ## Repository layout
 
@@ -395,7 +395,7 @@ into a Pydantic `MasterConfig`. The top-level sections are `policy`, `loss_fn`,
 | `modelopt/` | FP8 weight quantization for inference serving. |
 | `infra/` | Kubernetes deployment assets; `ray.sub` / `scripts/cluster/` cover Slurm. |
 | `examples/` | The launcher (`run_grpo_swe.py`) and the `configs/` family. |
-| `docs/` | The documentation site (this README links into it). |
+| `docs/` | Sphinx documentation sources (published at the Pages site). |
 
 ## Validation
 
@@ -426,17 +426,21 @@ id.
 
 ## Documentation
 
-The full documentation is a Sphinx site under [`docs/`](docs/index.md):
+The full documentation is published at
+**<https://nullvoider07.github.io/dockyard_rl/>** — getting started, the runtime
+architecture, per-subsystem design docs, every environment, deployment, and an
+auto-generated API reference.
+
+To build the Sphinx site locally from the `docs/` sources:
 
 ```sh
 pip install -r docs/requirements.txt
 cd docs && make html      # open _build/html/index.html
 ```
 
-It covers getting started, the runtime architecture, per-subsystem design docs,
-every environment, deployment, and an auto-generated API reference. New to the
-acronyms (GRPO, DAPO, GDPO, FSDP2, NCCL, RoCE, …)? The
-[glossary](docs/glossary.md) expands them with one-line definitions.
+New to the acronyms (GRPO, DAPO, GDPO, FSDP2, NCCL, RoCE, …)? The
+[glossary](https://nullvoider07.github.io/dockyard_rl/glossary.html) expands them
+with one-line definitions.
 
 ## Acknowledgements
 
