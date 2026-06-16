@@ -25,6 +25,6 @@ jobs:
         uses: github/codeql-action/init@v3
         with:
           languages: python
-          queries: security-and-quality
+          queries: security-extended
       - name: Analyze
         uses: github/codeql-action/analyze@v3
