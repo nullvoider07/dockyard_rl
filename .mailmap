@@ -1,0 +1,9 @@
+# Canonical author identity for dockyard_rl.
+#
+# dockyard_rl has a single human author, Kartik A (NullVoider). Automated
+# commits merged into main (e.g. Dependabot version bumps) are coalesced under
+# that identity so the contributor graph reflects authorship accurately rather
+# than listing the bot. The Claude co-author trailer is intentionally NOT
+# coalesced.
+Kartik A (NullVoider) <42990140+nullvoider07@users.noreply.github.com>
+Kartik A (NullVoider) <42990140+nullvoider07@users.noreply.github.com> <49699333+dependabot[bot]@users.noreply.github.com>
