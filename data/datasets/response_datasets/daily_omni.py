@@ -54,8 +54,9 @@ class DailyOmniDataset(RawDataset):
                 raise ValueError(f"{archive_filename} cannot be found.")
             try:
                 with tarfile.open(archive_filename, "r:*") as tar:
-                    # Extract all contents to the specified path
-                    tar.extractall(path=self.hf_cache_dir)
+                    # Extract all contents to the specified path. filter="data"
+                    # (Python 3.12+) rejects path-traversal and unsafe members.
+                    tar.extractall(path=self.hf_cache_dir, filter="data")
                 if os.path.isdir(files_folder):
                     print(
                         f"Successfully extracted '{archive_filename}' to '{files_folder}'"

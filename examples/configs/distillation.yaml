@@ -30,6 +30,14 @@ distillation:
   seed: 42
   # Top-k teacher logits transferred per token (memory vs. fidelity; 512–4096).
   num_topk_logits: 512
+  # DistillationLossFn: KL direction and top-k handling.
+  #   kl_type: "reverse" (student||teacher) for on-policy distillation;
+  #            "forward" (teacher||student) or "mixed" also supported.
+  #   mixed_kl_weight: forward/reverse blend in [0, 1], only used when kl_type="mixed".
+  #   zero_outside_topk: account for teacher mass outside the transferred top-k.
+  kl_type: "reverse"
+  mixed_kl_weight: 0.0
+  zero_outside_topk: false
 
 policy:
   model_name: "Qwen/Qwen2.5-1.5B-Instruct"     # student

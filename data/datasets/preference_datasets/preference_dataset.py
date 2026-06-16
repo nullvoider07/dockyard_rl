@@ -32,7 +32,7 @@ class PreferenceDataset(RawDataset):
         self.chosen_key = chosen_key
         self.rejected_key = rejected_key
 
-        self.dataset = load_dataset_from_path(data_path, split=split)  # type: ignore[call-arg]
+        self.dataset = load_dataset_from_path(data_path, data_split=split)
 
         self.dataset = self.dataset.map(
             self.format_data,

@@ -79,6 +79,15 @@ class DistillationConfig(TypedDict):
     # Higher values increase memory usage but improve distillation fidelity.
     # Recommended range: 512–4096.
     num_topk_logits: int
+    # DistillationLossFn parameters.
+    # kl_type: "forward" (teacher||student), "reverse" (student||teacher), or
+    #   "mixed". On-policy distillation uses "reverse".
+    kl_type: str
+    # mixed_kl_weight: forward/reverse blend in [0, 1]; only used when kl_type="mixed".
+    mixed_kl_weight: float
+    # zero_outside_topk: account for the teacher mass outside the transferred
+    #   top-k. Requires per-token full entropy (H_all) at loss time when True.
+    zero_outside_topk: bool
 
 class TeacherConfig(TypedDict):
     """Config for the frozen teacher policy."""
@@ -261,7 +270,11 @@ def setup(
     teacher_policy.print_node_ip_and_gpu_id()
     print("  ✓ Teacher policy initialized (no optimizer — frozen)")
 
-    loss_fn = DistillationLossFn(num_topk_logits=distillation_config["num_topk_logits"])  # type: ignore[call-arg]
+    loss_fn = DistillationLossFn({
+        "kl_type":           distillation_config["kl_type"],
+        "mixed_kl_weight":   distillation_config["mixed_kl_weight"],
+        "zero_outside_topk": distillation_config["zero_outside_topk"],
+    })
 
     print("\n" + "=" * 60)
     print(" " * 18 + "SETUP COMPLETE")
