@@ -11,6 +11,12 @@ updates:
     labels: [dependencies]
     commit-message:
       prefix: deps
+    groups:
+      # Consolidate non-breaking bumps into one PR; majors stay individual
+      # so each gets its own review.
+      minor-and-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
 
   # Documentation build toolchain.
   - package-ecosystem: pip
@@ -21,6 +27,10 @@ updates:
     labels: [dependencies, docs]
     commit-message:
       prefix: "deps(docs)"
+    groups:
+      minor-and-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
 
   # Kubernetes deployment CLI (operator-host tool).
   - package-ecosystem: pip
@@ -31,6 +41,10 @@ updates:
     labels: [dependencies, infra]
     commit-message:
       prefix: "deps(infra)"
+    groups:
+      minor-and-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
 
   # GitHub Actions used by the workflows below.
   - package-ecosystem: github-actions
@@ -40,3 +54,7 @@ updates:
     labels: [dependencies, ci]
     commit-message:
       prefix: ci
+    groups:
+      # One consolidated PR for all action bumps instead of one per action.
+      github-actions:
+        patterns: ["*"]
