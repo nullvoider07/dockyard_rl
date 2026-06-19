@@ -189,6 +189,69 @@ def test_j3b_exotic_branch_parity(tis_type, seq_level_is, on_policy_kl):
     np.testing.assert_allclose(np.asarray(grad_j), curr_t.grad.detach().numpy(), atol=2e-4, rtol=2e-4)
 
 
+@pytest.mark.parametrize(
+    "kl_pen,kl_type,use_is",
+    [
+        (0.0, "k3", False),
+        (0.05, "k3", False),
+        (0.05, "k1", True),
+    ],
+)
+def test_cispo_parity(kl_pen, kl_type, use_is):
+    # CISPO: clip_loss = -A * sg(clip(ratio)) * log pi_theta. Token-level only;
+    # incompatible with disable_ppo_ratio / force_on_policy / seq-level / dual-clip.
+    curr, prev, gen, ref, adv, token_mask, sample_mask = _fixtures(seed=7)
+    cfg = ClippedPGLossConfig(
+        token_level_loss=True,
+        use_cispo=True,
+        ratio_clip_min=0.2,
+        ratio_clip_max=0.2,
+        reference_policy_kl_penalty=kl_pen,
+        reference_policy_kl_type=kl_type,
+        use_importance_sampling_correction=use_is,
+    )
+    mask = token_mask * sample_mask[:, None]
+    gvt = torch.tensor(float(mask.sum()))
+    gvs = torch.tensor(float(sample_mask.sum()))
+
+    curr_t = torch.from_numpy(curr).clone().requires_grad_(True)
+    td = _torch_data(prev, gen, ref, adv, token_mask, sample_mask)
+    loss_t, _ = ClippedPGLossFn(cfg)(curr_t, td, gvs, gvt)  # pyright: ignore[reportArgumentType]
+    loss_t.backward()
+
+    def f(curr_j):
+        return jax_loss.clipped_pg_loss(
+            curr_j, _jax_data(prev, gen, ref, adv, token_mask, sample_mask),
+            jnp.asarray(float(sample_mask.sum())), jnp.asarray(float(mask.sum())), cfg,
+        )
+
+    (loss_j, _), grad_j = jax.value_and_grad(f, has_aux=True)(jnp.asarray(curr))
+    np.testing.assert_allclose(float(loss_j), float(loss_t.detach()), atol=2e-4, rtol=2e-4)
+    np.testing.assert_allclose(np.asarray(grad_j), curr_t.grad.detach().numpy(), atol=2e-4, rtol=2e-4)
+
+
+def test_cispo_rejects_incompatible_config():
+    # The five mutual-exclusion guards must fire (torch asserts; JAX ValueError).
+    curr, prev, gen, ref, adv, token_mask, sample_mask = _fixtures(seed=8)
+    incompatible = [
+        {"disable_ppo_ratio": True},
+        {"force_on_policy_ratio": True},
+        {"token_level_loss": False, "sequence_level_importance_ratios": True},
+        {"ratio_clip_c": 3.0},
+        {"token_level_loss": False},
+    ]
+    for extra in incompatible:
+        with pytest.raises((AssertionError, ValueError)):
+            ClippedPGLossFn(ClippedPGLossConfig(use_cispo=True, **extra))
+        mask = token_mask * sample_mask[:, None]
+        with pytest.raises(ValueError):
+            jax_loss.clipped_pg_loss(
+                jnp.asarray(curr), _jax_data(prev, gen, ref, adv, token_mask, sample_mask),
+                jnp.asarray(float(sample_mask.sum())), jnp.asarray(float(mask.sum())),
+                ClippedPGLossConfig(use_cispo=True, **extra),
+            )
+
+
 def test_logprobs_from_logits_parity():
     rng = np.random.default_rng(1)
     B, S, V = 2, 6, 17

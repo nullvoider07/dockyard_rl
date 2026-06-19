@@ -202,6 +202,24 @@ def test_sampling_params_constrained_preserves_other_fields():
     assert constrained.include_stop_str_in_output == baseline.include_stop_str_in_output
 
 
+# ── ignore_eos passthrough ──────────────────────────────────────────
+
+
+def test_sampling_params_ignore_eos_default_false():
+    _require_vllm()
+    worker = _StubWorker()  # cfg carries no ignore_eos key
+    params = _build(worker, greedy=False, stop_strings=None)
+    assert params.ignore_eos is False
+
+
+def test_sampling_params_ignore_eos_respected():
+    _require_vllm()
+    worker = _StubWorker()
+    worker.cfg["ignore_eos"] = True
+    params = _build(worker, greedy=False, stop_strings=None)
+    assert params.ignore_eos is True
+
+
 # ── derive_structural_submask ───────────────────────────────────────
 
 

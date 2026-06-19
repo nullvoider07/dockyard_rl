@@ -114,6 +114,18 @@ def _validate_cfg(cfg: Any) -> None:
         if tis_type == "seq-mask-tis" and seq_level_is:
             raise ValueError("seq-mask-tis is incompatible with sequence_level_importance_ratios=True")
 
+    if _get(cfg, "use_cispo", False):
+        if _get(cfg, "disable_ppo_ratio", False):
+            raise ValueError("use_cispo is incompatible with disable_ppo_ratio")
+        if _get(cfg, "force_on_policy_ratio", False):
+            raise ValueError("use_cispo is incompatible with force_on_policy_ratio")
+        if seq_level_is:
+            raise ValueError("use_cispo is incompatible with sequence_level_importance_ratios")
+        if _get(cfg, "ratio_clip_c", None) is not None:
+            raise ValueError("use_cispo is incompatible with dual clipping (ratio_clip_c)")
+        if not token_level:
+            raise ValueError("use_cispo requires token_level_loss=True (LossType.TOKEN_LEVEL)")
+
 
 def clipped_pg_loss(
     curr_logprobs: Array,
@@ -151,6 +163,7 @@ def clipped_pg_loss(
     force_on_policy = _get(cfg, "force_on_policy_ratio", False)
     disable_ppo_ratio = _get(cfg, "disable_ppo_ratio", False)
     token_level = bool(_get(cfg, "token_level_loss", True))
+    use_cispo = _get(cfg, "use_cispo", False)
 
     token_mask = data["token_mask"][:, 1:]
     sample_mask = data["sample_mask"]
@@ -221,9 +234,14 @@ def clipped_pg_loss(
         ratios = curr_logprobs
         ratios_clamped = curr_logprobs
 
-    loss1 = -advantages * ratios
-    loss2 = -advantages * ratios_clamped
-    clip_loss = jnp.maximum(loss1, loss2)
+    if use_cispo:
+        # CISPO (arXiv:2506.13585): stop-gradient clipped IS weight on a
+        # REINFORCE-style surrogate; gradient flows only through curr_logprobs.
+        clip_loss = -advantages * jax.lax.stop_gradient(ratios_clamped) * curr_logprobs
+    else:
+        loss1 = -advantages * ratios
+        loss2 = -advantages * ratios_clamped
+        clip_loss = jnp.maximum(loss1, loss2)
 
     if ratio_clip_c is not None:
         if not ratio_clip_c > 1:

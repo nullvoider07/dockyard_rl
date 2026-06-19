@@ -413,6 +413,8 @@ class SGLangGenerationWorker:
         if stop_token_ids is not None:
             sampling_params["stop_token_ids"] = stop_token_ids
 
+        sampling_params["ignore_eos"] = bool(self.cfg.get("ignore_eos", False))
+
         return sampling_params
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
