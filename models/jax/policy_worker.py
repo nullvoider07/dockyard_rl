@@ -236,10 +236,29 @@ def _build_model_and_reference(
             m = Qwen3ForCausalLM(jcfg, rngs=nnx.Rngs(params=seed), param_dtype=param_dtype)
             load_hf_state_dict(m, state_dict, param_dtype=param_dtype)
             return m
+    elif "gemma4" in model_type:
+        from dockyard_rl.models.jax.models.gemma4 import (
+            Gemma4ForCausalLM, Gemma4TextConfig, load_hf_gemma4_state_dict,
+        )
+
+        # Multimodal "gemma4" nests the text hyperparameters under text_config;
+        # "gemma4_text" exposes them directly. Only the text path is wired.
+        text_cfg = getattr(hf_cfg, "text_config", None) or hf_cfg
+        jcfg_g4 = Gemma4TextConfig.from_hf_config(text_cfg)
+        if jcfg_g4.enable_moe_block and ep_size > 1:
+            raise NotImplementedError(
+                f"expert_parallel_size={ep_size} for gemma4 MoE requires a live EP mesh + "
+                "alltoall dispatch (HV-29/30); set jax_cfg.expert_parallel_size=1."
+            )
+
+        def _build(seed: int) -> nnx.Module:
+            m = Gemma4ForCausalLM(jcfg_g4, rngs=nnx.Rngs(params=seed), param_dtype=param_dtype)
+            load_hf_gemma4_state_dict(m, state_dict, param_dtype=param_dtype)
+            return m
     else:
         raise NotImplementedError(
-            f"JAX trainer backend supports Qwen3 dense + Qwen3-MoE; got model_type={model_type!r}. "
-            "Gemma3/Llama dense land in later phases."
+            "JAX trainer backend supports Qwen3 dense + Qwen3-MoE + Qwen3-Next + Gemma4; "
+            f"got model_type={model_type!r}. Gemma3/Llama dense land in later phases."
         )
 
     src = weights_path or model_name
