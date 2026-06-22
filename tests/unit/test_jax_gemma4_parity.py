@@ -8,11 +8,12 @@ CPU float32. Attention / KV-sharing / PLE / MoE / assembly land in C2-C6.
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import pytest
 
 jnp = pytest.importorskip("jax.numpy")
-import jax  # noqa: E402
 torch = pytest.importorskip("torch")
 pytest.importorskip("transformers.models.gemma4")
 
@@ -46,6 +47,10 @@ from dockyard_rl.models.jax.models.gemma4 import (  # noqa: E402
     gemma4_sliding_bias,
     load_hf_gemma4_state_dict,
 )
+from dockyard_rl.models.jax.models.gemma4_refit import (  # noqa: E402
+    iter_gemma4_refit_state_dict,
+    prepare_gemma4_refit_info,
+)
 
 
 def _causal_mask_np(s: int) -> np.ndarray:
@@ -62,7 +67,7 @@ def _sliding_mask_np(s: int, w: int) -> np.ndarray:
 
 
 def _hf_text_config(**overrides):
-    base = dict(
+    base: dict[str, Any] = dict(
         vocab_size=64,
         hidden_size=16,
         intermediate_size=32,
@@ -77,12 +82,11 @@ def _hf_text_config(**overrides):
     return HFGemma4TextConfig(**base)
 
 
-def _t2j(t: torch.Tensor) -> jnp.ndarray:
+def _t2j(t):
     return jnp.asarray(t.detach().numpy())
 
 
-# ── config extraction ───────────────────────────────────────────────
-
+#config extraction
 
 def test_from_hf_config_extracts_fields():
     hf = _hf_text_config(
@@ -112,6 +116,7 @@ def test_from_hf_config_extracts_fields():
     assert cfg.enable_moe_block and cfg.num_experts == 8 and cfg.top_k_experts == 2
     assert cfg.use_double_wide_mlp is True
     # layer_types resolved by HF __post_init__: 5:1 sliding:full, last forced full.
+    assert hf.layer_types is not None
     assert tuple(cfg.layer_types) == tuple(hf.layer_types)
     assert cfg.layer_types[-1] == "full_attention"
     # Per-layer-type RoPE: sliding=default theta=10k, full=proportional theta=1e6.
@@ -129,7 +134,7 @@ def test_from_hf_config_extracts_fields():
     np.testing.assert_allclose(cfg.embed_scale, 16.0**0.5, rtol=1e-6)
 
 
-# ── Gemma4RMSNorm ───────────────────────────────────────────────────
+#Gemma4RMSNorm
 
 
 @pytest.mark.parametrize("with_scale", [True, False])
@@ -150,7 +155,7 @@ def test_rmsnorm_parity(with_scale):
     np.testing.assert_allclose(out_jx, out_hf, atol=1e-5, rtol=1e-5)
 
 
-# ── Gemma4MLP (incl. double-wide) ───────────────────────────────────
+#Gemma4MLP (incl. double-wide)
 
 
 @pytest.mark.parametrize(
@@ -185,7 +190,7 @@ def test_mlp_parity(layer_idx, overrides):
     assert jcfg.mlp_intermediate_size(layer_idx) == expected
 
 
-# ── Gemma4ScaledWordEmbedding ───────────────────────────────────────
+#Gemma4ScaledWordEmbedding
 
 
 def test_scaled_word_embedding_parity():
@@ -204,7 +209,7 @@ def test_scaled_word_embedding_parity():
     np.testing.assert_allclose(out_jx, out_hf, atol=1e-5, rtol=1e-5)
 
 
-# ── C4: per-layer input embeddings (PLE) ────────────────────────────
+#C4: per-layer input embeddings (PLE)
 
 
 def test_ple_parity():
@@ -235,7 +240,7 @@ def test_ple_parity():
     np.testing.assert_allclose(np.asarray(out), ple_hf, atol=2e-4, rtol=2e-4)
 
 
-# ── C6: full forward-logits parity (assembly + loader) ──────────────
+#C6: full forward-logits parity (assembly + loader)
 
 
 def _full_cfg(**ov):
@@ -275,7 +280,61 @@ def test_forward_logits_parity(moe):
     np.testing.assert_allclose(logits_jx, logits_hf, atol=1e-3, rtol=1e-3)
 
 
-# ── C5: MoE router + grouped experts ────────────────────────────────
+#C7: refit (weight-sync) round-trip vs HF checkpoint
+
+
+# HF state-dict keys that are non-trainable buffers the loader skips (so the refit
+# does not emit them): the per-layer identity ``layer_scalar`` ones-buffer.
+_REFIT_IGNORE_SUFFIXES = ("layer_scalar",)
+
+
+@pytest.mark.parametrize(
+    "moe", [False, True], ids=["dense_kvshare_ple_softcap", "with_moe"]
+)
+def test_refit_roundtrip_reproduces_hf_state_dict(moe):
+    # load HF -> NNX -> refit must reproduce the HF checkpoint (names, shapes,
+    # values). This is the inverse of load_hf_gemma4_state_dict; it guards the
+    # weight-sync path that pushes trained params back to the generation engine.
+    extra = dict(enable_moe_block=True, num_experts=6, top_k_experts=2, moe_intermediate_size=24) if moe else {}
+    hf_cfg = _full_cfg(**extra)
+    torch.manual_seed(0)
+    hf = HFGemma4ForCausalLM(hf_cfg).eval()
+    with torch.no_grad():
+        for p in hf.parameters():
+            p.copy_(torch.randn_like(p) * 0.1)
+    hf_sd = hf.state_dict()
+
+    jcfg = Gemma4TextConfig.from_hf_config(hf_cfg)
+    jm = Gemma4ForCausalLM(jcfg, rngs=nnx_rngs(), param_dtype=jnp.float32)
+    load_hf_gemma4_state_dict(jm, hf_sd)
+
+    refit = dict(iter_gemma4_refit_state_dict(jm, to_torch=False))
+    info = prepare_gemma4_refit_info(jm)
+
+    # The refit must consume exactly the HF params the loader does: every HF key
+    # except the skipped buffers (and lm_head.weight when tied -> no separate head).
+    expected = {k for k in hf_sd if k.split(".")[-1] not in _REFIT_IGNORE_SUFFIXES}
+    if jcfg.tie_word_embeddings:
+        expected.discard("lm_head.weight")
+    assert set(refit) == expected, (
+        f"refit name-set mismatch; only_refit={sorted(set(refit) - expected)}, "
+        f"only_hf={sorted(expected - set(refit))}"
+    )
+    # No collisions: distinct router/expert params land on distinct names.
+    assert len(list(iter_gemma4_refit_state_dict(jm, to_torch=False))) == len(expected)
+    assert set(info) == expected
+
+    # Every emitted tensor matches the HF checkpoint tensor (HF layout) exactly,
+    # and the declared (shape, dtype) matches the streamed array.
+    for name, arr in refit.items():
+        ref = hf_sd[name].detach().numpy()
+        np.testing.assert_allclose(np.asarray(arr), ref, atol=1e-6, rtol=1e-6)
+        shape, dtype_name = info[name]
+        assert tuple(shape) == ref.shape
+        assert dtype_name == "float32"
+
+
+#C5: MoE router + grouped experts
 
 
 def test_router_parity():
@@ -313,8 +372,8 @@ def test_experts_parity():
     torch.manual_seed(0)
     hf_exp = HFGemma4TextExperts(hf_cfg)
     with torch.no_grad():
-        hf_exp.gate_up_proj.copy_(torch.randn_like(hf_exp.gate_up_proj) * 0.1)
-        hf_exp.down_proj.copy_(torch.randn_like(hf_exp.down_proj) * 0.1)
+        for p in hf_exp.parameters():
+            p.copy_(torch.randn_like(p) * 0.1)
 
     t, d, k, e = 12, 16, 2, 6
     rng = np.random.default_rng(6)
@@ -332,7 +391,7 @@ def test_experts_parity():
     np.testing.assert_allclose(np.asarray(out_jx), out_hf, atol=2e-4, rtol=2e-4)
 
 
-# ── C2: per-layer-type RoPE + attention ─────────────────────────────
+#C2: per-layer-type RoPE + attention
 
 
 def _rope_cfg():
@@ -423,6 +482,7 @@ def test_attention_parity(layer_type, k_eq_v):
     jx.q_norm.weight[...] = _t2j(hf_attn.q_norm.weight)
     jx.k_norm.weight[...] = _t2j(hf_attn.k_norm.weight)
     if not uses_k_eq_v:
+        assert jx.v_proj is not None and hf_attn.v_proj is not None
         jx.v_proj.kernel[...] = _t2j(hf_attn.v_proj.weight).T
     else:
         assert jx.v_proj is None and hf_attn.v_proj is None

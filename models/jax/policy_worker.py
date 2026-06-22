@@ -123,6 +123,18 @@ def _model_is_qwen3_next(model: nnx.Module) -> bool:
     return any(isinstance(m, Qwen3NextGatedDeltaNet) for _p, m in nnx.iter_modules(model))
 
 
+def _model_is_gemma4(model: nnx.Module) -> bool:
+    """Whether ``model`` is a Gemma 4 model (its base ``Gemma4Model`` is present).
+
+    Structural, so it also covers test-injected models. Routes refit through the
+    Gemma 4 name-map: ``Gemma4Experts`` is not a ``GroupedExperts`` (so ``_model_is_moe``
+    is False for it) and the PLE table / router scalars need explicit mapping the
+    generic dense map cannot express."""
+    from dockyard_rl.models.jax.models.gemma4 import Gemma4Model
+
+    return any(isinstance(m, Gemma4Model) for _p, m in nnx.iter_modules(model))
+
+
 def _wire_ep_dispatchers(model: nnx.Module, ep_axis: str, ep_size: int) -> int:
     """Install the EP mesh axis on every all-to-all token dispatcher in ``model``.
 
@@ -338,6 +350,7 @@ class JaxPolicyWorkerImpl:
         self.temperature = temperature
         self._is_moe = _model_is_moe(model)
         self._is_qwen3_next = _model_is_qwen3_next(model)
+        self._is_gemma4 = _model_is_gemma4(model)
         # Aux-loss-free expert-bias updater (None unless the model has load-balanced
         # MoEBlocks); runs once per optimizer step, mirroring the torch step pre-hook.
         self._lb_update_fn = _make_lb_update_fn(model) if self._is_moe else None
@@ -509,6 +522,10 @@ class JaxPolicyWorkerImpl:
             from dockyard_rl.models.jax.linear_attn.refit import prepare_qwen3_next_refit_info
 
             return prepare_qwen3_next_refit_info(self.model)
+        if self._is_gemma4:
+            from dockyard_rl.models.jax.models.gemma4_refit import prepare_gemma4_refit_info
+
+            return prepare_gemma4_refit_info(self.model)
         if self._is_moe:
             from dockyard_rl.models.jax.moe.refit import prepare_moe_refit_info
 
@@ -532,6 +549,10 @@ class JaxPolicyWorkerImpl:
             from dockyard_rl.models.jax.linear_attn.refit import iter_qwen3_next_refit_state_dict
 
             stream = iter_qwen3_next_refit_state_dict(self.model)
+        elif self._is_gemma4:
+            from dockyard_rl.models.jax.models.gemma4_refit import iter_gemma4_refit_state_dict
+
+            stream = iter_gemma4_refit_state_dict(self.model)
         elif self._is_moe:
             from dockyard_rl.models.jax.moe.refit import iter_moe_refit_state_dict
 
