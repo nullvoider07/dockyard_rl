@@ -467,6 +467,7 @@ class BaseVllmGenerationWorker:
             stop_token_ids = self.cfg["stop_token_ids"],
             stop           = stop_strings,
             include_stop_str_in_output = True,
+            ignore_eos     = self.cfg.get("ignore_eos", False),
         )
         # Structured tool-use (fork 2): constrain only when a spec is present, so
         # the unconstrained path produces byte-identical SamplingParams. The spec
@@ -654,6 +655,7 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
             stop_token_ids = self.cfg["stop_token_ids"],
             stop           = stop_strings,
             include_stop_str_in_output = True,
+            ignore_eos     = self.cfg.get("ignore_eos", False),
         )
         assert self.llm is not None
         outputs = self.llm.generate(data["prompts"], sampling_params)

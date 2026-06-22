@@ -139,6 +139,8 @@ class GenerationConfig(TypedDict):
     model_name:      NotRequired[str]
     stop_token_ids:  list[int] | None
     stop_strings:    list[str] | None
+    # When true, suppress EOS so generation always runs to max_new_tokens.
+    ignore_eos:      NotRequired[bool]
     # Populated by configure_generation_config(), not by the caller.
     _pad_token_id:   NotRequired[int]
 

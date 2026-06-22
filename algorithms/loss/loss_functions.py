@@ -97,6 +97,12 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     use_on_policy_kl_approximation: bool = False
     force_on_policy_ratio:          bool = False
 
+    # --- CISPO ---
+    # Clipped IS-weight Policy Optimization (arXiv:2506.13585): a REINFORCE-style
+    # surrogate with a stop-gradient clipped IS weight. Mutually exclusive with the
+    # ratio knobs below; see __init__ asserts.
+    use_cispo:                      bool = False
+
 class ClippedPGLossDataDict(TypedDict):
     input_ids:                    torch.Tensor
     advantages:                   torch.Tensor
@@ -141,6 +147,28 @@ class ClippedPGLossFn(LossFunction):
         self.loss_type = (
             LossType.TOKEN_LEVEL if cfg.token_level_loss else LossType.SEQUENCE_LEVEL
         )
+
+        self.use_cispo = cfg.use_cispo
+        if self.use_cispo:
+            assert not self.disable_ppo_ratio, (
+                "use_cispo is incompatible with disable_ppo_ratio; CISPO needs the "
+                "pi_theta/pi_theta_old ratio that disable_ppo_ratio removes"
+            )
+            assert not self.force_on_policy_ratio, (
+                "use_cispo is incompatible with force_on_policy_ratio; forcing ratio=1 "
+                "removes the clipped IS-weight CISPO optimizes"
+            )
+            assert not self.sequence_level_importance_ratios, (
+                "use_cispo is incompatible with sequence_level_importance_ratios; "
+                "CISPO uses token-level importance weights"
+            )
+            assert self.ratio_clip_c is None, (
+                "use_cispo is incompatible with dual clipping (ratio_clip_c); the "
+                "dual-clip block runs after CISPO loss assembly and would overwrite it"
+            )
+            assert self.loss_type == LossType.TOKEN_LEVEL, (
+                "use_cispo requires token_level_loss=True (LossType.TOKEN_LEVEL)"
+            )
 
         if self.sequence_level_importance_ratios:
             assert self.loss_type == LossType.SEQUENCE_LEVEL, (
@@ -304,9 +332,15 @@ class ClippedPGLossFn(LossFunction):
             ratios = curr_logprobs
             ratios_clamped = curr_logprobs
 
-        loss1 = -advantages * ratios
-        loss2 = -advantages * ratios_clamped
-        clip_loss = torch.max(loss1, loss2)
+        if self.use_cispo:
+            # CISPO (arXiv:2506.13585): REINFORCE-style surrogate where the clipped
+            # IS weight is a stop-gradient scalar, so the gradient flows only through
+            # log pi_theta (curr_logprobs). ratio_clip_c is forbidden by __init__.
+            clip_loss = -advantages * ratios_clamped.detach() * curr_logprobs
+        else:
+            loss1 = -advantages * ratios
+            loss2 = -advantages * ratios_clamped
+            clip_loss = torch.max(loss1, loss2)
 
         if self.ratio_clip_c is not None:
             assert self.ratio_clip_c > 1, (

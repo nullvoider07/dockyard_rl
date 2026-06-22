@@ -39,6 +39,9 @@ class VllmSpecificArgs(TypedDict):
     http_server_serving_chat_kwargs:  NotRequired[dict[str, Any]]
     tool_parser_plugin:               NotRequired[str]
     reasoning_parser_plugin:          NotRequired[str]
+    # Extra environment variables forwarded to every vLLM worker process (e.g. to
+    # select a fused-MoE backend per recipe), scoped to this generation config.
+    env_vars:                         NotRequired[dict[str, str]]
 
     # Internal performance knobs.
     enable_prefix_caching:            NotRequired[bool]

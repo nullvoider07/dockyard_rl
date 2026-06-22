@@ -128,6 +128,9 @@ class VllmGeneration(GenerationInterface):
         env_vars: dict[str, str] = {}
         if self._ep_size > 1:
             env_vars["VLLM_DP_SIZE"] = str(self._dp_size)
+        # Per-recipe env vars (e.g. fused-MoE backend selection), scoped to this config.
+        for k, v in self.cfg["vllm_cfg"].get("env_vars", {}).items():
+            env_vars[str(k)] = str(v)
 
         # Initialise placement groups
         cluster._init_placement_groups(
