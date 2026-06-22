@@ -46,8 +46,8 @@ to `grpo`). The name is not an expanded acronym in this codebase — read it as
 ## One loss, many algorithms
 
 `ClippedPGLossFn` (`algorithms/loss/loss_functions.py`) is a single configurable
-loss that expresses PPO, GRPO, RLOO, DAPO, GSPO, and dual-clipping. The core is
-the clipped surrogate:
+loss that expresses PPO, GRPO, RLOO, DAPO, GSPO, CISPO, and dual-clipping. The
+core is the clipped surrogate:
 
 ```text
 L(θ) = E_t[ min(r_t · A_t, clip(r_t, 1−ε_lo, 1+ε_hi) · A_t) ] − β · KL(π_θ ‖ π_ref)
@@ -64,6 +64,28 @@ config) select the variant:
 | `sequence_level_importance_ratios` | GSPO-style sequence-level ratios (mutually exclusive with token-level loss). |
 | `disable_ppo_ratio` | Drop the ratio entirely (REINFORCE). |
 | `force_on_policy_ratio` | Pin the ratio to 1 (on-policy). |
+| `use_cispo` | CISPO surrogate: keep every token in the gradient with a stop-gradient clipped weight instead of the pessimistic `min`/`max` (token-level only). |
+
+### CISPO — keeping clipped tokens in the gradient
+
+`use_cispo` selects the CISPO surrogate (MiniMax-M1) in place of the pessimistic
+`min`/`max` clip. When the clip branch of `min(r_t · A_t, clip(r_t) · A_t)` wins,
+that token's ratio is detached and it stops contributing gradient — so the very
+tokens whose policy moved the most are silenced. CISPO instead keeps every token
+but freezes its importance weight at the clipped value behind a stop-gradient:
+
+```text
+L_CISPO(θ) = − E_t[ A_t · stop_grad(clip(r_t, 1−ε_lo, 1+ε_hi)) · log π_θ(a_t) ]
+```
+
+The clipped ratio still scales each token's contribution, but because it enters
+only through the stop-gradient, gradient always flows through the log-prob. This
+preserves the low-probability, high-information tokens (often the decisive
+reasoning steps) that the standard clip would zero out — the property CISPO was
+introduced for. It is token-level only and mutually exclusive with the dual clip
+(`ratio_clip_c`), `disable_ppo_ratio`, `force_on_policy_ratio`, and sequence-level
+ratios; the loss asserts these at construction. Both trainer backends implement
+it identically, value- and gradient-parity tested with CISPO on.
 
 ## Reference-KL penalty
 

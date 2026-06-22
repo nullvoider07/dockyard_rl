@@ -17,6 +17,13 @@ GSPO
   importance ratios instead of token-level (the `sequence_level_importance_ratios`
   knob on the shared loss).
 
+CISPO
+  Clipped Importance-Sampling-weight Policy Optimization (MiniMax-M1) — a clip
+  variant that keeps every token in the gradient but freezes its importance
+  weight at the clipped value via a stop-gradient, instead of dropping clipped
+  tokens as the `min`/`max` surrogate does (the `use_cispo` knob on the shared
+  loss). See [GRPO and the loss](design-docs/grpo-and-loss.md).
+
 DAPO
   Decoupled Clip and Dynamic Sampling Policy Optimization — GRPO with an
   asymmetric "clip-higher" range and dynamic resampling of degenerate groups.
@@ -39,7 +46,7 @@ PPO
 PG
   Policy Gradient. "Clipped-PG" is the single configurable clipped
   policy-gradient loss (`ClippedPGLossFn`) that expresses PPO, GRPO, RLOO, DAPO,
-  and GSPO.
+  GSPO, and CISPO.
 
 DPO
   Direct Preference Optimization — trains directly on preference pairs, no

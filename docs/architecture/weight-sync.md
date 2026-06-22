@@ -67,9 +67,14 @@ implements a **refit seam** that maps its internal representation to that layout
 - The **DTensor** backend gathers sharded `DTensor` parameters and emits the HF
   state dict.
 - The **JAX** backend converts NNX arrays (via dlpack on GPU, numpy on CPU) and
-  applies the same name map, including the MoE re-expansion that turns fused
-  expert tensors back into the per-expert `experts.{i}.{gate,up,down}_proj`
-  layout the inference engine's fused-MoE kernel consumes.
+  applies a **model-specific** inverse of that model's HF loader. The dense path
+  transposes linear kernels back to HF layout; Qwen3-MoE additionally re-expands
+  fused expert tensors into the per-expert `experts.{i}.{gate,up,down}_proj`
+  layout the inference engine's fused-MoE kernel consumes; Qwen3-Next adds its
+  linear-attention parameters; and Gemma 4 maps its multi-parameter router and
+  per-layer embedding table, keeping the experts **fused** because that is the
+  layout its checkpoint and engine use. Each map is the exact inverse of the
+  model's loader, so a load→refit round-trip reproduces the HF state dict.
 
 `prepare_refit_info()` reports the `{hf_name: (shape, dtype)}` map the collective
 producer uses to pack the broadcast; the consumer side unpacks it into the

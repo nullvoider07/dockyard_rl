@@ -71,6 +71,13 @@ A few settings disproportionately shape a run:
 - **Precision and FP8** — `policy.precision` is the training/master precision;
   `policy.generation.vllm_cfg.precision=fp8` serves the inference fleet in FP8
   while training stays in bf16 (weights are quantized on each refit).
+- **Generation engine** — `policy.generation` configures sampling and the
+  inference backend (vLLM or SGLang). Two knobs beyond the usual sampling fields:
+  `ignore_eos` lets a rollout keep generating past the end-of-sequence token (off
+  by default; useful when a reward needs a fixed-length completion), and
+  `policy.generation.vllm_cfg.env_vars` passes a per-recipe map of environment
+  variables through to the vLLM workers — for example to select a fused-MoE
+  backend for a particular model without baking it into the image.
 
 ## The config family
 
