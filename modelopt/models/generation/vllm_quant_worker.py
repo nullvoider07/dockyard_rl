@@ -20,6 +20,9 @@ class VllmQuantGenerationWorker(VllmGenerationWorkerImpl):
         llm_kwargs["worker_extension_cls"] = (
             "dockyard_rl.modelopt.models.generation.vllm_quant_backend.VllmQuantInternalWorkerExtension"
         )
+        # Expert fakequant needs a fused-MoE backend that calibrates per-expert;
+        # default to triton when the recipe does not pin one (explicit config wins).
+        llm_kwargs.setdefault("moe_backend", "triton")
         quant_cfg = self.cfg.get("quant_cfg")
         if quant_cfg:
             print("setting VLLM_QUANT_CFG to:", quant_cfg)
@@ -73,6 +76,9 @@ class VllmQuantAsyncGenerationWorker(VllmAsyncGenerationWorkerImpl):
         llm_kwargs["worker_extension_cls"] = (
             "dockyard_rl.modelopt.models.generation.vllm_quant_backend.VllmQuantInternalWorkerExtension"
         )
+        # Expert fakequant needs a fused-MoE backend that calibrates per-expert;
+        # default to triton when the recipe does not pin one (explicit config wins).
+        llm_kwargs.setdefault("moe_backend", "triton")
         quant_cfg = self.cfg.get("quant_cfg")
         if quant_cfg:
             print("setting VLLM_QUANT_CFG to:", quant_cfg)
