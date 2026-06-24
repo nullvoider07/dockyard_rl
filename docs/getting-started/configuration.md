@@ -78,6 +78,13 @@ A few settings disproportionately shape a run:
   `policy.generation.vllm_cfg.env_vars` passes a per-recipe map of environment
   variables through to the vLLM workers — for example to select a fused-MoE
   backend for a particular model without baking it into the image.
+- **Logging backends** — `logger` enables any of W&B, TensorBoard, MLflow, and
+  SwanLab together. W&B receives full per-step series (including the per-worker
+  generation timeline) as-is. Scalar-only backends (MLflow) cannot hold a list
+  metric, so a list-valued metric is summarized to `<name>/{mean,p50,p90,max}`
+  and the per-worker generation timeline is merged across workers before that
+  reduction — one bounded set of scalar keys per metric instead of one key per
+  element.
 
 ## The config family
 

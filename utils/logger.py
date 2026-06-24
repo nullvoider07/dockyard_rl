@@ -758,14 +758,35 @@ class MLflowLogger(LoggerInterface):
             prefix: Optional prefix for metric names
             step_metric: Optional step metric name (ignored in MLflow)
         """
-        metrics_to_log = {}
-        flattened_metrics = flatten_dict(metrics)
-        for name, value in flattened_metrics.items():
+        merged: dict[str, Any] = dict(metrics)
+        gen_metrics = merged.pop("generation_logger_metrics", None)
+        if isinstance(gen_metrics, dict) and gen_metrics:
+            merged["generation_logger_metrics"] = _merge_generation_logger_workers(
+                gen_metrics
+            )
+
+        # Keep list values intact (expand_lists=False) and summarize them into a
+        # handful of scalar keys; MLflow has no list metric type, so index-
+        # expansion would otherwise emit one key per element.
+        flattened = flatten_dict(merged, sep="/", expand_lists=False)
+
+        metrics_to_log: dict[str, float] = {}
+        for name, value in flattened.items():
             if prefix:
                 name = f"{prefix}/{name}"
-            metrics_to_log[name] = value
+            if isinstance(value, np.ndarray):
+                value = value.tolist()
+            if isinstance(value, list):
+                for stat, stat_value in _summarize_list(value).items():
+                    metrics_to_log[f"{name}/{stat}"] = stat_value
+            elif isinstance(value, bool):
+                metrics_to_log[name] = float(value)
+            elif isinstance(value, (int, float, np.integer, np.floating)):
+                metrics_to_log[name] = float(value)
+            # Non-numeric scalars are skipped: MLflow logs float metrics only.
 
-        mlflow.log_metrics(metrics_to_log, step=step, run_id=self.run_id)
+        if metrics_to_log:
+            mlflow.log_metrics(metrics_to_log, step=step, run_id=self.run_id)
 
     def log_hyperparams(self, params: Mapping[str, Any]) -> None:
         """Log hyperparameters to MLflow.
@@ -1142,15 +1163,73 @@ class Logger(LoggerInterface):
         if self.gpu_monitor:
             self.gpu_monitor.stop()
 
-def flatten_dict(d: Mapping[str, Any], sep: str = ".") -> dict[str, Any]:
+def _summarize_list(values: list[Any]) -> dict[str, float]:
+    """Reduce a list of scalars to {mean, p50, p90, max} over finite numbers.
+
+    Non-numeric and non-finite entries are dropped. Returns an empty dict when
+    nothing finite remains, so the caller can skip the key entirely.
+    """
+    finite: list[float] = []
+    for v in values:
+        if isinstance(v, bool):
+            continue
+        if isinstance(v, (int, float, np.integer, np.floating)):
+            f = float(v)
+            if np.isfinite(f):
+                finite.append(f)
+    if not finite:
+        return {}
+    arr = np.asarray(finite, dtype=np.float64)
+    return {
+        "mean": float(arr.mean()),
+        "p50": float(np.percentile(arr, 50)),
+        "p90": float(np.percentile(arr, 90)),
+        "max": float(arr.max()),
+    }
+
+def _merge_generation_logger_workers(
+    metrics: Mapping[str, Mapping[int, Any]],
+) -> dict[str, list[Any]]:
+    """Collapse {metric: {dp_idx: [values]}} into {metric: [values]}.
+
+    The per-worker generation timeline arrives keyed by data-parallel index; for
+    scalar-only backends the per-worker split is meaningless, so the values are
+    concatenated (in ascending dp index) into one series per metric.
+    """
+    merged: dict[str, list[Any]] = {}
+    for metric_name, per_worker in metrics.items():
+        series: list[Any] = []
+        if isinstance(per_worker, dict):
+            iterable = (per_worker[dp_idx] for dp_idx in sorted(per_worker))
+        elif isinstance(per_worker, list):
+            iterable = iter(per_worker)
+        else:
+            iterable = iter([per_worker])
+        for values in iterable:
+            if isinstance(values, list):
+                series.extend(values)
+            else:
+                series.append(values)
+        merged[metric_name] = series
+    return merged
+
+def flatten_dict(
+    d: Mapping[str, Any], sep: str = ".", expand_lists: bool = True
+) -> dict[str, Any]:
     """Flatten a nested dictionary.
 
-    Handles nested dictionaries and lists by creating keys with separators.
-    For lists, the index is used as part of the key.
+    Handles nested dictionaries by creating keys with separators. Lists are
+    handled per ``expand_lists``: when ``True`` (default) each element is
+    index-expanded into its own key; when ``False`` a list keeps a single key
+    holding the whole list (a dict element inside a list is still recursed when
+    expanding).
 
     Args:
         d: Dictionary to flatten
         sep: Separator to use between nested keys
+        expand_lists: Index-expand list values into per-element keys. Set to
+            ``False`` for scalar-only backends that would otherwise produce one
+            key per element (the caller summarizes the retained list instead).
 
     Returns:
         Flattened dictionary with compound keys
@@ -1166,6 +1245,9 @@ def flatten_dict(d: Mapping[str, Any], sep: str = ".") -> dict[str, Any]:
 
         >>> flatten_dict({"a": [{"b": 1}, {"c": 2}]})
         {'a.0.b': 1, 'a.1.c': 2}
+
+        >>> flatten_dict({"a": [1, 2], "b": {"c": 3}}, expand_lists=False)
+        {'a': [1, 2], 'b.c': 3}
         ```
     """
     result: dict[str, Any] = {}
@@ -1176,7 +1258,7 @@ def flatten_dict(d: Mapping[str, Any], sep: str = ".") -> dict[str, Any]:
 
             if isinstance(value, dict):
                 _flatten(value, new_key)
-            elif isinstance(value, list):
+            elif isinstance(value, list) and expand_lists:
                 for i, item in enumerate(value):
                     list_key = f"{new_key}{sep}{i}"
                     if isinstance(item, dict):
