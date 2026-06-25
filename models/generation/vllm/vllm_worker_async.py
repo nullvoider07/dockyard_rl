@@ -24,7 +24,7 @@ from dockyard_rl.models.generation.interfaces import (
     verify_right_padding,
 )
 from dockyard_rl.models.generation.vllm.config import VllmConfig
-from dockyard_rl.models.generation.vllm.utils import (
+from .utils import (
     format_prompt_for_vllm_generation,
 )
 from dockyard_rl.models.generation.vllm.vllm_worker import (
@@ -279,7 +279,10 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
 
         verify_right_padding(data, pad_value=self.cfg.get("_pad_token_id", 0))
         padded_input_length = input_ids.size(1)
-        prompts = format_prompt_for_vllm_generation(data)
+        prompts = format_prompt_for_vllm_generation(
+            data,
+            allow_multimodal_inputs=self.cfg.get("allow_multimodal_inputs", False),
+        )
 
         # Fire all async generation requests and collect results in order.
         request_ids = [f"req-{i}" for i in range(len(prompts))]
@@ -393,7 +396,11 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
 
         async def process_single_sample(sample_idx: int):
             current_input_actual_length = int(input_lengths_batch[sample_idx].item())
-            prompt = format_prompt_for_vllm_generation(data, sample_idx)
+            prompt = format_prompt_for_vllm_generation(
+                data,
+                sample_idx,
+                allow_multimodal_inputs=self.cfg.get("allow_multimodal_inputs", False),
+            )
 
             per_sample_stop = None
             if batch_stop_strings and sample_idx < len(batch_stop_strings):

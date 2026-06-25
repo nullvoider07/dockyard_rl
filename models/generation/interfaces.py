@@ -15,11 +15,35 @@ Design notes
   the config is passed to VllmGeneration.
 """
 
+import math
 from abc import ABC, abstractmethod
 from typing import Any, NotRequired, TypedDict, Union
 import ray
 import torch
 from dockyard_rl.distributed.batched_data_dict import BatchedDataDict
+
+
+# Sampling-parameter validation
+def assert_finite_sampling_params(temperature: float, top_p: float) -> None:
+    """Reject non-finite sampling parameters before they reach the engine.
+
+    vLLM through 0.23.0 (GHSA-7h4p-rffg-7823, unpatched at time of writing)
+    does not reject ``temperature=NaN`` / ``Infinity`` at the sampling-params
+    boundary, so a non-finite value propagates into the GPU sampling kernels.
+    dockyard sources temperature and top_p from static generation config, so a
+    malformed or computed-to-non-finite value is caught here at worker init —
+    before any SamplingParams is constructed — rather than reaching the engine.
+    """
+    for name, value in (("temperature", temperature), ("top_p", top_p)):
+        if not math.isfinite(value):
+            raise ValueError(
+                f"Non-finite generation {name}={value!r}. NaN/Inf sampling "
+                "parameters are rejected at the worker boundary because vLLM "
+                "<= 0.23.0 forwards them into GPU sampling kernels "
+                "(GHSA-7h4p-rffg-7823). Set a finite value in the generation "
+                "config."
+            )
+
 
 # Padding verification
 def verify_right_padding(
@@ -141,6 +165,11 @@ class GenerationConfig(TypedDict):
     stop_strings:    list[str] | None
     # When true, suppress EOS so generation always runs to max_new_tokens.
     ignore_eos:      NotRequired[bool]
+    # Opt-in gate for multimodal (image) generation requests. Defaults to false:
+    # the image-decode path in vLLM <= 0.23.0 carries unpatched advisories
+    # (GHSA-8jr5-v98p-w75m), so per-sample images are only forwarded to the
+    # engine when a config explicitly enables this. Text generation is unaffected.
+    allow_multimodal_inputs: NotRequired[bool]
     # Populated by configure_generation_config(), not by the caller.
     _pad_token_id:   NotRequired[int]
 

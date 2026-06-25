@@ -14,9 +14,26 @@ if TYPE_CHECKING:
     from dockyard_rl.tool_protocol.registry import ToolRegistry
 
 # Prompt formatting for vLLM
+def _normalize_vllm_image(image: Any) -> Any:
+    """Normalize a per-sample image before it reaches the vLLM engine.
+
+    Applies EXIF orientation and flattens to RGB so the pixels vLLM receives
+    match what the model expects. vLLM <= 0.23.0 does not normalize EXIF
+    rotation or PNG ``tRNS`` transparency itself (GHSA-8jr5-v98p-w75m), which
+    otherwise yields a silent mismatch between the rendered image and the model
+    input. Non-PIL inputs are returned unchanged.
+    """
+    from PIL import Image, ImageOps
+
+    if not isinstance(image, Image.Image):
+        return image
+    return ImageOps.exif_transpose(image).convert("RGB")
+
+
 def format_prompt_for_vllm_generation(
     data: BatchedDataDict[GenerationDatumSpec],
     sample_idx: Optional[int] = None,
+    allow_multimodal_inputs: bool = False,
 ) -> list[dict[str, Any]] | dict[str, Any]:
     """Convert a BatchedDataDict to vLLM's generate() prompt format.
 
@@ -29,6 +46,12 @@ def format_prompt_for_vllm_generation(
         sample_idx: If provided, return the single prompt for that index
                     (as a plain dict, not wrapped in a list).  If None,
                     return prompts for the entire batch (list of dicts).
+        allow_multimodal_inputs: When False (default), per-sample images are
+                    rejected rather than forwarded to the engine — the vLLM
+                    image-decode path through 0.23.0 carries unpatched
+                    advisories (GHSA-8jr5-v98p-w75m). A VLM/CUA config must opt
+                    in explicitly. The text path never sets images, so it is
+                    unaffected regardless of this flag.
 
     Returns:
         List of prompt dicts when sample_idx is None; a single prompt dict
@@ -58,7 +81,17 @@ def format_prompt_for_vllm_generation(
         )
         prompt: dict[str, Any] = {"prompt_token_ids": valid_ids.tolist()}
         if vllm_images is not None and i < len(vllm_images) and vllm_images[i]:
-            prompt["multi_modal_data"] = {"image": list(vllm_images[i])}
+            if not allow_multimodal_inputs:
+                raise ValueError(
+                    "Multimodal image inputs are present but disabled. The vLLM "
+                    "image-decode path (<= 0.23.0) has unpatched advisories "
+                    "(GHSA-8jr5-v98p-w75m); set generation config "
+                    "'allow_multimodal_inputs: true' to opt in once you accept "
+                    "that exposure."
+                )
+            prompt["multi_modal_data"] = {
+                "image": [_normalize_vllm_image(img) for img in vllm_images[i]]
+            }
         prompts.append(prompt)
 
     return prompts if return_all else prompts[0]
