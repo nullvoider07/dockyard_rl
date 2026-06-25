@@ -19,10 +19,11 @@ from dockyard_rl.distributed.worker_groups_utils import (
 from dockyard_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationOutputSpec,
+    assert_finite_sampling_params,
     verify_right_padding,
 )
 from dockyard_rl.models.generation.vllm.config import VllmConfig
-from dockyard_rl.models.generation.vllm.utils import (
+from .utils import (
     format_prompt_for_vllm_generation,
 )
 
@@ -154,6 +155,7 @@ class BaseVllmGenerationWorker:
                               vLLM executor subprocess.
         """
         self.cfg              = config
+        assert_finite_sampling_params(self.cfg["temperature"], self.cfg["top_p"])
         self.model_name       = self.cfg.get("model_name", "")
         self.tensor_parallel_size   = self.cfg["vllm_cfg"]["tensor_parallel_size"]
         self.pipeline_parallel_size = self.cfg["vllm_cfg"]["pipeline_parallel_size"]
@@ -563,7 +565,10 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
 
         verify_right_padding(data, pad_value=cast(int, self.cfg.get("_pad_token_id")))
         padded_input_length = input_ids.size(1)
-        prompts = format_prompt_for_vllm_generation(data)
+        prompts = format_prompt_for_vllm_generation(
+            data,
+            allow_multimodal_inputs=self.cfg.get("allow_multimodal_inputs", False),
+        )
 
         assert self.llm is not None
         outputs = self.llm.generate(prompts, sampling_params) # type: ignore[arg-type]

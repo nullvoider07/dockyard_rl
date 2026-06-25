@@ -77,7 +77,13 @@ A few settings disproportionately shape a run:
   by default; useful when a reward needs a fixed-length completion), and
   `policy.generation.vllm_cfg.env_vars` passes a per-recipe map of environment
   variables through to the vLLM workers — for example to select a fused-MoE
-  backend for a particular model without baking it into the image.
+  backend for a particular model without baking it into the image. `temperature`
+  and `top_p` are validated for finiteness at worker startup — a NaN/Inf value is
+  rejected rather than forwarded to the engine. Per-sample image inputs are gated
+  by `allow_multimodal_inputs` (default `false`): a VLM/CUA recipe must set it to
+  `true` to forward images to vLLM, and when enabled images are EXIF- and
+  transparency-normalized before the engine sees them. The text generation path is
+  unaffected by the flag.
 - **Logging backends** — `logger` enables any of W&B, TensorBoard, MLflow, and
   SwanLab together. W&B receives full per-step series (including the per-worker
   generation timeline) as-is. Scalar-only backends (MLflow) cannot hold a list

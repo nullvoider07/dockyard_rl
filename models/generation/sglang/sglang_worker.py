@@ -16,6 +16,7 @@ from dockyard_rl.distributed.worker_groups_utils import get_nsight_config_if_pat
 from dockyard_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationOutputSpec,
+    assert_finite_sampling_params,
     verify_right_padding,
 )
 from dockyard_rl.models.generation.sglang.config import SGLangConfig
@@ -138,6 +139,7 @@ class SGLangGenerationWorker:
             seed: Random seed for initialization, if None, then defaults to the config's seed
         """
         self.cfg = config
+        assert_finite_sampling_params(self.cfg["temperature"], self.cfg.get("top_p", 1.0))
         self.is_model_owner = bundle_indices is not None
         self.global_rank = int(os.environ.get("RANK", "0"))
         self.sglang_cfg = config["sglang_cfg"]
