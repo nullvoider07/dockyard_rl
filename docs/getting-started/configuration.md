@@ -116,3 +116,25 @@ GRPO core and differ in dataset, environment, and rollout shape:
 
 Each config's header comment documents the topology and target hardware it was
 written for.
+
+## Exporting a trained model to GGUF
+
+After training, `utils/native_checkpoint.py::convert_dcp_to_hf` converts a DCP
+checkpoint to a regular Hugging Face build. `utils/gguf_export.py` then produces a
+switchable GGUF build alongside it so the released model also runs under llama.cpp /
+ollama and other native GGUF runtimes:
+
+- `convert_hf_to_gguf(hf_ckpt_path, out_path, quant_type=...)` emits one GGUF;
+  `f16`/`bf16`/`f32` are written directly, quantized types (`Q4_K_M`, `Q8_0`, …) go
+  through `llama-quantize`. `export_gguf_variants(...)` produces several at once.
+- Conversion shells out to llama.cpp's `convert_hf_to_gguf.py` and `llama-quantize`
+  (a build-time dependency located via `DOCKYARD_LLAMA_CPP_DIR` or the `llama_cpp_dir`
+  argument — not a Python package), run with `sys.executable`.
+- Each output is validated with the `gguf` package (`validate_gguf`): architecture and
+  tensor presence plus float-tensor finiteness.
+
+Security: the GGUF dequant advisory (GHSA-5jv2-g5wq-cmr4) lives in vLLM's dequant
+kernel. This export+validation path never invokes vLLM, so producing and checking a
+GGUF does not exercise the vulnerable kernel. Serving a GGUF in vLLM is a separate,
+explicitly hardened path; keeping export off the vLLM-GGUF runtime leaves the advisory
+unexercised in dockyard.
