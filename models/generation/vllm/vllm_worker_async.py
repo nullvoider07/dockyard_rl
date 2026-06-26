@@ -109,6 +109,13 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
 
         async def _serve():
             app = build_app(serving_kwargs)  # type: ignore[arg-type]
+            # Sanitize leaked PIL repr addresses in the Anthropic router's error
+            # bodies before the server starts serving (GHSA-hgg8-fqqc-vfmw).
+            from dockyard_rl.models.generation.vllm.serving_hardening import (
+                install_anthropic_repr_sanitizer,
+            )
+
+            install_anthropic_repr_sanitizer(app)
             await init_app_state(
                 engine=self.llm,  # type: ignore[call-arg]
                 engine_config=self.llm.engine_config,  # type: ignore[call-arg]
