@@ -8,7 +8,7 @@ from typing import Any, Optional, Union, cast
 import decord
 import requests
 import torch
-from PIL import Image
+from PIL import Image, ImageOps
 from transformers import PreTrainedTokenizerBase
 from transformers.audio_utils import load_audio
 from transformers.video_utils import load_video
@@ -275,6 +275,47 @@ def resolve_to_image(image_path_or_image: str | Image.Image) -> Image.Image:
     else:
         # Handle local file path
         return Image.open(image_path_or_image).convert("RGB")
+
+# Decoded-pixel ceiling for a single image. A 50 MP image is ~200 MB as RGB uint8;
+# larger images are rejected at the worker boundary before being forwarded to the engine.
+DEFAULT_MAX_IMAGE_PIXELS = 50_000_000
+
+
+def normalize_and_validate_image(
+    image: Any,
+    *,
+    max_pixels: int = DEFAULT_MAX_IMAGE_PIXELS,
+) -> Any:
+    """Normalize and bound-check a PIL image before it reaches a generation engine.
+
+    Single normalization point for every backend. vLLM <= 0.23.0 does not normalize
+    EXIF orientation or PNG ``tRNS`` transparency, and Pillow loads only the first
+    frame of a multi-frame image (GHSA-8jr5-v98p-w75m), so the pixels the model
+    receives can differ from the rendered image. This:
+
+    - pins a multi-frame image to its first frame (later frames cannot smuggle
+      different content past the rendered preview),
+    - applies EXIF orientation,
+    - flattens transparency to RGB,
+    - rejects images whose pixel count exceeds ``max_pixels``, bounding the input
+      forwarded to the engine. In the standard data path images are already decoded
+      upstream (resolve_to_image), so this caps engine input rather than preventing
+      the decode itself; it still rejects anything oversized reaching this boundary.
+
+    Non-PIL inputs are returned unchanged.
+    """
+    if not isinstance(image, Image.Image):
+        return image
+    if getattr(image, "n_frames", 1) > 1:
+        image.seek(0)
+    width, height = image.size
+    if width * height > max_pixels:
+        raise ValueError(
+            f"Image {width}x{height} ({width * height} px) exceeds the decoded-pixel "
+            f"cap of {max_pixels}. Oversized images are rejected at the worker "
+            "boundary to bound the pixel volume forwarded to the generation engine."
+        )
+    return ImageOps.exif_transpose(image).convert("RGB")
 
 def get_media_from_message(message: dict[str, Any]) -> dict[str, list[Any]]:
     """Get all media from a message log item."""

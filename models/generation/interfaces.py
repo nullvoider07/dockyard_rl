@@ -170,6 +170,11 @@ class GenerationConfig(TypedDict):
     # (GHSA-8jr5-v98p-w75m), so per-sample images are only forwarded to the
     # engine when a config explicitly enables this. Text generation is unaffected.
     allow_multimodal_inputs: NotRequired[bool]
+    # Per-image decoded-pixel cap (decompression-bomb guard) and per-sample image
+    # count cap, applied when allow_multimodal_inputs is set. Absent → the worker
+    # passes None and multimodal_utils.DEFAULT_MAX_IMAGE_PIXELS / no count cap apply.
+    max_image_pixels:      NotRequired[int]
+    max_images_per_sample: NotRequired[int]
     # Populated by configure_generation_config(), not by the caller.
     _pad_token_id:   NotRequired[int]
 

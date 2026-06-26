@@ -282,6 +282,8 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         prompts = format_prompt_for_vllm_generation(
             data,
             allow_multimodal_inputs=self.cfg.get("allow_multimodal_inputs", False),
+            max_image_pixels=self.cfg.get("max_image_pixels"),
+            max_images_per_sample=self.cfg.get("max_images_per_sample"),
         )
 
         # Fire all async generation requests and collect results in order.
@@ -400,6 +402,8 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 data,
                 sample_idx,
                 allow_multimodal_inputs=self.cfg.get("allow_multimodal_inputs", False),
+                max_image_pixels=self.cfg.get("max_image_pixels"),
+                max_images_per_sample=self.cfg.get("max_images_per_sample"),
             )
 
             per_sample_stop = None

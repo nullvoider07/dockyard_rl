@@ -81,9 +81,14 @@ A few settings disproportionately shape a run:
   and `top_p` are validated for finiteness at worker startup — a NaN/Inf value is
   rejected rather than forwarded to the engine. Per-sample image inputs are gated
   by `allow_multimodal_inputs` (default `false`): a VLM/CUA recipe must set it to
-  `true` to forward images to vLLM, and when enabled images are EXIF- and
-  transparency-normalized before the engine sees them. The text generation path is
-  unaffected by the flag.
+  `true` to forward images to vLLM, and when enabled each image is normalized before
+  the engine sees it — EXIF orientation applied, transparency flattened to RGB, and
+  multi-frame inputs pinned to their first frame (GHSA-8jr5-v98p-w75m).
+  `max_image_pixels` caps a single image's decoded size (decompression-bomb guard)
+  and `max_images_per_sample` caps how many images one sample may carry; both reject
+  oversized inputs at the worker boundary. The SGLang backend applies the same gate
+  but does not yet forward images — image inputs are surfaced as an explicit error
+  rather than silently dropped. The text generation path is unaffected by the flag.
 - **Logging backends** — `logger` enables any of W&B, TensorBoard, MLflow, and
   SwanLab together. W&B receives full per-step series (including the per-worker
   generation timeline) as-is. Scalar-only backends (MLflow) cannot hold a list
