@@ -11,10 +11,15 @@ paths are wired:
 Both deploy the same three-fleet topology and the same image; they differ only in
 how nodes are provisioned and how each node learns its `DOCKYARD_FLEET_ROLE`.
 
+Before a first cluster run, see [Hardware-deferred validation](hardware-validation.md)
+for the paths that are statically validated but **not yet confirmed on a GPU** — the
+checks to run at bring-up.
+
 ```{toctree}
 :hidden:
 :maxdepth: 1
 
 slurm
 kubernetes
+hardware-validation
 ```
