@@ -14,26 +14,12 @@ if TYPE_CHECKING:
     from dockyard_rl.tool_protocol.registry import ToolRegistry
 
 # Prompt formatting for vLLM
-def _normalize_vllm_image(image: Any) -> Any:
-    """Normalize a per-sample image before it reaches the vLLM engine.
-
-    Applies EXIF orientation and flattens to RGB so the pixels vLLM receives
-    match what the model expects. vLLM <= 0.23.0 does not normalize EXIF
-    rotation or PNG ``tRNS`` transparency itself (GHSA-8jr5-v98p-w75m), which
-    otherwise yields a silent mismatch between the rendered image and the model
-    input. Non-PIL inputs are returned unchanged.
-    """
-    from PIL import Image, ImageOps
-
-    if not isinstance(image, Image.Image):
-        return image
-    return ImageOps.exif_transpose(image).convert("RGB")
-
-
 def format_prompt_for_vllm_generation(
     data: BatchedDataDict[GenerationDatumSpec],
     sample_idx: Optional[int] = None,
     allow_multimodal_inputs: bool = False,
+    max_image_pixels: Optional[int] = None,
+    max_images_per_sample: Optional[int] = None,
 ) -> list[dict[str, Any]] | dict[str, Any]:
     """Convert a BatchedDataDict to vLLM's generate() prompt format.
 
@@ -52,6 +38,10 @@ def format_prompt_for_vllm_generation(
                     advisories (GHSA-8jr5-v98p-w75m). A VLM/CUA config must opt
                     in explicitly. The text path never sets images, so it is
                     unaffected regardless of this flag.
+        max_image_pixels: Per-image decoded-pixel cap (decompression-bomb guard);
+                    None uses multimodal_utils.DEFAULT_MAX_IMAGE_PIXELS.
+        max_images_per_sample: Reject a sample carrying more than this many images;
+                    None disables the count cap.
 
     Returns:
         List of prompt dicts when sample_idx is None; a single prompt dict
@@ -89,8 +79,29 @@ def format_prompt_for_vllm_generation(
                     "'allow_multimodal_inputs: true' to opt in once you accept "
                     "that exposure."
                 )
+            from dockyard_rl.data.multimodal_utils import (
+                DEFAULT_MAX_IMAGE_PIXELS,
+                normalize_and_validate_image,
+            )
+
+            if (
+                max_images_per_sample is not None
+                and len(vllm_images[i]) > max_images_per_sample
+            ):
+                raise ValueError(
+                    f"Sample {i} carries {len(vllm_images[i])} images, exceeding "
+                    f"max_images_per_sample={max_images_per_sample}."
+                )
+            cap = (
+                max_image_pixels
+                if max_image_pixels is not None
+                else DEFAULT_MAX_IMAGE_PIXELS
+            )
             prompt["multi_modal_data"] = {
-                "image": [_normalize_vllm_image(img) for img in vllm_images[i]]
+                "image": [
+                    normalize_and_validate_image(img, max_pixels=cap)
+                    for img in vllm_images[i]
+                ]
             }
         prompts.append(prompt)
 

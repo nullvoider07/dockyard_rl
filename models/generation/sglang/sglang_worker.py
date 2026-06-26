@@ -52,6 +52,32 @@ def _require_sglang():
     return launch_server, ServerArgs, kill_process_tree
 
 
+def _guard_sglang_multimodal_inputs(
+    cfg: dict[str, Any], data: BatchedDataDict[GenerationDatumSpec]
+) -> None:
+    """Gate and surface image inputs on the SGLang backend.
+
+    SGLang image forwarding is not wired here yet — the worker submits token ids
+    only. Rather than silently dropping per-sample images (which would let a VLM
+    recipe appear to run while the model never sees the pixels), enforce the
+    allow_multimodal_inputs gate and fail loudly. Image normalization
+    (GHSA-8jr5-v98p-w75m) and forwarding land with the validated SGLang VLM path.
+    """
+    vllm_images = data.get("vllm_images")
+    if not vllm_images or not any(imgs for imgs in vllm_images):
+        return
+    if not cfg.get("allow_multimodal_inputs", False):
+        raise ValueError(
+            "Multimodal image inputs are present but disabled. Set generation "
+            "config 'allow_multimodal_inputs: true' to opt in (GHSA-8jr5-v98p-w75m)."
+        )
+    raise NotImplementedError(
+        "SGLang received image inputs, but SGLang multimodal forwarding is not yet "
+        "implemented. Use the vLLM backend for VLM/CUA generation until the "
+        "validated SGLang image path lands."
+    )
+
+
 @ray.remote(
     runtime_env={**get_nsight_config_if_pattern_matches("sglang_generation_worker")}
 )  # pragma: no cover
@@ -595,6 +621,8 @@ class SGLangGenerationWorker:
                 }
             )
 
+        _guard_sglang_multimodal_inputs(cast(dict[str, Any], self.cfg), data)
+
         input_ids = data["input_ids"]
         input_lengths = data["input_lengths"]
         batch_stop_strings = data.get("stop_strings", [None] * len(input_lengths))
@@ -745,6 +773,8 @@ class SGLangGenerationWorker:
 
         if len(data["input_ids"]) == 0:
             return
+
+        _guard_sglang_multimodal_inputs(cast(dict[str, Any], self.cfg), data)
 
         input_ids     = data["input_ids"]
         input_lengths = data["input_lengths"]
