@@ -279,26 +279,30 @@ class ClippedPGLossFn(LossFunction):
         if self.reference_policy_kl_penalty != 0:
             assert curr_logprobs_unfiltered is not None
             assert reference_policy_logprobs is not None
+            # KL samples are drawn from the optimized policy, so the KL loss must
+            # carry the score-function gradient through the sampling probability
+            # (https://arxiv.org/abs/2506.09477v1). The on-policy importance ratio
+            # exp(curr - generation) provides it; otherwise the straight-through
+            # exp(x - x.detach()) has forward value 1 while preserving that gradient.
             if self.use_on_policy_kl_approximation:
                 kl_importance_weights = torch.exp(
                     curr_logprobs_unfiltered - generation_logprobs
-                ).detach()
-                kl_importance_weights = torch.nan_to_num(
-                    kl_importance_weights, nan=0.0, posinf=0.0, neginf=0.0
                 )
             else:
-                kl_importance_weights = torch.ones_like(curr_logprobs_unfiltered)
-
-            kl = (
-                kl_importance_weights
-                * self.reference_policy_kl_penalty
-                * calculate_kl(
-                    logprobs=curr_logprobs_unfiltered,
-                    logprobs_reference=reference_policy_logprobs,
-                    kl_type=self.reference_policy_kl_type,
-                    input_clamp_value=self.kl_input_clamp_value,
-                    output_clamp_value=self.kl_output_clamp_value,
+                kl_importance_weights = torch.exp(
+                    curr_logprobs_unfiltered - curr_logprobs_unfiltered.detach()
                 )
+            kl_importance_weights = torch.nan_to_num(
+                kl_importance_weights, nan=0.0, posinf=0.0, neginf=0.0
+            )
+
+            kl = self.reference_policy_kl_penalty * calculate_kl(
+                logprobs=curr_logprobs_unfiltered,
+                logprobs_reference=reference_policy_logprobs,
+                kl_type=self.reference_policy_kl_type,
+                input_clamp_value=self.kl_input_clamp_value,
+                output_clamp_value=self.kl_output_clamp_value,
+                importance_sampling_weights=kl_importance_weights,
             )
 
             if self.loss_type == LossType.TOKEN_LEVEL:
