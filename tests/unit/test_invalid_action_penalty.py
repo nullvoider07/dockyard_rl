@@ -27,6 +27,7 @@ from dockyard_rl.rewards.invalid_action import (
     detect_malformed_thinking,
     penalty_scale_at_step,
     pop_env_flags,
+    violation_rate_metrics,
 )
 from dockyard_rl.tool_protocol.registry import ToolRegistry, make_tool
 
@@ -371,6 +372,27 @@ class TestSchemaValidation:
             x.type in (VIOLATION_SCHEMA_ARGS, VIOLATION_SCHEMA_UNKNOWN_TOOL)
             for x in v.violations
         )
+
+
+class TestViolationRateMetrics:
+    def test_per_type_and_aggregate_rates(self):
+        counts = {
+            VIOLATION_UNEXECUTED_PATTERN: 2,
+            VIOLATION_SCHEMA_ARGS: 1,
+            VIOLATION_MALFORMED_THINKING: 1,
+        }
+        m = violation_rate_metrics(counts, num_assistant_messages=8)
+        assert m["num_assistant_messages"] == 8.0
+        assert m[f"violation_rate/{VIOLATION_UNEXECUTED_PATTERN}"] == 2 / 8
+        # invalid-action aggregate = unexecuted_pattern + schema_args = 3/8
+        assert m["invalid_action_msg_rate"] == 3 / 8
+        assert m["malformed_thinking_msg_rate"] == 1 / 8
+
+    def test_zero_messages_no_div_by_zero(self):
+        m = violation_rate_metrics({}, num_assistant_messages=0)
+        assert m["num_assistant_messages"] == 0.0
+        assert m["invalid_action_msg_rate"] == 0.0
+        assert m["malformed_thinking_msg_rate"] == 0.0
 
 
 class TestPenaltyStepScale:

@@ -293,6 +293,32 @@ def penalty_scale_at_step(
     raise ValueError(f"Unknown penalty_step_scale schedule {kind!r}")
 
 
+def violation_rate_metrics(
+    violation_counts: dict[str, int], num_assistant_messages: int
+) -> dict[str, float]:
+    """Per-type and aggregate violation rates over assistant messages (#2800).
+
+    ``violation_counts`` maps a violation type to its count across all assistant
+    turns in the rollout. Returns ``num_assistant_messages``, a per-type
+    ``violation_rate/<type>`` for each observed type, and the aggregate
+    ``invalid_action_msg_rate`` / ``malformed_thinking_msg_rate`` (counts over
+    assistant messages, distinct from the existing per-sample flag fractions).
+    """
+    denom = max(num_assistant_messages, 1)
+    metrics: dict[str, float] = {
+        "num_assistant_messages": float(num_assistant_messages),
+        "invalid_action_msg_rate": (
+            sum(violation_counts.get(t, 0) for t in _INVALID_ACTION_TYPES) / denom
+        ),
+        "malformed_thinking_msg_rate": (
+            sum(violation_counts.get(t, 0) for t in _MALFORMED_THINKING_TYPES) / denom
+        ),
+    }
+    for vtype, count in violation_counts.items():
+        metrics[f"violation_rate/{vtype}"] = count / denom
+    return metrics
+
+
 def _classify_schema_failure(reason: str) -> str:
     """Map a tool_protocol assessment reason to a graded schema violation type."""
     if reason.startswith("unknown tool") or "unknown tool" in reason:
