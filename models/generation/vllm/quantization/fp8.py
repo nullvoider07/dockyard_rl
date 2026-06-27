@@ -538,9 +538,14 @@ def process_weights_after_loading_moe(self, layer) -> None:
     getattr(layer, f"w13_{self.weight_scale_name}").copy_(w13_scale)
     getattr(layer, f"w2_{self.weight_scale_name}").copy_(w2_scale)
 
-    # Set up the MoE kernel (same as upstream _setup_kernel but without replace_parameter).
+    # Set up the MoE kernel on the initial load only (same as upstream _setup_kernel
+    # but without replace_parameter). This patched method re-runs on every weight
+    # refit; building the kernel again outside the initial load lacks the
+    # set_current_vllm_config context and corrupts CUDA-graph MoE state. Gate on
+    # `moe_kernel is None` (not hasattr) because FusedMoEMethodBase.__init__ always
+    # initializes moe_kernel = None and sets it here on first load.
     self.moe_quant_config = self.get_fused_moe_quant_config(layer)
-    if self.moe_quant_config:
+    if self.moe_quant_config and self.moe_kernel is None:
         from vllm.model_executor.layers.quantization.fp8 import make_fp8_moe_kernel  # type: ignore[reportPrivateImportUsage]
 
         assert self.experts_cls is not None
