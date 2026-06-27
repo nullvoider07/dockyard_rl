@@ -14,12 +14,21 @@ from dockyard_rl.distributed.batched_data_dict import BatchedDataDict
 from dockyard_rl.rewards.invalid_action import (
     ENV_INVALID_ACTION_KEY,
     ENV_MALFORMED_THINKING_KEY,
+    LOCUS_ADVANTAGE,
+    LOCUS_REWARD,
+    VIOLATION_ENV_INVALID_ACTION,
+    VIOLATION_MALFORMED_THINKING,
+    VIOLATION_SCHEMA_ARGS,
+    VIOLATION_SCHEMA_UNKNOWN_TOOL,
+    VIOLATION_UNEXECUTED_PATTERN,
     InvalidActionPenaltyConfig,
     assess_assistant_turn,
     detect_invalid_tool_call,
     detect_malformed_thinking,
+    penalty_scale_at_step,
     pop_env_flags,
 )
+from dockyard_rl.tool_protocol.registry import ToolRegistry, make_tool
 
 
 # generic detectors
@@ -251,3 +260,145 @@ class TestEnvironmentStamping:
         diff = "```diff\n--- a/f.py\n+++ b/f.py\n@@ -1 +1 @@\n-x\n+y\n```"
         assert _extract_patch(diff).strip()
         assert not _extract_patch("no patch here, just words").strip()
+
+
+# Typed / graded violations (N4)
+class TestTypedViolations:
+    def test_env_invalid_is_reward_locus(self):
+        v = assess_assistant_turn("clean", _CFG, {ENV_INVALID_ACTION_KEY: True})
+        assert v.invalid_action
+        types = {x.type: x for x in v.violations}
+        assert VIOLATION_ENV_INVALID_ACTION in types
+        # Env task-semantic invalid-action defaults to the reward locus.
+        assert types[VIOLATION_ENV_INVALID_ACTION].locus == LOCUS_REWARD
+
+    def test_pattern_is_advantage_locus(self):
+        v = assess_assistant_turn("try <tool_call>x</tool_call>", _CFG, {})
+        types = {x.type: x for x in v.violations}
+        assert VIOLATION_UNEXECUTED_PATTERN in types
+        # Structural/format violations default to the advantage (token-local) locus.
+        assert types[VIOLATION_UNEXECUTED_PATTERN].locus == LOCUS_ADVANTAGE
+
+    def test_thinking_is_advantage_locus(self):
+        v = assess_assistant_turn("<think>oops no close", _CFG, None)
+        types = {x.type for x in v.violations}
+        assert VIOLATION_MALFORMED_THINKING in types
+        assert all(
+            x.locus == LOCUS_ADVANTAGE
+            for x in v.violations
+            if x.type == VIOLATION_MALFORMED_THINKING
+        )
+
+    def test_severity_default_and_override(self):
+        v = assess_assistant_turn("try <tool_call>x</tool_call>", _CFG, {})
+        sev = {x.type: x.severity for x in v.violations}
+        assert sev[VIOLATION_UNEXECUTED_PATTERN] == 1.0  # default
+        cfg = cast(
+            InvalidActionPenaltyConfig,
+            dict(_CFG, severity_weights={VIOLATION_UNEXECUTED_PATTERN: 2.5}),
+        )
+        v2 = assess_assistant_turn("try <tool_call>x</tool_call>", cfg, {})
+        sev2 = {x.type: x.severity for x in v2.violations}
+        assert sev2[VIOLATION_UNEXECUTED_PATTERN] == 2.5
+
+    def test_locus_override(self):
+        cfg = cast(
+            InvalidActionPenaltyConfig,
+            dict(_CFG, locus_overrides={VIOLATION_UNEXECUTED_PATTERN: LOCUS_REWARD}),
+        )
+        v = assess_assistant_turn("try <tool_call>x</tool_call>", cfg, {})
+        types = {x.type: x for x in v.violations}
+        assert types[VIOLATION_UNEXECUTED_PATTERN].locus == LOCUS_REWARD
+
+
+# Structured tool-call schema validation (N3) — wires tool_protocol into the verdict
+_SCHEMA_CFG: InvalidActionPenaltyConfig = {
+    "enabled": True,
+    "invalid_action_penalty": 0.5,
+    "malformed_thinking_penalty": 0.25,
+    "use_environment_flags": True,
+    "enable_schema_validation": True,
+    "thinking_tags": ["<think>", "</think>"],
+}
+_REGISTRY = ToolRegistry(
+    tools=(
+        make_tool(
+            "run_shell",
+            "Run a shell command",
+            {
+                "type": "object",
+                "properties": {"cmd": {"type": "string"}},
+                "required": ["cmd"],
+            },
+        ),
+    )
+)
+
+
+def _tool_call(name: str, arguments: dict) -> str:
+    import json
+
+    return f'<tool_call>\n{json.dumps({"name": name, "arguments": arguments})}\n</tool_call>'
+
+
+class TestSchemaValidation:
+    def test_valid_call_no_violation(self):
+        v = assess_assistant_turn(
+            _tool_call("run_shell", {"cmd": "ls"}), _SCHEMA_CFG, {}, registry=_REGISTRY
+        )
+        assert not v.invalid_action and not v.violations
+
+    def test_unknown_tool_violation(self):
+        v = assess_assistant_turn(
+            _tool_call("nope", {}), _SCHEMA_CFG, {}, registry=_REGISTRY
+        )
+        assert v.invalid_action
+        assert any(x.type == VIOLATION_SCHEMA_UNKNOWN_TOOL for x in v.violations)
+
+    def test_bad_args_schema_violation(self):
+        v = assess_assistant_turn(
+            _tool_call("run_shell", {}), _SCHEMA_CFG, {}, registry=_REGISTRY
+        )
+        assert v.invalid_action
+        sv = [x for x in v.violations if x.type == VIOLATION_SCHEMA_ARGS]
+        assert sv and sv[0].locus == LOCUS_ADVANTAGE
+        assert sv[0].detail  # carries the schema error reason
+
+    def test_no_registry_means_no_schema_tier(self):
+        # Same bad-args call without a registry: schema tier is skipped entirely.
+        v = assess_assistant_turn(_tool_call("run_shell", {}), _SCHEMA_CFG, {})
+        assert not any(
+            x.type in (VIOLATION_SCHEMA_ARGS, VIOLATION_SCHEMA_UNKNOWN_TOOL)
+            for x in v.violations
+        )
+
+
+class TestPenaltyStepScale:
+    def test_no_schedule_is_identity(self):
+        assert penalty_scale_at_step(_CFG, 100) == 1.0
+
+    def test_constant(self):
+        cfg = cast(
+            InvalidActionPenaltyConfig,
+            dict(_CFG, penalty_step_scale={"schedule": "constant", "start": 0.3}),
+        )
+        assert penalty_scale_at_step(cfg, 5) == 0.3
+        assert penalty_scale_at_step(cfg, None) == 0.3
+
+    def test_linear_interpolation_and_clamp(self):
+        cfg = cast(
+            InvalidActionPenaltyConfig,
+            dict(
+                _CFG,
+                penalty_step_scale={
+                    "schedule": "linear",
+                    "start": 0.0,
+                    "end": 1.0,
+                    "steps": 10,
+                },
+            ),
+        )
+        assert penalty_scale_at_step(cfg, 0) == 0.0
+        assert penalty_scale_at_step(cfg, 5) == 0.5
+        assert penalty_scale_at_step(cfg, 10) == 1.0
+        assert penalty_scale_at_step(cfg, 100) == 1.0  # clamped at end
