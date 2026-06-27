@@ -319,6 +319,66 @@ def violation_rate_metrics(
     return metrics
 
 
+def violations_at_locus(
+    violations: Sequence[Violation], penalty_mode: Optional[str], locus: str
+) -> list[Violation]:
+    """Violations whose penalty applies at ``locus`` under ``penalty_mode``.
+
+    - ``"auto"`` (default): each violation at its own default locus (no double-count).
+    - ``"reward"`` / ``"advantage"``: force every violation to that single locus.
+    - ``"both"``: every violation at both loci (intentional stacking).
+    """
+    mode = penalty_mode or "auto"
+    if mode == "both":
+        return list(violations)
+    if mode == "auto":
+        return [v for v in violations if v.locus == locus]
+    if mode in (LOCUS_REWARD, LOCUS_ADVANTAGE):
+        return list(violations) if mode == locus else []
+    raise ValueError(f"Unknown penalty_mode {mode!r}")
+
+
+def base_penalty_for_type(cfg: InvalidActionPenaltyConfig, vtype: str) -> float:
+    """Base reward penalty for a violation type: malformed-thinking vs invalid-action."""
+    if vtype in _MALFORMED_THINKING_TYPES:
+        return float(cfg.get("malformed_thinking_penalty", 0.0))
+    return float(cfg.get("invalid_action_penalty", 0.0))
+
+
+def violation_penalty(
+    cfg: InvalidActionPenaltyConfig, violation: Violation, step: Optional[int] = None
+) -> float:
+    """Penalty magnitude for one violation: base(type) * severity * step_scale (>= 0)."""
+    return (
+        base_penalty_for_type(cfg, violation.type)
+        * violation.severity
+        * penalty_scale_at_step(cfg, step)
+    )
+
+
+def sample_locus_penalty(
+    message_log: Sequence[dict],
+    cfg: InvalidActionPenaltyConfig,
+    locus: str,
+    step: Optional[int] = None,
+) -> float:
+    """Total penalty routed to ``locus`` for one sample's stamped message log.
+
+    Reads ``message["invalid_action_violations"]`` (a list of ``Violation``) stamped
+    at rollout time on assistant turns; sums ``violation_penalty`` over the
+    violations that route to ``locus`` under ``cfg``'s ``penalty_mode``.
+    """
+    mode = cfg.get("penalty_mode")
+    total = 0.0
+    for message in message_log:
+        violations = message.get("invalid_action_violations")
+        if not violations:
+            continue
+        for v in violations_at_locus(violations, mode, locus):
+            total += violation_penalty(cfg, v, step)
+    return total
+
+
 def _classify_schema_failure(reason: str) -> str:
     """Map a tool_protocol assessment reason to a graded schema violation type."""
     if reason.startswith("unknown tool") or "unknown tool" in reason:

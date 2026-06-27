@@ -702,6 +702,12 @@ def run_multi_turn_rollout(
                     rollout_violation_counts[_viol.type] = (
                         rollout_violation_counts.get(_viol.type, 0) + 1
                     )
+                # Stamp typed violations on the assistant turn for the graded
+                # reward / advantage-span penalties (N2).
+                if verdict.violations:
+                    current_batch["message_log"][global_idx][-1][
+                        "invalid_action_violations"
+                    ] = list(verdict.violations)
             # Verdict keys are per-turn; never carry into next-turn extra_env_info.
             pop_env_flags(env_output.metadata[i])
 
@@ -1054,6 +1060,12 @@ async def run_sample_multi_turn_rollout(
             for _viol in verdict.violations:
                 async_violation_counts[_viol.type] = (
                     async_violation_counts.get(_viol.type, 0) + 1
+                )
+            # Stamp typed violations on the assistant turn for the graded
+            # reward / advantage-span penalties (N2).
+            if verdict.violations:
+                current_message_log[-1]["invalid_action_violations"] = list(
+                    verdict.violations
                 )
         # Verdict keys are per-turn; never carry into next-turn extra_env_info.
         pop_env_flags(env_output.metadata[0])

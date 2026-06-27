@@ -9,7 +9,10 @@ from typing import cast
 import pytest
 import torch
 
-from dockyard_rl.algorithms.reward_functions import apply_invalid_action_penalty
+from dockyard_rl.algorithms.reward_functions import (
+    apply_invalid_action_penalty,
+    apply_message_span_advantage_penalties,
+)
 from dockyard_rl.distributed.batched_data_dict import BatchedDataDict
 from dockyard_rl.rewards.invalid_action import (
     ENV_INVALID_ACTION_KEY,
@@ -21,8 +24,11 @@ from dockyard_rl.rewards.invalid_action import (
     VIOLATION_SCHEMA_ARGS,
     VIOLATION_SCHEMA_UNKNOWN_TOOL,
     VIOLATION_UNEXECUTED_PATTERN,
+    Violation,
     InvalidActionPenaltyConfig,
     assess_assistant_turn,
+    sample_locus_penalty,
+    violations_at_locus,
     detect_invalid_tool_call,
     detect_malformed_thinking,
     penalty_scale_at_step,
@@ -424,3 +430,131 @@ class TestPenaltyStepScale:
         assert penalty_scale_at_step(cfg, 5) == 0.5
         assert penalty_scale_at_step(cfg, 10) == 1.0
         assert penalty_scale_at_step(cfg, 100) == 1.0  # clamped at end
+
+
+# penalty_mode routing + reward / advantage application (N2)
+def _adv(t: str, locus: str) -> Violation:
+    return Violation(type=t, severity=1.0, locus=locus)
+
+
+class TestViolationsAtLocus:
+    def test_auto_routes_by_default_locus(self):
+        vs = [_adv("a", LOCUS_ADVANTAGE), _adv("r", LOCUS_REWARD)]
+        assert violations_at_locus(vs, "auto", LOCUS_ADVANTAGE) == [vs[0]]
+        assert violations_at_locus(vs, "auto", LOCUS_REWARD) == [vs[1]]
+
+    def test_force_reward_or_advantage(self):
+        vs = [_adv("a", LOCUS_ADVANTAGE), _adv("r", LOCUS_REWARD)]
+        assert violations_at_locus(vs, "reward", LOCUS_REWARD) == vs
+        assert violations_at_locus(vs, "reward", LOCUS_ADVANTAGE) == []
+        assert violations_at_locus(vs, "advantage", LOCUS_ADVANTAGE) == vs
+        assert violations_at_locus(vs, "advantage", LOCUS_REWARD) == []
+
+    def test_both_stacks_at_each_locus(self):
+        vs = [_adv("a", LOCUS_ADVANTAGE), _adv("r", LOCUS_REWARD)]
+        assert violations_at_locus(vs, "both", LOCUS_REWARD) == vs
+        assert violations_at_locus(vs, "both", LOCUS_ADVANTAGE) == vs
+
+
+_PEN_CFG: InvalidActionPenaltyConfig = {
+    "enabled": True,
+    "invalid_action_penalty": 0.5,
+    "malformed_thinking_penalty": 0.25,
+}
+
+
+class TestSampleLocusPenalty:
+    def test_auto_splits_by_locus(self):
+        # One advantage-locus invalid violation + one reward-locus env violation.
+        message_log = [
+            {"role": "assistant", "invalid_action_violations": [
+                Violation(VIOLATION_UNEXECUTED_PATTERN, 1.0, LOCUS_ADVANTAGE),
+                Violation(VIOLATION_ENV_INVALID_ACTION, 1.0, LOCUS_REWARD),
+            ]},
+        ]
+        # reward locus picks only the env violation (base 0.5 * sev 1)
+        assert sample_locus_penalty(message_log, _PEN_CFG, LOCUS_REWARD) == 0.5
+        # advantage locus picks the unexecuted-pattern violation (base 0.5 * sev 1)
+        assert sample_locus_penalty(message_log, _PEN_CFG, LOCUS_ADVANTAGE) == 0.5
+
+    def test_severity_and_step_scale(self):
+        cfg = cast(
+            InvalidActionPenaltyConfig,
+            dict(_PEN_CFG, penalty_step_scale={"schedule": "constant", "start": 0.5}),
+        )
+        message_log = [
+            {"role": "assistant", "invalid_action_violations": [
+                Violation(VIOLATION_UNEXECUTED_PATTERN, 2.0, LOCUS_ADVANTAGE),
+            ]},
+        ]
+        # 0.5 base * 2.0 severity * 0.5 step-scale = 0.5
+        assert sample_locus_penalty(message_log, cfg, LOCUS_ADVANTAGE, step=3) == 0.5
+
+
+class TestAdvantageSpanPenalty:
+    def test_overwrites_flagged_assistant_span_only(self):
+        # sample 0: user(2 tok) + assistant(3 tok, advantage violation)
+        message_logs = [
+            [
+                {"role": "user", "token_ids": torch.zeros(2, dtype=torch.long)},
+                {
+                    "role": "assistant",
+                    "token_ids": torch.zeros(3, dtype=torch.long),
+                    "invalid_action_violations": [
+                        Violation(VIOLATION_UNEXECUTED_PATTERN, 1.0, LOCUS_ADVANTAGE)
+                    ],
+                },
+            ]
+        ]
+        advantages = torch.ones(1, 5)
+        out, metrics = apply_message_span_advantage_penalties(
+            advantages, message_logs, _PEN_CFG
+        )
+        # user span untouched; assistant span overwritten to -(0.5*1) = -0.5
+        assert torch.allclose(out[0, :2], torch.ones(2))
+        assert torch.allclose(out[0, 2:], torch.full((3,), -0.5))
+        assert metrics["advantage_penalty_spans"] == 1.0
+
+    def test_reward_locus_violation_not_applied_to_advantage(self):
+        message_logs = [
+            [
+                {
+                    "role": "assistant",
+                    "token_ids": torch.zeros(3, dtype=torch.long),
+                    "invalid_action_violations": [
+                        Violation(VIOLATION_ENV_INVALID_ACTION, 1.0, LOCUS_REWARD)
+                    ],
+                }
+            ]
+        ]
+        advantages = torch.ones(1, 3)
+        out, metrics = apply_message_span_advantage_penalties(
+            advantages, message_logs, _PEN_CFG  # default "auto"
+        )
+        assert torch.allclose(out, torch.ones(1, 3))  # reward-locus -> untouched here
+        assert metrics == {}
+
+    def test_disabled_is_noop(self):
+        advantages = torch.ones(1, 3)
+        out, metrics = apply_message_span_advantage_penalties(advantages, [[]], None)
+        assert torch.allclose(out, torch.ones(1, 3)) and metrics == {}
+
+
+class TestGradedRewardPath:
+    def test_message_log_routes_reward_locus_only(self):
+        # assistant turn with one reward-locus + one advantage-locus violation;
+        # only the reward-locus one is subtracted from total_reward here.
+        batch = BatchedDataDict({
+            "total_reward": torch.tensor([1.0]),
+            "message_log": [
+                [
+                    {"role": "assistant", "invalid_action_violations": [
+                        Violation(VIOLATION_ENV_INVALID_ACTION, 1.0, LOCUS_REWARD),
+                        Violation(VIOLATION_UNEXECUTED_PATTERN, 1.0, LOCUS_ADVANTAGE),
+                    ]},
+                ]
+            ],
+        })
+        out = apply_invalid_action_penalty(batch, _PEN_CFG)
+        # only env reward-locus penalty (0.5) subtracted; advantage one deferred
+        assert torch.allclose(out["total_reward"], torch.tensor([0.5]))
