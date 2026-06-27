@@ -39,6 +39,31 @@ distillation:
   mixed_kl_weight: 0.0
   zero_outside_topk: false
 
+  # ----------------------------------------------------------------------
+  # Colocated distillation (optional; default false = separate clusters).
+  # When true, the student and frozen teacher share ONE GPU mesh instead of
+  # the two clusters configured below — roughly halving the GPU allocation
+  # for comparable model sizes. The teacher is resident only while scoring,
+  # the student optimizer only while training (anti-phase residency), and a
+  # preflight estimator selects the fastest schedule that fits or refuses at
+  # startup. In colocated mode `teacher_policy.resources` is ignored (the
+  # teacher shares the `cluster` mesh).
+  # ----------------------------------------------------------------------
+  colocated: false
+  # "auto" (fastest that fits), "fast" (both resident, zero per-step transfer),
+  # or "tight" (anti-phase eviction).
+  colocation_schedule: "auto"
+  # Fraction of device capacity withheld from the preflight budget.
+  colocation_safety_margin: 0.05
+  # Per-GPU fixed overhead (GiB) for CUDA context / fragmentation / buffers.
+  colocation_overhead_gb: 2.0
+  # Per-GPU activation reserve (GiB); the teacher (no backward) is charged half.
+  # Calibrate from observed memory on the first real run.
+  colocation_activation_reserve_gb: 8.0
+  # Teacher top-k scoring micro-batch (null → student train_micro_batch_size).
+  # The teacher has no optimizer/grad memory, so a larger value raises occupancy.
+  teacher_inference_micro_batch_size: null
+
 policy:
   model_name: "Qwen/Qwen2.5-1.5B-Instruct"     # student
   tokenizer:

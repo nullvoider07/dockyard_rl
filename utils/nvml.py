@@ -115,3 +115,31 @@ def get_free_memory_bytes(device_idx: int) -> int:
                 f"Failed to get free memory for device {device_idx} "
                 f"(physical index {physical_idx}): {exc}"
             ) from exc
+
+def get_total_memory_bytes(device_idx: int) -> int:
+    """Return the total GPU memory capacity in bytes for a CUDA device.
+
+    Unlike :func:`get_free_memory_bytes`, this reports device capacity and is
+    independent of what is currently allocated — the correct basis for a
+    preflight memory budget (transient buffers and the CUDA context are
+    accounted for separately via a fixed overhead).
+
+    Args:
+        device_idx: Logical CUDA device index.
+
+    Returns:
+        Total memory in bytes.
+
+    Raises:
+        RuntimeError: On NVML error.
+    """
+    physical_idx = device_id_to_physical_device_id(device_idx)
+    with nvml_context():
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(physical_idx)
+            return int(pynvml.nvmlDeviceGetMemoryInfo(handle).total)
+        except pynvml.NVMLError as exc:
+            raise RuntimeError(
+                f"Failed to get total memory for device {device_idx} "
+                f"(physical index {physical_idx}): {exc}"
+            ) from exc
