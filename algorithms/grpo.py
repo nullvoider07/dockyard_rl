@@ -3005,7 +3005,10 @@ def async_grpo_train(
 
             logger.log_metrics(performance_metrics, step + 1, prefix="performance")
             logger.log_metrics(metrics, step + 1, prefix="train")
-            logger.log_metrics(timing_metrics, step + 1, prefix="timing/train")
+            # step_finished=True: this is the final log of the current async step.
+            logger.log_metrics(
+                timing_metrics, step + 1, prefix="timing/train", step_finished=True
+            )
 
             timer.reset()
             step += 1
@@ -3034,4 +3037,34 @@ def async_grpo_train(
             ray.kill(replay_buffer)  # type: ignore[arg-type]
         except Exception as e:
             print(f"Error stopping replay buffer: {e}")
+
+        # Shut environments down before generation/policy: an environment may hold
+        # in-flight HTTP requests to the vLLM endpoints, and killing generation
+        # first would leave it retrying dead connections.
+        for env_dict in (task_to_env, val_task_to_env):
+            if not env_dict:
+                continue
+            for task_name, env in env_dict.items():
+                print(f"🛑 Shutting down environment {task_name}...")
+                try:
+                    ray.get(env.shutdown.remote(), timeout=10)
+                except Exception:
+                    try:
+                        ray.kill(env)
+                    except Exception as e:
+                        print(f"Error shutting down environment {task_name}: {e}")
+
+        print("🛑 Shutting down generation workers...")
+        try:
+            policy_generation.shutdown()
+        except Exception as e:
+            print(f"Error shutting down generation workers: {e}")
+
+        if policy is not policy_generation:
+            print("🛑 Shutting down policy workers...")
+            try:
+                policy.shutdown()
+            except Exception as e:
+                print(f"Error shutting down policy workers: {e}")
+
         print("Async GRPO training complete!")
