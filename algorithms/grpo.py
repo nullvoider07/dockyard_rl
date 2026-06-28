@@ -638,7 +638,7 @@ def setup(
         colocated=colocated_inference,
         train_cluster=train_cluster,
         inference_world_size=inference_nodes * inference_gpus_per_node,
-        refit_buffer_size_gb=None,
+        refit_buffer_size_gb=generation_config.get("refit_buffer_size_gb"),
     )
     weight_synchronizer.init_communicator()
     if not colocated_inference:

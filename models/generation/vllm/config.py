@@ -57,3 +57,24 @@ class VllmConfig(GenerationConfig):
 
     # Optional post-training quantization config (ModelOpt integration).
     quant_cfg:   NotRequired[str | None]
+
+    # Real-quant switch (ModelOpt NVFP4 W4A16). Only meaningful when quant_cfg
+    # is set. When False (default), quant_cfg selects the fakequant path
+    # (TensorQuantizer simulation in FakeQuantWorker — numerics-accurate, full
+    # precision kernel). When True, the inference engine loads vLLM's real
+    # ModelOpt NVFP4 kernel (ModelOptNvFp4W4A16LinearMethod, FP4 Marlin GEMM);
+    # the trainer holds an mtq-quantized model and streams NVFP4 tensors that
+    # the inference patch canonicalizes + converts to the kernel layout on each
+    # refit (see modelopt/models/generation/vllm_modelopt_patch.py). Also
+    # forwarded to workers via the VLLM_MODELOPT_REAL_QUANT env var.
+    real_quant:  NotRequired[bool]
+
+    # Layers kept in native dtype under real_quant (NVFP4). When omitted, the
+    # DEFAULT_NVFP4_IGNORE list (lm_head, router/gate, attention) is used. These
+    # feed the vLLM deployment quantization_config 'ignore' list.
+    real_quant_ignore: NotRequired[list[str] | None]
+
+    # Fixed IPC staging-buffer size (GB) for colocated refit. None (default)
+    # derives the buffer from free memory; set a fixed value when refit chunk
+    # sizes vary (e.g. packed NVFP4 real-quant weights). Must be > 0 when set.
+    refit_buffer_size_gb: NotRequired[int | None]
