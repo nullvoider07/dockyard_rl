@@ -178,3 +178,72 @@ def test_opd_advantage_metrics_populated():
     assert m["on_policy_distillation/teacher_student_logprob_gap_mean"] == pytest.approx(1.5)
     assert "on_policy_distillation/adv_mean" in m
     assert "on_policy_distillation/adv_std" in m
+
+
+# -- collector teacher scoring (routing + DP padding + stitching) -------------
+
+def _make_collector_with_teacher(teacher_logprob_fn, dp_size=1):
+    """Bypass-construct an AsyncTrajectoryCollectorImpl with one fake teacher."""
+    import threading
+    from collections import defaultdict
+    from unittest.mock import MagicMock
+
+    from dockyard_rl.algorithms.async_utils import trajectory_collector as tc
+
+    col = tc.AsyncTrajectoryCollectorImpl.__new__(tc.AsyncTrajectoryCollectorImpl)
+    teacher = MagicMock()
+    teacher.sharding_annotations.get_axis_size.return_value = dp_size
+
+    def _get_logprobs(sub_data):
+        from dockyard_rl.distributed.batched_data_dict import BatchedDataDict
+        return BatchedDataDict(
+            {"reference_logprobs": teacher_logprob_fn(sub_data["input_ids"])}
+        )
+
+    teacher.get_logprobs.side_effect = _get_logprobs
+    col._teacher_worker_groups = {"t1": teacher}
+    col._alias_to_group_alias = {"t1": "t1"}
+    col._on_policy_distillation_cfg = {
+        "teacher_model_by_agent_name": {"t1": "m1"},
+        "default_teacher_alias": "t1",
+    }
+    col._teacher_locks = defaultdict(threading.Lock)
+    return col, teacher
+
+
+def test_collector_teacher_logprobs_routes_and_stitches():
+    col, _ = _make_collector_with_teacher(
+        lambda ids: torch.arange(ids.numel(), dtype=torch.float32).reshape(ids.shape)
+    )
+    input_ids = torch.zeros(3, 4, dtype=torch.long)
+    agent_refs = [{"name": "t1"}, {"name": "t1"}, {"name": "t1"}]
+    result, _t = col._compute_teacher_logprobs(input_ids, agent_refs)
+    assert result.shape == (3, 4)
+    assert torch.allclose(result, torch.arange(12, dtype=torch.float32).reshape(3, 4))
+
+
+def test_collector_teacher_logprobs_dp_padding_trimmed():
+    # dp_size=2 with 3 samples -> padded to 4 for the forward, trimmed back to 3.
+    seen_batch = {}
+
+    def _fn(ids):
+        seen_batch["B"] = ids.shape[0]
+        return torch.ones(ids.shape, dtype=torch.float32)
+
+    col, _ = _make_collector_with_teacher(_fn, dp_size=2)
+    input_ids = torch.zeros(3, 5, dtype=torch.long)
+    agent_refs = [{"name": "t1"}] * 3
+    result, _t = col._compute_teacher_logprobs(input_ids, agent_refs)
+    assert seen_batch["B"] == 4  # padded up to a multiple of dp_size
+    assert result.shape == (3, 5)  # trimmed back
+
+
+def test_collector_teacher_logprobs_default_routing_for_unknown_agent():
+    col, _ = _make_collector_with_teacher(
+        lambda ids: torch.full(ids.shape, 7.0, dtype=torch.float32)
+    )
+    # Unknown agent name -> falls back to default_teacher_alias 't1'.
+    result, _t = col._compute_teacher_logprobs(
+        torch.zeros(2, 3, dtype=torch.long), [{"name": "ghost"}, {"name": "ghost"}]
+    )
+    assert torch.allclose(result, torch.full((2, 3), 7.0))

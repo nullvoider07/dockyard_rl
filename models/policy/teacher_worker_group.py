@@ -163,9 +163,11 @@ class TeacherWorkerGroup:
         self.cfg = cfg
         self._micro_batch_size = teacher_cfg.micro_batch_size
 
-        # Expose the worker group for health checks / teardown (mirrors the
-        # training policy interface used by the OPD setup helper).
+        # Expose the worker group + sharding for health checks, teardown, and
+        # the collector's DP-padding (mirrors the training policy interface used
+        # by the OPD setup + scoring helpers).
         self.worker_group = self.policy.worker_group
+        self.sharding_annotations = self.policy.sharding_annotations
         self.use_sequence_packing = self.policy.use_sequence_packing
         # SP-forward divisor; the collector reads it to pre-pad non-packed inputs.
         self.sequence_length_pad_multiple = cp * 2 * tp if cp > 1 else tp
@@ -177,12 +179,13 @@ class TeacherWorkerGroup:
     ) -> BatchedDataDict[Any]:
         """Run a teacher forward pass and return per-token logprobs.
 
-        The returned BatchedDataDict carries a ``logprobs`` key of shape
-        ``[B, S]`` (dockyard's get_logprobs convention; micro-batching is driven
-        by the teacher's config). ``micro_batch_size`` is accepted for interface
+        The returned BatchedDataDict carries a ``reference_logprobs`` key of shape
+        ``[B, S]`` (the teacher is a frozen reference; micro-batching is driven by
+        the teacher's config). ``micro_batch_size`` is accepted for interface
         parity with the training policy.
         """
-        return self.policy.get_logprobs(data)
+        result = self.policy.get_logprobs(data)
+        return BatchedDataDict({"reference_logprobs": result["logprobs"]})
 
     def shutdown(self) -> bool:
         """Shut down the teacher policy workers."""
