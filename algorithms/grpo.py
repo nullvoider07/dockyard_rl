@@ -24,6 +24,7 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from dockyard_rl.algorithms.advantage_estimator import (
     GDPOAdvantageEstimator,
     GRPOAdvantageEstimator,
+    OPDAdvantageEstimator,
     ReinforcePlusPlusAdvantageEstimator,
 )
 from dockyard_rl.algorithms.async_utils import AsyncTrajectoryCollector, ReplayBuffer
@@ -908,6 +909,9 @@ def _create_advantage_estimator(master_config: MasterConfig):
     elif name == "reinforce_plus_plus":
         adv = ReinforcePlusPlusAdvantageEstimator(_adv_cfg, loss_config)
         print("  ✓ Using Reinforce++ advantage estimator")
+    elif name == "opd":
+        adv = OPDAdvantageEstimator(_adv_cfg, loss_config)
+        print("  ✓ Using OPD advantage estimator (on-policy distillation)")
     else:
         raise ValueError(f"Invalid adv_estimator name: {name!r}")
     return adv
