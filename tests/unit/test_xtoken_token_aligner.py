@@ -5,6 +5,8 @@ are built and tested first: token canonicalization, multi-token mojibake merges,
 byte-value lookup, and byte-fallback re-merging into Unicode characters.
 """
 
+import torch
+
 from dockyard_rl.algorithms.x_token import token_aligner as ta
 
 
@@ -236,3 +238,86 @@ def test_align_dp_score_and_traceback_identical():
     assert score == 6.0  # 2 exact matches * 3.0
     assert all(len(p.s_tokens) == 1 and len(p.t_tokens) == 1 for p in pairs)
     assert [p.s_start for p in pairs] == [0, 1]
+
+
+# -- M1.c: batch assembly + align() entry -------------------------------------
+
+def test_pairs_to_batch_dense_tensors():
+    pairs = [
+        ta.AlignmentPair(["a"], ["a"], 0, 1, 0, 1, is_correct=True),
+        ta.AlignmentPair(["b", "c"], ["bc"], 1, 3, 1, 2, is_correct=False),
+    ]
+    batch = ta.TokenAligner._pairs_to_batch([pairs], b=1, t_s=3, t_t=2)
+    assert batch.student_chunk_id.tolist() == [[0, 1, 1]]
+    assert batch.teacher_chunk_id.tolist() == [[0, 1]]
+    assert batch.pair_valid.tolist() == [[True, True]]
+    assert batch.pair_is_correct.tolist() == [[True, False]]
+    # Only the 1-1 exact pair contributes to the gold partition.
+    assert batch.student_exact_partition_mask.tolist() == [[True, False, False]]
+    assert batch.teacher_exact_partition_mask.tolist() == [[True, False]]
+    assert batch.num_chunks.tolist() == [2]
+
+
+def test_pairs_to_batch_insertion_leaves_chunk_id_unset():
+    # A teacher-only insertion (s_start == -1) writes no student chunk id.
+    pairs = [ta.AlignmentPair([], ["x"], -1, -1, 0, 1, is_correct=False)]
+    batch = ta.TokenAligner._pairs_to_batch([pairs], b=1, t_s=2, t_t=1)
+    assert batch.student_chunk_id.tolist() == [[-1, -1]]
+    assert batch.teacher_chunk_id.tolist() == [[0]]
+
+
+def test_drop_padding_gates_chunk_ids_and_partition():
+    pairs = [
+        ta.AlignmentPair(["a"], ["a"], 0, 1, 0, 1, is_correct=True),
+        ta.AlignmentPair(["b"], ["b"], 1, 2, 1, 2, is_correct=True),
+        ta.AlignmentPair(["c"], ["c"], 2, 3, 2, 3, is_correct=True),
+    ]
+    batch = ta.TokenAligner._pairs_to_batch([pairs], b=1, t_s=3, t_t=3)
+    # Mark the last student/teacher position as padding.
+    s_mask = torch.tensor([[1, 1, 0]])
+    t_mask = torch.tensor([[1, 1, 0]])
+    ta.TokenAligner._drop_padding(
+        batch, student_attention_mask=s_mask, teacher_attention_mask=t_mask
+    )
+    assert batch.student_chunk_id.tolist() == [[0, 1, -1]]
+    assert batch.teacher_chunk_id.tolist() == [[0, 1, -1]]
+    assert batch.student_exact_partition_mask.tolist() == [[True, True, False]]
+
+
+class _FakeTok:
+    """Minimal tokenizer: maps token ids to token strings for align()."""
+
+    def __init__(self, id_to_token: dict[int, str]):
+        self._m = id_to_token
+
+    def convert_ids_to_tokens(self, ids):
+        return [self._m[i] for i in ids]
+
+
+def test_align_end_to_end_identical_tokenizers():
+    vocab = {0: "a", 1: "b", 2: "c"}
+    al = ta.TokenAligner(_FakeTok(vocab), _FakeTok(vocab), projection_matrix_path="")
+    student_ids = torch.tensor([[0, 1, 2]])
+    teacher_ids = torch.tensor([[0, 1, 2]])
+    batch = al.align(student_ids, teacher_ids)
+    assert batch.student_chunk_id.tolist() == [[0, 1, 2]]
+    assert batch.teacher_chunk_id.tolist() == [[0, 1, 2]]
+    assert batch.pair_is_correct.tolist() == [[True, True, True]]
+    assert batch.student_exact_partition_mask.tolist() == [[True, True, True]]
+    assert batch.num_chunks.tolist() == [3]
+
+
+def test_align_end_to_end_respects_attention_mask():
+    vocab = {0: "a", 1: "b", 2: "c"}
+    al = ta.TokenAligner(_FakeTok(vocab), _FakeTok(vocab), projection_matrix_path="")
+    student_ids = torch.tensor([[0, 1, 2]])
+    teacher_ids = torch.tensor([[0, 1, 2]])
+    batch = al.align(
+        student_ids,
+        teacher_ids,
+        student_attention_mask=torch.tensor([[1, 1, 0]]),
+        teacher_attention_mask=torch.tensor([[1, 1, 0]]),
+    )
+    # Padded last position is gated out of chunks + partition.
+    assert batch.student_chunk_id.tolist() == [[0, 1, -1]]
+    assert batch.student_exact_partition_mask.tolist() == [[True, True, False]]

@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from typing import Any, List, Tuple
 
 import numpy as np
+import torch
 
 # Visual byte representations used by some BPE tokenizers (especially for
 # emojis / non-ASCII bytes), mapping the visual character back to its byte value.
@@ -187,6 +188,36 @@ class AlignmentPair:
     is_correct: bool = False
 
 
+@dataclass
+class AlignmentBatch:
+    """Per-batch alignment payload covering the cross-tokenizer loss modes.
+
+    The collator hands this directly to the loss fn alongside the tokenized
+    batch. Tensors are dense-padded to the batch maximum so the DTensor policy
+    can shard on dim 0 without knowing cross-tokenizer specifics.
+
+    Attributes:
+        pair_valid: ``[B, max_pairs]`` bool. False on padding entries.
+        pair_is_correct: ``[B, max_pairs]`` bool. True when the canonicalized
+            student span text matches the canonicalized teacher span text.
+        student_exact_partition_mask: ``[B, T_s]`` bool. True at student tokens
+            on a 1-1 exact-match pair (gold_loss partition).
+        teacher_exact_partition_mask: ``[B, T_t]`` bool. Counterpart.
+        student_chunk_id: ``[B, T_s]`` long. Chunk index (= pair index) the
+            student token belongs to; ``-1`` if not in any chunk.
+        teacher_chunk_id: ``[B, T_t]`` long. Counterpart.
+        num_chunks: ``[B]`` long. Number of valid chunks per sample.
+    """
+
+    pair_valid: torch.Tensor
+    pair_is_correct: torch.Tensor
+    student_exact_partition_mask: torch.Tensor
+    teacher_exact_partition_mask: torch.Tensor
+    student_chunk_id: torch.Tensor
+    teacher_chunk_id: torch.Tensor
+    num_chunks: torch.Tensor
+
+
 class TokenAligner:
     """Aligns student and teacher tokenizations of the same source text.
 
@@ -218,6 +249,144 @@ class TokenAligner:
         self.teacher_tokenizer = teacher_tokenizer
         self.max_combination_len = max_comb_len
         self.projection_matrix_path = projection_matrix_path
+
+    # ------------------------------------------------------------------ #
+    # Public batch entry
+    # ------------------------------------------------------------------ #
+    def align(
+        self,
+        student_ids: torch.Tensor,
+        teacher_ids: torch.Tensor,
+        *,
+        student_attention_mask: torch.Tensor | None = None,
+        teacher_attention_mask: torch.Tensor | None = None,
+    ) -> AlignmentBatch:
+        """Align a batch of student/teacher token id tensors.
+
+        Args:
+            student_ids: ``[B, T_s]`` long tensor.
+            teacher_ids: ``[B, T_t]`` long tensor.
+            student_attention_mask: optional ``[B, T_s]`` mask (1 = real token,
+                0 = padding). When given, padded positions are forced to the
+                ``chunk_id = -1`` / partition-``False`` sentinels so tokenizer
+                padding never forms a valid chunk. ``align`` runs the DP over the
+                fully padded ids, so without this the pad run on each side can be
+                aligned into chunks that survive valid-chunk masking.
+            teacher_attention_mask: optional ``[B, T_t]`` counterpart.
+
+        Returns:
+            An :class:`AlignmentBatch` with all fields populated.
+        """
+        assert student_ids.dim() == 2 and teacher_ids.dim() == 2
+        assert student_ids.shape[0] == teacher_ids.shape[0], (
+            f"student/teacher batch size mismatch: "
+            f"{student_ids.shape[0]} vs {teacher_ids.shape[0]}"
+        )
+        b, t_s = student_ids.shape
+        _, t_t = teacher_ids.shape
+
+        student_token_lists: List[List[str]] = [
+            self.student_tokenizer.convert_ids_to_tokens(student_ids[i].tolist())
+            for i in range(b)
+        ]
+        teacher_token_lists: List[List[str]] = [
+            self.teacher_tokenizer.convert_ids_to_tokens(teacher_ids[i].tolist())
+            for i in range(b)
+        ]
+
+        per_sample_pairs: List[List[AlignmentPair]] = []
+        for s_toks, t_toks in zip(student_token_lists, teacher_token_lists):
+            pairs = self._align_single(s_toks, t_toks)
+            per_sample_pairs.append(pairs)
+
+        batch = self._pairs_to_batch(per_sample_pairs, b=b, t_s=t_s, t_t=t_t)
+        self._drop_padding(
+            batch,
+            student_attention_mask=student_attention_mask,
+            teacher_attention_mask=teacher_attention_mask,
+        )
+        return batch
+
+    @staticmethod
+    def _drop_padding(
+        batch: AlignmentBatch,
+        *,
+        student_attention_mask: torch.Tensor | None,
+        teacher_attention_mask: torch.Tensor | None,
+    ) -> None:
+        """Strip tokenizer padding out of the chunk-id / partition tensors.
+
+        Mutates ``batch`` in place. For every position the attention mask marks
+        as padding, reset ``*_chunk_id`` to ``-1`` and ``*_exact_partition_mask``
+        to ``False``. Gating per position (rather than trimming a contiguous
+        span) stays correct under either left- or right-padding. A pair whose
+        tokens are entirely padding on one side then has size 0 there and is
+        dropped by the loss's valid-chunk masking; a pair straddling the
+        real/pad boundary shrinks to its real tokens.
+        """
+        if student_attention_mask is not None:
+            s_pad = student_attention_mask == 0
+            batch.student_chunk_id[s_pad] = -1
+            batch.student_exact_partition_mask[s_pad] = False
+        if teacher_attention_mask is not None:
+            t_pad = teacher_attention_mask == 0
+            batch.teacher_chunk_id[t_pad] = -1
+            batch.teacher_exact_partition_mask[t_pad] = False
+
+    @staticmethod
+    def _pairs_to_batch(
+        per_sample_pairs: List[List[AlignmentPair]],
+        *,
+        b: int,
+        t_s: int,
+        t_t: int,
+    ) -> AlignmentBatch:
+        """Pack per-sample alignment lists into dense-padded tensors."""
+        max_pairs = max((len(p) for p in per_sample_pairs), default=0)
+        # Guarantee at least one slot so downstream tensor shapes stay sane.
+        max_pairs = max(max_pairs, 1)
+
+        pair_valid = torch.zeros((b, max_pairs), dtype=torch.bool)
+        pair_is_correct = torch.zeros((b, max_pairs), dtype=torch.bool)
+        student_partition = torch.zeros((b, t_s), dtype=torch.bool)
+        teacher_partition = torch.zeros((b, t_t), dtype=torch.bool)
+        student_chunk_id = torch.full((b, t_s), -1, dtype=torch.long)
+        teacher_chunk_id = torch.full((b, t_t), -1, dtype=torch.long)
+        num_chunks = torch.zeros((b,), dtype=torch.long)
+
+        for batch_i, pairs in enumerate(per_sample_pairs):
+            num_chunks[batch_i] = len(pairs)
+            for pair_i, pair in enumerate(pairs):
+                if pair.s_start != -1 and pair.s_end != -1:
+                    if 0 <= pair.s_start < t_s and 0 < pair.s_end <= t_s:
+                        student_chunk_id[batch_i, pair.s_start : pair.s_end] = pair_i
+                if pair.t_start != -1 and pair.t_end != -1:
+                    if 0 <= pair.t_start < t_t and 0 < pair.t_end <= t_t:
+                        teacher_chunk_id[batch_i, pair.t_start : pair.t_end] = pair_i
+                pair_valid[batch_i, pair_i] = True
+                pair_is_correct[batch_i, pair_i] = bool(pair.is_correct)
+                # gold_loss partition: tokens on a 1-1 exact-match pair.
+                if (
+                    pair.is_correct
+                    and pair.s_start != -1
+                    and pair.t_start != -1
+                    and (pair.s_end - pair.s_start) == 1
+                    and (pair.t_end - pair.t_start) == 1
+                ):
+                    if 0 <= pair.s_start < t_s:
+                        student_partition[batch_i, pair.s_start] = True
+                    if 0 <= pair.t_start < t_t:
+                        teacher_partition[batch_i, pair.t_start] = True
+
+        return AlignmentBatch(
+            pair_valid=pair_valid,
+            pair_is_correct=pair_is_correct,
+            student_exact_partition_mask=student_partition,
+            teacher_exact_partition_mask=teacher_partition,
+            student_chunk_id=student_chunk_id,
+            teacher_chunk_id=teacher_chunk_id,
+            num_chunks=num_chunks,
+        )
 
     # ------------------------------------------------------------------ #
     # Per-sample alignment pipeline
