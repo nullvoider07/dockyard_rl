@@ -15,7 +15,10 @@ are content-coupled to the BPE/SentencePiece tokenizers being aligned across.
 
 from __future__ import annotations
 
-from typing import List, Tuple
+from dataclasses import dataclass
+from typing import Any, List, Tuple
+
+import numpy as np
 
 # Visual byte representations used by some BPE tokenizers (especially for
 # emojis / non-ASCII bytes), mapping the visual character back to its byte value.
@@ -148,6 +151,737 @@ _SPECIAL_TOKEN_MAP = {
     "<bos>": "<bos>",
     "<pad>": "",
 }
+
+
+@dataclass
+class AlignmentPair:
+    """One aligned span between student and teacher token sequences.
+
+    The DP / anchor / post-process helpers construct these as they trace the
+    alignment; ``_align_single`` then fills in ``is_correct`` from the
+    canonicalized-text comparison. Insertions/deletions use ``-1`` for the empty
+    side's start/end indices.
+
+    Attributes:
+        s_tokens: Student tokens covered by this pair.
+        t_tokens: Teacher tokens covered by this pair.
+        s_start: Inclusive start into the student token sequence (``-1`` for
+            teacher-only insertions).
+        s_end: Exclusive end into the student token sequence (``-1`` for
+            teacher-only insertions).
+        t_start: Inclusive start into the teacher token sequence (``-1`` for
+            student-only insertions).
+        t_end: Exclusive end into the teacher token sequence (``-1`` for
+            student-only insertions).
+        is_correct: ``True`` when the canonicalized student span text matches the
+            canonicalized teacher span text. Defaults ``False`` so DP / anchor
+            stages can build pairs before the mask is computed.
+    """
+
+    s_tokens: List[str]
+    t_tokens: List[str]
+    s_start: int
+    s_end: int
+    t_start: int
+    t_end: int
+    is_correct: bool = False
+
+
+class TokenAligner:
+    """Aligns student and teacher tokenizations of the same source text.
+
+    The algorithm is a Needleman-Wunsch DP over canonicalized token strings,
+    augmented with multi-token combination scoring (one token on one side may
+    match a span of up to ``max_comb_len`` tokens on the other) and anchor-based
+    segmentation for long sequences. The DP core lives here; the public batch
+    entry ``align`` (and the dense ``AlignmentBatch`` it produces) is added
+    alongside.
+
+    Args:
+        student_tokenizer: HF tokenizer for the student model.
+        teacher_tokenizer: HF tokenizer for the teacher model.
+        projection_matrix_path: Path retained for downstream callers (the loss
+            fn) that materialize the sparse student->teacher vocab projection on
+            their training device.
+        max_comb_len: Maximum span length considered when matching one token on
+            one side against multiple tokens on the other.
+    """
+
+    def __init__(
+        self,
+        student_tokenizer,
+        teacher_tokenizer,
+        projection_matrix_path: str,
+        max_comb_len: int = 4,
+    ):
+        self.student_tokenizer = student_tokenizer
+        self.teacher_tokenizer = teacher_tokenizer
+        self.max_combination_len = max_comb_len
+        self.projection_matrix_path = projection_matrix_path
+
+    # ------------------------------------------------------------------ #
+    # Per-sample alignment pipeline
+    # ------------------------------------------------------------------ #
+    def _align_single(
+        self,
+        student_tokens: List[str],
+        teacher_tokens: List[str],
+        exact_match_score: float = 3.0,
+        combination_score_multiplier: float = 1.5,
+        gap_penalty: float = -1.5,
+        anchor_lengths: Tuple[int, ...] = (3,),
+    ) -> List[AlignmentPair]:
+        """Run canonicalize -> anchor-DP -> post-process for one sample.
+
+        Returns a list of :class:`AlignmentPair`. Insertions/deletions use ``-1``
+        for the empty side's start/end. Pair start/end indices address the
+        **original** token sequences (not canonical space), so they can be
+        written straight into the chunk-id tensors.
+        """
+        student_canon, student_canon_to_orig = _canonicalize_sequence(student_tokens)
+        teacher_canon, teacher_canon_to_orig = _canonicalize_sequence(teacher_tokens)
+
+        aligned, _ = self._align_with_anchors(
+            student_canon,
+            teacher_canon,
+            anchor_lengths=anchor_lengths,
+            exact_match_score=exact_match_score,
+            combination_score_multiplier=combination_score_multiplier,
+            gap_penalty=gap_penalty,
+            max_combination_len=self.max_combination_len,
+            ignore_leading_char_diff=False,
+        )
+        aligned = self._post_process_alignment(
+            aligned,
+            exact_match_score=exact_match_score,
+            combination_score_multiplier=combination_score_multiplier,
+            gap_penalty=gap_penalty,
+            max_combination_len=self.max_combination_len,
+        )
+        # Remap canonical-space span indices back onto the original token axis
+        # BEFORE the is_correct mask write — the mask reads pair.s_tokens
+        # (canonical strings) and is order-independent, but everything downstream
+        # (the chunk_id writes) needs original-space indices.
+        self._remap_pairs_to_original(
+            aligned,
+            student_canon_to_orig=student_canon_to_orig,
+            teacher_canon_to_orig=teacher_canon_to_orig,
+        )
+        for pair, m in zip(aligned, self._alignment_mask(aligned)):
+            pair.is_correct = m
+        return aligned
+
+    @staticmethod
+    def _remap_pairs_to_original(
+        pairs: List[AlignmentPair],
+        *,
+        student_canon_to_orig: List[Tuple[int, int]],
+        teacher_canon_to_orig: List[Tuple[int, int]],
+    ) -> None:
+        """Remap pair start/end indices from canonical to original space.
+
+        Mutates ``pairs`` in place. Insertion/deletion pairs (empty side already
+        ``-1``) keep the sentinel. ``s_end - 1`` / ``t_end - 1`` indexes the last
+        canonical token in the span; its ``orig_end`` is the new exclusive end.
+        """
+        for pair in pairs:
+            if pair.s_start != -1:
+                s0 = student_canon_to_orig[pair.s_start][0]
+                s1 = student_canon_to_orig[pair.s_end - 1][1]
+                pair.s_start, pair.s_end = s0, s1
+            if pair.t_start != -1:
+                t0 = teacher_canon_to_orig[pair.t_start][0]
+                t1 = teacher_canon_to_orig[pair.t_end - 1][1]
+                pair.t_start, pair.t_end = t0, t1
+
+    # ------------------------------------------------------------------ #
+    # Anchor-based segmentation
+    # ------------------------------------------------------------------ #
+    def _align_with_anchors(
+        self,
+        student_tokens: List[str],
+        teacher_tokens: List[str],
+        anchor_lengths: Tuple[int, ...] = (3,),
+        *,
+        exact_match_score: float,
+        combination_score_multiplier: float,
+        gap_penalty: float,
+        max_combination_len: int,
+        ignore_leading_char_diff: bool,
+    ) -> Tuple[List[AlignmentPair], float]:
+        """Optimize long alignments by pinning unique n-gram matches as anchors.
+
+        Falls back to plain DP when no anchors exist or ``anchor_lengths`` is
+        empty.
+        """
+        dp_kwargs: dict[str, Any] = dict(
+            exact_match_score=exact_match_score,
+            combination_score_multiplier=combination_score_multiplier,
+            gap_penalty=gap_penalty,
+            max_combination_len=max_combination_len,
+            ignore_leading_char_diff=ignore_leading_char_diff,
+        )
+        if not anchor_lengths:
+            return self._align_dp(student_tokens, teacher_tokens, **dp_kwargs)
+
+        # Find unique n-gram matches in both sequences.
+        all_potential_anchors: List[Tuple[int, int, int]] = []
+        for anchor_len in anchor_lengths:
+            if anchor_len == 1:
+                student_counts: dict[str, List[int]] = {}
+                teacher_counts: dict[str, List[int]] = {}
+                for i, t in enumerate(student_tokens):
+                    student_counts.setdefault(t, []).append(i)
+                for j, t in enumerate(teacher_tokens):
+                    teacher_counts.setdefault(t, []).append(j)
+                for token in student_counts.keys() & teacher_counts.keys():
+                    if (
+                        len(student_counts[token]) == 1
+                        and len(teacher_counts[token]) == 1
+                    ):
+                        all_potential_anchors.append(
+                            (student_counts[token][0], teacher_counts[token][0], 1)
+                        )
+            else:
+                student_ngrams: dict[Tuple[str, ...], List[int]] = {}
+                teacher_ngrams: dict[Tuple[str, ...], List[int]] = {}
+                for i in range(len(student_tokens) - anchor_len + 1):
+                    student_ngrams.setdefault(
+                        tuple(student_tokens[i : i + anchor_len]), []
+                    ).append(i)
+                for j in range(len(teacher_tokens) - anchor_len + 1):
+                    teacher_ngrams.setdefault(
+                        tuple(teacher_tokens[j : j + anchor_len]), []
+                    ).append(j)
+                for ngram in student_ngrams.keys() & teacher_ngrams.keys():
+                    if (
+                        len(student_ngrams[ngram]) == 1
+                        and len(teacher_ngrams[ngram]) == 1
+                    ):
+                        i = student_ngrams[ngram][0]
+                        j = teacher_ngrams[ngram][0]
+                        if (
+                            i + anchor_len <= len(student_tokens)
+                            and j + anchor_len <= len(teacher_tokens)
+                            and student_tokens[i : i + anchor_len]
+                            == teacher_tokens[j : j + anchor_len]
+                        ):
+                            all_potential_anchors.append((i, j, anchor_len))
+
+        # Greedy non-conflicting selection, preferring longer anchors.
+        all_potential_anchors.sort(key=lambda x: (-x[2], x[0], x[1]))
+        used_student: set[int] = set()
+        used_teacher: set[int] = set()
+        selected: List[Tuple[int, int, int]] = []
+        for i, j, k in all_potential_anchors:
+            r1 = set(range(i, i + k))
+            r2 = set(range(j, j + k))
+            if not (r1 & used_student) and not (r2 & used_teacher):
+                selected.append((i, j, k))
+                used_student.update(r1)
+                used_teacher.update(r2)
+        selected.sort()
+
+        # Validate monotonic ordering.
+        validated: List[Tuple[int, int, int]] = []
+        last_j = -1
+        for i, j, k in selected:
+            if j > last_j and student_tokens[i : i + k] == teacher_tokens[j : j + k]:
+                validated.append((i, j, k))
+                last_j = j + k - 1
+
+        if not validated:
+            return self._align_dp(student_tokens, teacher_tokens, **dp_kwargs)
+
+        full_alignment: List[AlignmentPair] = []
+        last_i, last_j = 0, 0
+        for i, j, k in validated:
+            student_seg, teacher_seg = (
+                student_tokens[last_i:i],
+                teacher_tokens[last_j:j],
+            )
+            if student_seg or teacher_seg:
+                aligned_segment, _ = self._align_dp(
+                    student_seg, teacher_seg, **dp_kwargs
+                )
+                full_alignment.extend(
+                    self._shift_pairs(aligned_segment, last_i, last_j)
+                )
+            # Anchor itself splits to 1-1 matches.
+            for kk in range(k):
+                full_alignment.append(
+                    AlignmentPair(
+                        s_tokens=[student_tokens[i + kk]],
+                        t_tokens=[teacher_tokens[j + kk]],
+                        s_start=i + kk,
+                        s_end=i + kk + 1,
+                        t_start=j + kk,
+                        t_end=j + kk + 1,
+                    )
+                )
+            last_i, last_j = i + k, j + k
+
+        student_seg, teacher_seg = student_tokens[last_i:], teacher_tokens[last_j:]
+        if student_seg or teacher_seg:
+            aligned_segment, _ = self._align_dp(student_seg, teacher_seg, **dp_kwargs)
+            full_alignment.extend(self._shift_pairs(aligned_segment, last_i, last_j))
+
+        return full_alignment, 0.0
+
+    # ------------------------------------------------------------------ #
+    # DP kernel + post-process (algorithm-internal helpers).
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _align_dp(
+        student_tokens: List[str],
+        teacher_tokens: List[str],
+        *,
+        exact_match_score: float,
+        combination_score_multiplier: float,
+        gap_penalty: float,
+        max_combination_len: int,
+        ignore_leading_char_diff: bool,
+    ) -> Tuple[List[AlignmentPair], float]:
+        """Needleman-Wunsch DP with up-to-``max_combination_len`` token spans."""
+        n1, n2 = len(student_tokens), len(teacher_tokens)
+        dp = np.zeros((n1 + 1, n2 + 1), dtype=np.float32)
+        trace = np.full((n1 + 1, n2 + 1), "", dtype=object)
+
+        for i in range(1, n1 + 1):
+            dp[i, 0] = dp[i - 1, 0] + gap_penalty
+            trace[i, 0] = "up"
+        for j in range(1, n2 + 1):
+            dp[0, j] = dp[0, j - 1] + gap_penalty
+            trace[0, j] = "left"
+
+        joined_student = {
+            (i - k, i): "".join(student_tokens[i - k : i])
+            for i in range(n1 + 1)
+            for k in range(1, min(i, max_combination_len) + 1)
+        }
+        joined_teacher = {
+            (j - k, j): "".join(teacher_tokens[j - k : j])
+            for j in range(n2 + 1)
+            for k in range(1, min(j, max_combination_len) + 1)
+        }
+
+        for i in range(1, n1 + 1):
+            for j in range(1, n2 + 1):
+                student_val, teacher_val = student_tokens[i - 1], teacher_tokens[j - 1]
+                match_score = (
+                    exact_match_score
+                    if _strings_equal_flexible(
+                        student_val, teacher_val, ignore_leading_char_diff
+                    )
+                    else -exact_match_score
+                )
+                score_diag = dp[i - 1, j - 1] + match_score
+                score_up = dp[i - 1, j] + gap_penalty
+                score_left = dp[i, j - 1] + gap_penalty
+
+                max_score = score_diag
+                best_move = "diag"
+                if score_up > max_score:
+                    max_score = score_up
+                    best_move = "up"
+                if score_left > max_score:
+                    max_score = score_left
+                    best_move = "left"
+
+                for k in range(2, min(j + 1, max_combination_len + 1)):
+                    key = (j - k, j)
+                    if key in joined_teacher and _strings_equal_flexible(
+                        student_val, joined_teacher[key], ignore_leading_char_diff
+                    ):
+                        cand = dp[i - 1, j - k] + combination_score_multiplier * k
+                        if cand > max_score:
+                            max_score = cand
+                            best_move = f"comb_s1_over_s2_{k}"
+
+                for k in range(2, min(i + 1, max_combination_len + 1)):
+                    key = (i - k, i)
+                    if key in joined_student and _strings_equal_flexible(
+                        teacher_val, joined_student[key], ignore_leading_char_diff
+                    ):
+                        cand = dp[i - k, j - 1] + combination_score_multiplier * k
+                        if cand > max_score:
+                            max_score = cand
+                            best_move = f"comb_s2_over_s1_{k}"
+
+                dp[i, j] = max_score
+                trace[i, j] = best_move
+
+        aligned: List[AlignmentPair] = []
+        i, j = n1, n2
+        while i > 0 or j > 0:
+            move = trace[i, j]
+            if move == "diag":
+                aligned.append(
+                    AlignmentPair(
+                        s_tokens=[student_tokens[i - 1]],
+                        t_tokens=[teacher_tokens[j - 1]],
+                        s_start=i - 1,
+                        s_end=i,
+                        t_start=j - 1,
+                        t_end=j,
+                    )
+                )
+                i -= 1
+                j -= 1
+            elif move == "up":
+                aligned.append(
+                    AlignmentPair(
+                        s_tokens=[student_tokens[i - 1]],
+                        t_tokens=[],
+                        s_start=i - 1,
+                        s_end=i,
+                        t_start=-1,
+                        t_end=-1,
+                    )
+                )
+                i -= 1
+            elif move == "left":
+                aligned.append(
+                    AlignmentPair(
+                        s_tokens=[],
+                        t_tokens=[teacher_tokens[j - 1]],
+                        s_start=-1,
+                        s_end=-1,
+                        t_start=j - 1,
+                        t_end=j,
+                    )
+                )
+                j -= 1
+            elif move.startswith("comb_s1_over_s2_"):
+                k = int(move.rsplit("_", 1)[-1])
+                aligned.append(
+                    AlignmentPair(
+                        s_tokens=[student_tokens[i - 1]],
+                        t_tokens=teacher_tokens[j - k : j],
+                        s_start=i - 1,
+                        s_end=i,
+                        t_start=j - k,
+                        t_end=j,
+                    )
+                )
+                i -= 1
+                j -= k
+            elif move.startswith("comb_s2_over_s1_"):
+                k = int(move.rsplit("_", 1)[-1])
+                aligned.append(
+                    AlignmentPair(
+                        s_tokens=student_tokens[i - k : i],
+                        t_tokens=[teacher_tokens[j - 1]],
+                        s_start=i - k,
+                        s_end=i,
+                        t_start=j - 1,
+                        t_end=j,
+                    )
+                )
+                i -= k
+                j -= 1
+            else:
+                break
+        aligned.reverse()
+        return aligned, float(dp[n1, n2])
+
+    @staticmethod
+    def _shift_pairs(
+        pairs: List[AlignmentPair], shift_s: int, shift_t: int
+    ) -> List[AlignmentPair]:
+        """Offset start/end indices of pairs after segment-level alignment."""
+        out: List[AlignmentPair] = []
+        for pair in pairs:
+            ns = pair.s_start + shift_s if pair.s_start != -1 else -1
+            ne = pair.s_end + shift_s if pair.s_end != -1 else -1
+            nts = pair.t_start + shift_t if pair.t_start != -1 else -1
+            nte = pair.t_end + shift_t if pair.t_end != -1 else -1
+            # Split coarse same-token spans into 1-1 matches.
+            if (
+                len(pair.s_tokens) > 1
+                and len(pair.s_tokens) == len(pair.t_tokens)
+                and pair.s_tokens == pair.t_tokens
+                and ns >= 0
+                and nts >= 0
+            ):
+                for k in range(len(pair.s_tokens)):
+                    out.append(
+                        AlignmentPair(
+                            s_tokens=[pair.s_tokens[k]],
+                            t_tokens=[pair.t_tokens[k]],
+                            s_start=ns + k,
+                            s_end=ns + k + 1,
+                            t_start=nts + k,
+                            t_end=nts + k + 1,
+                        )
+                    )
+            else:
+                out.append(
+                    AlignmentPair(
+                        s_tokens=pair.s_tokens,
+                        t_tokens=pair.t_tokens,
+                        s_start=ns,
+                        s_end=ne,
+                        t_start=nts,
+                        t_end=nte,
+                    )
+                )
+        return out
+
+    @staticmethod
+    def _alignment_mask(aligned_pairs: List[AlignmentPair]) -> List[bool]:
+        """Compute is_correct for each pair using canonicalized text comparison."""
+        out: List[bool] = []
+        for pair in aligned_pairs:
+            s_canon = (
+                "".join(canonical_token(tk) for tk in pair.s_tokens)
+                if pair.s_tokens
+                else ""
+            )
+            t_canon = (
+                "".join(canonical_token(tk) for tk in pair.t_tokens)
+                if pair.t_tokens
+                else ""
+            )
+            out.append(
+                _strings_equal_flexible(
+                    s_canon, t_canon, ignore_leading_char_diff=False
+                )
+            )
+        return out
+
+    @staticmethod
+    def _post_process_alignment(
+        aligned_pairs: List[AlignmentPair],
+        *,
+        exact_match_score: float,
+        combination_score_multiplier: float,
+        gap_penalty: float,
+        max_combination_len: int,
+        end_mismatch_threshold: float = 0.2,
+    ) -> List[AlignmentPair]:
+        """Combine misaligned consecutive pairs and re-align bad spans."""
+        if not aligned_pairs:
+            return []
+
+        # Step 1: combine consecutive misaligned pairs (away from sequence end).
+        pair_strings = TokenAligner._build_pair_strings(aligned_pairs)
+        aligned_pairs = TokenAligner._combine_consecutive_misaligned(
+            aligned_pairs, pair_strings, end_mismatch_threshold
+        )
+        pair_strings = TokenAligner._build_pair_strings(aligned_pairs)
+
+        # Step 2: split exact-token coarse alignments and re-align small bad spans.
+        processed: List[AlignmentPair] = []
+        align_cache: dict[
+            Tuple[Tuple[str, ...], Tuple[str, ...]],
+            Tuple[List[AlignmentPair], bool],
+        ] = {}
+        i = 0
+        while i < len(aligned_pairs):
+            cur = aligned_pairs[i]
+            if (
+                len(cur.s_tokens) > 1
+                and len(cur.s_tokens) == len(cur.t_tokens)
+                and cur.s_tokens == cur.t_tokens
+            ):
+                for k in range(len(cur.s_tokens)):
+                    processed.append(
+                        AlignmentPair(
+                            s_tokens=[cur.s_tokens[k]],
+                            t_tokens=[cur.t_tokens[k]],
+                            s_start=cur.s_start + k,
+                            s_end=cur.s_start + k + 1,
+                            t_start=cur.t_start + k,
+                            t_end=cur.t_start + k + 1,
+                        )
+                    )
+                i += 1
+                continue
+
+            bad_start = -1
+            for j in range(i, len(aligned_pairs)):
+                if not pair_strings[j][2]:
+                    bad_start = j
+                    break
+            if bad_start == -1:
+                processed.extend(aligned_pairs[i:])
+                break
+            processed.extend(aligned_pairs[i:bad_start])
+
+            found = False
+            max_chunk = min(10, len(aligned_pairs) - bad_start)
+            for chunk_size in range(2, max_chunk + 1):
+                chunk = aligned_pairs[bad_start : bad_start + chunk_size]
+                chunk_s1, chunk_s2, s1_idx, s2_idx = TokenAligner._flatten_chunk(chunk)
+                chunk_s1_str = "".join(canonical_token(t) for t in chunk_s1)
+                chunk_s2_str = "".join(canonical_token(t) for t in chunk_s2)
+                if not _strings_equal_flexible(
+                    chunk_s1_str, chunk_s2_str, ignore_leading_char_diff=False
+                ):
+                    continue
+                cache_key = (tuple(chunk_s1), tuple(chunk_s2))
+                if cache_key in align_cache:
+                    sub_pairs, perfect = align_cache[cache_key]
+                else:
+                    sub_pairs, _ = TokenAligner._align_dp(
+                        chunk_s1,
+                        chunk_s2,
+                        exact_match_score=exact_match_score,
+                        combination_score_multiplier=combination_score_multiplier,
+                        gap_penalty=gap_penalty,
+                        max_combination_len=max_combination_len,
+                        ignore_leading_char_diff=False,
+                    )
+                    perfect = all(
+                        _strings_equal_flexible(
+                            "".join(canonical_token(t) for t in p.s_tokens),
+                            "".join(canonical_token(t) for t in p.t_tokens),
+                            ignore_leading_char_diff=False,
+                        )
+                        for p in sub_pairs
+                    )
+                    align_cache[cache_key] = (sub_pairs, perfect)
+
+                s1_chunk_start = min(s1_idx[::2]) if s1_idx else -1
+                s2_chunk_start = min(s2_idx[::2]) if s2_idx else -1
+                if perfect:
+                    for sub in sub_pairs:
+                        ns = s1_chunk_start + sub.s_start if sub.s_start != -1 else -1
+                        ne = s1_chunk_start + sub.s_end if sub.s_end != -1 else -1
+                        nts = s2_chunk_start + sub.t_start if sub.t_start != -1 else -1
+                        nte = s2_chunk_start + sub.t_end if sub.t_end != -1 else -1
+                        processed.append(
+                            AlignmentPair(
+                                s_tokens=sub.s_tokens,
+                                t_tokens=sub.t_tokens,
+                                s_start=ns,
+                                s_end=ne,
+                                t_start=nts,
+                                t_end=nte,
+                            )
+                        )
+                else:
+                    s1_chunk_end = max(s1_idx[1::2]) if s1_idx else -1
+                    s2_chunk_end = max(s2_idx[1::2]) if s2_idx else -1
+                    processed.append(
+                        AlignmentPair(
+                            s_tokens=chunk_s1,
+                            t_tokens=chunk_s2,
+                            s_start=s1_chunk_start,
+                            s_end=s1_chunk_end,
+                            t_start=s2_chunk_start,
+                            t_end=s2_chunk_end,
+                        )
+                    )
+                i = bad_start + chunk_size
+                found = True
+                break
+            if not found:
+                processed.append(aligned_pairs[bad_start])
+                i = bad_start + 1
+        return processed
+
+    @staticmethod
+    def _build_pair_strings(
+        aligned_pairs: List[AlignmentPair],
+    ) -> List[Tuple[str, str, bool]]:
+        """Precompute (s_str, t_str, is_match) for each pair."""
+        out: List[Tuple[str, str, bool]] = []
+        for pair in aligned_pairs:
+            s_canon = (
+                "".join(canonical_token(t) for t in pair.s_tokens)
+                if pair.s_tokens
+                else ""
+            )
+            t_canon = (
+                "".join(canonical_token(t) for t in pair.t_tokens)
+                if pair.t_tokens
+                else ""
+            )
+            is_match = _strings_equal_flexible(
+                s_canon, t_canon, ignore_leading_char_diff=False
+            )
+            out.append((s_canon, t_canon, is_match))
+        return out
+
+    @staticmethod
+    def _combine_consecutive_misaligned(
+        aligned_pairs: List[AlignmentPair],
+        pair_strings: List[Tuple[str, str, bool]],
+        end_mismatch_threshold: float,
+    ) -> List[AlignmentPair]:
+        """Combine consecutive misaligned pairs into single multi-token chunks."""
+        if not aligned_pairs or len(aligned_pairs) < 2:
+            return aligned_pairs
+        end_boundary = int(len(aligned_pairs) * (1 - end_mismatch_threshold))
+        out: List[AlignmentPair] = []
+        i = 0
+        while i < len(aligned_pairs):
+            if (
+                i < end_boundary
+                and not pair_strings[i][2]
+                and i + 1 < len(aligned_pairs)
+            ):
+                run = [i]
+                j = i + 1
+                while (
+                    j < end_boundary
+                    and j < len(aligned_pairs)
+                    and not pair_strings[j][2]
+                ):
+                    run.append(j)
+                    j += 1
+                if len(run) >= 2:
+                    combined_s1: List[str] = []
+                    combined_s2: List[str] = []
+                    s1_idx: List[int] = []
+                    s2_idx: List[int] = []
+                    for idx in run:
+                        pair = aligned_pairs[idx]
+                        combined_s1.extend(pair.s_tokens)
+                        combined_s2.extend(pair.t_tokens)
+                        if pair.s_tokens and pair.s_start != -1:
+                            s1_idx.extend([pair.s_start, pair.s_end])
+                        if pair.t_tokens and pair.t_start != -1:
+                            s2_idx.extend([pair.t_start, pair.t_end])
+                    cs1_start = min(s1_idx[::2]) if s1_idx else -1
+                    cs1_end = max(s1_idx[1::2]) if s1_idx else -1
+                    cs2_start = min(s2_idx[::2]) if s2_idx else -1
+                    cs2_end = max(s2_idx[1::2]) if s2_idx else -1
+                    out.append(
+                        AlignmentPair(
+                            s_tokens=combined_s1,
+                            t_tokens=combined_s2,
+                            s_start=cs1_start,
+                            s_end=cs1_end,
+                            t_start=cs2_start,
+                            t_end=cs2_end,
+                        )
+                    )
+                    i = j
+                    continue
+            out.append(aligned_pairs[i])
+            i += 1
+        return out
+
+    @staticmethod
+    def _flatten_chunk(
+        chunk: List[AlignmentPair],
+    ) -> Tuple[List[str], List[str], List[int], List[int]]:
+        """Concatenate tokens and collect span indices across a chunk of pairs."""
+        chunk_s1: List[str] = []
+        chunk_s2: List[str] = []
+        s1_idx: List[int] = []
+        s2_idx: List[int] = []
+        for pair in chunk:
+            chunk_s1.extend(pair.s_tokens)
+            chunk_s2.extend(pair.t_tokens)
+            if pair.s_tokens:
+                s1_idx.extend([pair.s_start, pair.s_end])
+            if pair.t_tokens:
+                s2_idx.extend([pair.t_start, pair.t_end])
+        return chunk_s1, chunk_s2, s1_idx, s2_idx
 
 
 def canonical_token(token: str, *, enabled: bool = True) -> str:

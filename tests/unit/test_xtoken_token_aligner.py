@@ -154,3 +154,85 @@ def test_strings_equal_flexible_exact_vs_canonical():
     assert not ta._strings_equal_flexible("Ġ.", ".", ignore_leading_char_diff=False)
     # Canonicalized: "Ġ." -> "." so they match under flexible compare.
     assert ta._strings_equal_flexible("Ġ.", ".", ignore_leading_char_diff=True)
+
+
+# -- DP core (M1.b): AlignmentPair + _align_single ----------------------------
+
+def _aligner():
+    # Tokenizers are unused by _align_single / _align_dp (they take token lists).
+    return ta.TokenAligner(None, None, projection_matrix_path="", max_comb_len=4)
+
+
+def _as_tuples(pairs):
+    return [
+        (p.s_tokens, p.t_tokens, p.s_start, p.s_end, p.t_start, p.t_end, p.is_correct)
+        for p in pairs
+    ]
+
+
+def test_align_single_identical_is_one_to_one_all_correct():
+    al = _aligner()
+    pairs = al._align_single(["a", "b", "c"], ["a", "b", "c"])
+    assert _as_tuples(pairs) == [
+        (["a"], ["a"], 0, 1, 0, 1, True),
+        (["b"], ["b"], 1, 2, 1, 2, True),
+        (["c"], ["c"], 2, 3, 2, 3, True),
+    ]
+
+
+def test_align_single_one_to_many_combination():
+    al = _aligner()
+    # Student 'abc' matches the teacher span 'ab'+'c'.
+    pairs = al._align_single(["abc"], ["ab", "c"])
+    assert len(pairs) == 1
+    p = pairs[0]
+    assert p.s_tokens == ["abc"] and p.t_tokens == ["ab", "c"]
+    assert (p.s_start, p.s_end) == (0, 1)
+    assert (p.t_start, p.t_end) == (0, 2)  # teacher span covers both tokens
+    assert p.is_correct is True
+
+
+def test_align_single_many_to_one_combination():
+    al = _aligner()
+    # Teacher 'abc' matches the student span 'ab'+'c'.
+    pairs = al._align_single(["ab", "c"], ["abc"])
+    assert len(pairs) == 1
+    p = pairs[0]
+    assert p.s_tokens == ["ab", "c"] and p.t_tokens == ["abc"]
+    assert (p.s_start, p.s_end) == (0, 2)
+    assert (p.t_start, p.t_end) == (0, 1)
+    assert p.is_correct is True
+
+
+def test_align_single_teacher_deletion_uses_sentinel():
+    al = _aligner()
+    # Teacher is missing 'b' -> a student-only pair with t_start/t_end == -1.
+    pairs = al._align_single(["a", "b", "c"], ["a", "c"])
+    by = {tuple(p.s_tokens): p for p in pairs}
+    assert by[("a",)].is_correct and by[("c",)].is_correct
+    delp = by[("b",)]
+    assert delp.t_tokens == [] and delp.t_start == -1 and delp.t_end == -1
+    assert delp.is_correct is False  # 'b' vs '' is not a match
+
+
+def test_align_single_mismatch_marks_incorrect():
+    al = _aligner()
+    pairs = al._align_single(["a"], ["x"])
+    assert len(pairs) == 1
+    assert pairs[0].is_correct is False
+
+
+def test_align_dp_score_and_traceback_identical():
+    # Direct kernel check: identical sequences -> all-diag, score = N * match.
+    pairs, score = ta.TokenAligner._align_dp(
+        ["a", "b"],
+        ["a", "b"],
+        exact_match_score=3.0,
+        combination_score_multiplier=1.5,
+        gap_penalty=-1.5,
+        max_combination_len=4,
+        ignore_leading_char_diff=False,
+    )
+    assert score == 6.0  # 2 exact matches * 3.0
+    assert all(len(p.s_tokens) == 1 and len(p.t_tokens) == 1 for p in pairs)
+    assert [p.s_start for p in pairs] == [0, 1]
