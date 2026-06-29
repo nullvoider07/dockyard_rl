@@ -29,10 +29,11 @@ stays import-clean before those primitives land.
 from __future__ import annotations
 
 import os
-from dataclasses import fields
+from dataclasses import dataclass, fields
 from typing import Any, Dict, Mapping, Optional, Tuple, Union
 
 import torch
+from torch.distributed.tensor import DTensor
 
 from dockyard_rl.algorithms.x_token.token_aligner import AlignmentBatch
 
@@ -608,3 +609,150 @@ def build_exact_token_map(
     }
     _EXACT_TOKEN_MAP_CACHE[key] = result
     return result
+
+
+# ---------------------------------------------------------------------------
+# CP-localized alignment + student-side CE / accuracy.
+#
+# The CP-collective helpers (vocab_parallel_argmax / cp_shift_next) and the
+# DTensor unwrap (to_local_if_dtensor) are imported inside the functions: the
+# single-rank / non-DTensor CPU path here stays import-clean, and the multi-rank
+# behavior is GPU-deferred.
+# ---------------------------------------------------------------------------
+@dataclass
+class LocalizedAlignment:
+    """CP-localized chunk-alignment tensors consumed by the loss reductions."""
+
+    student_chunk_id: torch.Tensor
+    teacher_chunk_id: torch.Tensor
+    pair_valid: torch.Tensor
+    pair_is_correct: torch.Tensor
+    sample_mask: torch.Tensor
+    # Filled post-construction by the loss-input keystone (None when built via
+    # localize_alignment); read only by the next-token-accuracy metric -- the
+    # gold path leaves them unset.
+    student_input_ids: Optional[torch.Tensor] = None
+    student_token_mask: Optional[torch.Tensor] = None
+
+
+def localize_alignment(
+    data: Mapping[str, Any],
+    *,
+    teacher_seq_len: int,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> LocalizedAlignment:
+    """Localize the chunk-alignment data-dict fields for the local CP shard.
+
+    Unwraps the ``alignment_*`` / ``sample_mask`` entries from DTensor to their
+    local tensors. The teacher-seq ``teacher_chunk_id`` is full, so it is sliced
+    contiguously to this CP rank's ``teacher_seq_len`` window to match the
+    transport consumer's contiguous teacher-logit slice. Student-seq fields stay
+    as handed in; the caller (the loss-input keystone) relayouts them from the CP
+    load-balanced layout to this rank's contiguous window before use.
+    """
+    from dockyard_rl.models.dtensor.parallelize import to_local_if_dtensor
+
+    teacher_chunk_id_full = to_local_if_dtensor(data["alignment_teacher_chunk_id"])
+    cp_rank = (
+        torch.distributed.get_rank(cp_group)
+        if cp_group is not None and torch.distributed.get_world_size(cp_group) > 1
+        else 0
+    )
+    teacher_seq_start = cp_rank * teacher_seq_len
+    teacher_chunk_id = teacher_chunk_id_full[
+        :, teacher_seq_start : teacher_seq_start + teacher_seq_len
+    ]
+    return LocalizedAlignment(
+        student_chunk_id=to_local_if_dtensor(data["alignment_student_chunk_id"]),
+        teacher_chunk_id=teacher_chunk_id,
+        pair_valid=to_local_if_dtensor(data["alignment_pair_valid"]),
+        pair_is_correct=to_local_if_dtensor(data["alignment_pair_is_correct"]),
+        sample_mask=to_local_if_dtensor(data["sample_mask"]),
+    )
+
+
+def student_next_token_ce(
+    logits: torch.Tensor,
+    *,
+    input_ids: torch.Tensor,
+    seq_index: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Per-token next-token cross-entropy ``[B, T-1]`` on the student.
+
+    DTensor (TP/CP) logits route through the vocab-parallel log-prob helper
+    (which also handles the CP roll); plain logits use a local shifted
+    ``cross_entropy``. The next-token shift (drop the last predictor) matches the
+    convention the KL terms use.
+    """
+    if isinstance(logits, DTensor):
+        from dockyard_rl.distributed.model_utils import (
+            get_logprobs_from_vocab_parallel_logits,
+        )
+
+        next_token_logprobs = get_logprobs_from_vocab_parallel_logits(
+            logits, input_ids, seq_index=seq_index
+        )
+        return -next_token_logprobs
+    shift_logits = logits[:, :-1].contiguous()
+    shift_labels = input_ids[:, 1:].contiguous()
+    return torch.nn.functional.cross_entropy(
+        shift_logits.reshape(-1, shift_logits.shape[-1]).float(),
+        shift_labels.reshape(-1),
+        reduction="none",
+    ).reshape(shift_labels.shape)
+
+
+def ce_label_mask(
+    *,
+    token_mask: torch.Tensor,
+    sample_mask: torch.Tensor,
+    ce_seq_len: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Next-token label mask ``[B, ce_seq_len]`` = shifted token_mask * sample_mask.
+
+    ``token_mask`` is gathered to the full sequence (CP) before the shift; both
+    inputs are DTensor-unwrapped.
+    """
+    from dockyard_rl.models.dtensor.parallelize import to_local_if_dtensor
+
+    token_mask = (
+        token_mask.full_tensor() if isinstance(token_mask, DTensor) else token_mask
+    )
+    sample_mask = to_local_if_dtensor(sample_mask)
+    return (token_mask[:, 1 : ce_seq_len + 1] * sample_mask.unsqueeze(-1)).to(dtype)
+
+
+def next_token_accuracy(
+    logits: torch.Tensor,
+    *,
+    input_ids: torch.Tensor,
+    token_mask: torch.Tensor,
+    sample_mask: torch.Tensor,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> torch.Tensor:
+    """Masked next-token top-1 accuracy of the student (scalar, no gradient).
+
+    Uses :func:`vocab_parallel_argmax` for the (possibly TP-sharded) argmax. The
+    next-token shift on labels/mask is CP-aware (:func:`cp_shift_next`) so the
+    boundary token crosses CP ranks, and the correct/total counts are CP-reduced
+    so every rank reports the same global accuracy.
+    """
+    from dockyard_rl.distributed.model_utils import cp_shift_next, vocab_parallel_argmax
+    from dockyard_rl.models.dtensor.parallelize import to_local_if_dtensor
+
+    with torch.no_grad():
+        argmax = vocab_parallel_argmax(logits, tp_group=tp_group)
+        next_labels = cp_shift_next(to_local_if_dtensor(input_ids), cp_group, fill=0)
+        next_mask = cp_shift_next(to_local_if_dtensor(token_mask), cp_group, fill=0)
+        acc_mask = (
+            next_mask.float() * to_local_if_dtensor(sample_mask).unsqueeze(-1).float()
+        )
+        correct = ((argmax == next_labels).float() * acc_mask).sum()
+        denom = acc_mask.sum()
+        if cp_group is not None and torch.distributed.get_world_size(cp_group) > 1:
+            stats = torch.stack([correct, denom])
+            torch.distributed.all_reduce(stats, group=cp_group)
+            correct, denom = stats[0], stats[1]
+        return correct / denom.clamp(min=1.0)
