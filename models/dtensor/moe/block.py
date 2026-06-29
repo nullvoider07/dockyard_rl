@@ -118,10 +118,16 @@ class MoEBlock(nn.Module):
             torch.zeros(num_experts, dtype=torch.float32),
             persistent=False,
         )
+        # Transient MoE router-replay slot. A plain attribute (not a buffer, so
+        # it never enters state_dict or moves with .to()): the router-replay
+        # controller binds this layer's recorded route ``(B, L, K)`` before a
+        # replayed forward and clears it after (set-and-consume). None on the
+        # default path, so the forward and gating math are byte-unchanged.
+        self._replay_route_BLK: Optional[torch.Tensor] = None
 
     def forward(self, x_BLD: torch.Tensor) -> torch.Tensor:
         topk_scores_BLK, topk_expert_ids_BLK, scores_BLE = self.router(
-            x_BLD, self.expert_bias_E
+            x_BLD, self.expert_bias_E, replay_route_BLK=self._replay_route_BLK
         )
         _, num_tokens_per_expert_E = routing_map_and_counts(
             scores_BLE, topk_expert_ids_BLK
