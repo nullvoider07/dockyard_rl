@@ -35,6 +35,11 @@ from transformers.models.gemma3.modeling_gemma3 import (
 
 from dockyard_rl.data_plane.worker_mixin import TQWorkerMixin
 from dockyard_rl.distributed.batched_data_dict import BatchedDataDict
+from dockyard_rl.models.dtensor.moe.router_replay import (
+    resolve_router_replay_enabled,
+    router_replay_context,
+    validate_router_replay_config,
+)
 from dockyard_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
@@ -497,6 +502,7 @@ class DTensorPolicyWorkerImpl(
             )
 
         self._setup_moe_load_balancing()
+        self._setup_router_replay()
 
         # Restore from checkpoint
         if weights_path:
@@ -514,6 +520,16 @@ class DTensorPolicyWorkerImpl(
         load-balanced ``MoEBlock`` modules.
         """
         return
+
+    def _setup_router_replay(self) -> None:
+        """Resolve and validate MoE router-replay (#2908).
+
+        Reads ``policy.router_replay.enabled`` and fails fast if it is set on a
+        model without ``MoEBlock`` modules. The forward sites consume the flag
+        via ``router_replay_context``; the default (disabled) path is inert.
+        """
+        self._router_replay_enabled = resolve_router_replay_enabled(self.cfg)
+        validate_router_replay_config(self._router_replay_enabled, self.model)
 
     def _apply_moe_surgery(self, model: nn.Module) -> None:
         """Seam: swap HF routed-expert MLPs for native MoEBlocks (MoE only).
@@ -856,7 +872,17 @@ class DTensorPolicyWorkerImpl(
                             if len(vlm_kwargs) > 0:
                                 del model_args["flash_attn_kwargs"]
 
-                            outputs = self.model(**model_args)
+                            # MoE router-replay: force the recorded generation
+                            # routing for this microbatch (inert when disabled or
+                            # no routed_experts column).
+                            with router_replay_context(
+                                self.model,
+                                mb.get("routed_experts", None),
+                                enabled=self._router_replay_enabled,
+                                seq_packing=self.enable_seq_packing,
+                                context_parallel=self.cp_size > 1,
+                            ):
+                                outputs = self.model(**model_args)
 
                         if not hasattr(outputs, "logits"):
                             logits = cast(Any, self.model).lm_head(outputs.last_hidden_state)
@@ -1157,7 +1183,18 @@ class DTensorPolicyWorkerImpl(
                         if len(vlm_kwargs) > 0:
                             del model_args["flash_attn_kwargs"]
 
-                        outputs = self.model(**model_args)
+                        # MoE router-replay: the prev-logprob recompute is the
+                        # primary consumer — re-routing tokens differently here
+                        # than at generation is what inflates the train/gen
+                        # logprob error. Inert when disabled / no routing column.
+                        with router_replay_context(
+                            self.model,
+                            lp_batch.get("routed_experts", None),
+                            enabled=self._router_replay_enabled,
+                            seq_packing=self.enable_seq_packing,
+                            context_parallel=self.cp_size > 1,
+                        ):
+                            outputs = self.model(**model_args)
 
                     logits = outputs.logits
                     logits = self._apply_temperature_scaling(logits)

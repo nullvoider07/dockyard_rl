@@ -83,6 +83,43 @@ def bind_router_replay(
             block._replay_route_BLK = None
 
 
+@contextmanager
+def router_replay_context(
+    model: nn.Module,
+    routed_experts_BTLK: Any,
+    *,
+    enabled: bool,
+    seq_packing: bool = False,
+    context_parallel: bool = False,
+) -> Generator[None, None, None]:
+    """Bind router replay for one forward, or a null context when inapplicable.
+
+    The single hook the policy worker wraps around its MoE forward so the same
+    binding covers both the prev-logprob recompute (``get_logprobs``) and the
+    train forward. Yields without binding when replay is disabled or the batch
+    carries no ``routed_experts`` column (the default training path is therefore
+    byte-unchanged).
+
+    Sequence packing and context parallelism re-lay-out the token/sequence axis
+    (packed rows, seq-sharded buffers), so the recorded routing would have to be
+    transformed identically to stay aligned — that layout work is HV-47. Until
+    then this refuses those combinations loudly rather than silently replaying a
+    misaligned route.
+    """
+    if not enabled or routed_experts_BTLK is None:
+        yield
+        return
+    if seq_packing or context_parallel:
+        raise NotImplementedError(
+            "router replay does not yet support sequence packing or context "
+            "parallelism (the recorded routing must be re-laid-out to match the "
+            "packed/seq-sharded tokens; HV-47). Disable policy.sequence_packing "
+            "/ context parallel, or policy.router_replay."
+        )
+    with bind_router_replay(model, routed_experts_BTLK):
+        yield
+
+
 def resolve_router_replay_enabled(policy_cfg: Any) -> bool:
     """Read ``policy.router_replay.enabled`` from a dict or attr-style config."""
     if isinstance(policy_cfg, dict):

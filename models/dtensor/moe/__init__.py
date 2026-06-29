@@ -33,6 +33,7 @@ from dockyard_rl.models.dtensor.moe.router_replay import (
     count_moe_blocks,
     iter_moe_blocks,
     resolve_router_replay_enabled,
+    router_replay_context,
     validate_router_replay_config,
 )
 from dockyard_rl.models.dtensor.moe.parallelize_moe import (
@@ -88,6 +89,7 @@ __all__ = [
     "count_moe_blocks",
     "iter_moe_blocks",
     "resolve_router_replay_enabled",
+    "router_replay_context",
     "validate_router_replay_config",
     "parallelize_grouped_experts",
     "parallelize_router_gate",

@@ -24,6 +24,7 @@ from dockyard_rl.models.dtensor.moe.router_replay import (
     count_moe_blocks,
     iter_moe_blocks,
     resolve_router_replay_enabled,
+    router_replay_context,
     validate_router_replay_config,
 )
 from dockyard_rl.models.generation.vllm import router_capture
@@ -287,3 +288,69 @@ def test_validate_router_replay_config():
 def test_sentinel_constant_does_not_drift():
     # The producer (capture) and consumer (router) must agree on the sentinel.
     assert MISSING_ROUTE_SENTINEL == router_capture.MISSING_ROUTE_SENTINEL
+
+
+# --------------------------------------------------------------------------- #
+# router_replay_context — the policy-worker forward hook (covers train +
+# get_logprobs); decision logic is CPU-testable, execution is GPU-deferred.
+# --------------------------------------------------------------------------- #
+def test_context_noop_when_disabled():
+    model = _moe_model(2)
+    blocks = iter_moe_blocks(model)
+    routed = torch.zeros(1, 3, 2, 2, dtype=torch.int32)
+    with router_replay_context(model, routed, enabled=False):
+        # Disabled -> nothing bound even though a routing column is present.
+        assert all(b._replay_route_BLK is None for b in blocks)
+
+
+def test_context_noop_when_no_column():
+    model = _moe_model(2)
+    blocks = iter_moe_blocks(model)
+    with router_replay_context(model, None, enabled=True):
+        assert all(b._replay_route_BLK is None for b in blocks)
+
+
+def test_context_binds_when_enabled_with_column():
+    model = _moe_model(2)
+    blocks = iter_moe_blocks(model)
+    routed = torch.zeros(1, 3, 2, 2, dtype=torch.int32)
+    routed[:, :, 1, :] = 4
+    with router_replay_context(model, routed, enabled=True):
+        assert torch.equal(blocks[1]._replay_route_BLK, routed[:, :, 1, :])
+    assert all(b._replay_route_BLK is None for b in blocks)
+
+
+def test_context_refuses_seq_packing():
+    model = _moe_model(1)
+    routed = torch.zeros(1, 3, 1, 2, dtype=torch.int32)
+    try:
+        with router_replay_context(model, routed, enabled=True, seq_packing=True):
+            pass
+    except NotImplementedError as e:
+        assert "sequence packing" in str(e)
+    else:
+        raise AssertionError("expected NotImplementedError under seq packing")
+
+
+def test_context_refuses_context_parallel():
+    model = _moe_model(1)
+    routed = torch.zeros(1, 3, 1, 2, dtype=torch.int32)
+    try:
+        with router_replay_context(
+            model, routed, enabled=True, context_parallel=True
+        ):
+            pass
+    except NotImplementedError as e:
+        assert "context paralle" in str(e)
+    else:
+        raise AssertionError("expected NotImplementedError under CP")
+
+
+def test_context_packing_guard_inert_when_no_column():
+    # Packing/CP only matter when there IS routing to lay out; a null column
+    # must not trip the guard (the common default-training path).
+    model = _moe_model(1)
+    with router_replay_context(
+        model, None, enabled=True, seq_packing=True, context_parallel=True
+    ):
+        pass  # no raise
