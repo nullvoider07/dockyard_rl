@@ -965,6 +965,70 @@ def rebuild_teacher_full_logits_from_ipc(
     return torch.stack(rebuilt, dim=0)
 
 
+# ---------------------------------------------------------------------------
+# Cross-cluster teacher-logit transport (full-vocab via the data_plane).
+#
+# When teacher and student run as separate (non-colocated) fleets, node-local
+# CUDA IPC can't reach across the cluster, so the teacher ships full-vocab logits
+# over the data_plane instead. The producer casts to bf16 and splits along the
+# sequence axis to bound per-message size; each chunk rides as a data_plane
+# column entry. The consumer reassembles the chunks, slices to this student CP
+# rank's seq window, and upcasts to fp32 — the SAME ``[B, T_t/CP_s, V_t]``
+# contract :func:`rebuild_teacher_full_logits_from_ipc` produces, so the loss
+# body and the keystone stay transport-blind. These two functions are the pure
+# encode/decode kernel (CPU round-trip testable); the data_plane put/get wiring
+# is GPU/cluster integration (HV-deferred, built with the driver).
+# ---------------------------------------------------------------------------
+def chunk_teacher_logits_for_cross_cluster(
+    teacher_logits: torch.Tensor,
+    num_seq_chunks: int,
+) -> list[torch.Tensor]:
+    """Producer prep: bf16-cast ``[B, T_t, V_t]`` logits and split along the seq axis.
+
+    Returns ``num_seq_chunks`` (or fewer if the seq is shorter) contiguous bf16
+    chunks ``[B, t_chunk, V_t]`` for the data_plane to ship as column entries.
+    bf16 halves the payload vs fp32; the seq split bounds the per-message size for
+    a large teacher vocab. Reassembled by
+    :func:`rebuild_teacher_full_logits_cross_cluster`.
+    """
+    if num_seq_chunks < 1:
+        raise ValueError(f"num_seq_chunks must be >= 1, got {num_seq_chunks}")
+    bf16 = teacher_logits.to(torch.bfloat16)
+    return [c.contiguous() for c in torch.chunk(bf16, num_seq_chunks, dim=1)]
+
+
+def rebuild_teacher_full_logits_cross_cluster(
+    seq_chunks: list[torch.Tensor],
+    *,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> torch.Tensor:
+    """Consumer: reassemble seq-chunked teacher logits to ``[B, T_t/CP_s, V_t]`` fp32.
+
+    Concatenates the producer's bf16 seq chunks back to the full ``[B, T_t, V_t]``,
+    slices to this student CP rank's contiguous seq window, and upcasts to fp32 —
+    matching :func:`rebuild_teacher_full_logits_from_ipc`'s output so the loss is
+    transport-blind. No-op CP slice when CP world <= 1.
+    """
+    if not seq_chunks:
+        raise ValueError("seq_chunks must be non-empty")
+    full = torch.cat(list(seq_chunks), dim=1).to(torch.float32)  # [B, T_t, V_t]
+    cp_size = (
+        torch.distributed.get_world_size(cp_group)
+        if cp_group is not None and torch.distributed.get_world_size(cp_group) > 1
+        else 1
+    )
+    if cp_size == 1:
+        return full
+    cp_rank = torch.distributed.get_rank(cp_group)
+    full_seq_len = full.shape[1]
+    assert full_seq_len % cp_size == 0, (
+        f"teacher seq len {full_seq_len} not divisible by student_cp_size {cp_size}"
+    )
+    local_seq_len = full_seq_len // cp_size
+    seq_start = cp_rank * local_seq_len
+    return full[:, seq_start : seq_start + local_seq_len].contiguous()
+
+
 def prepare_xtoken_cross_tokenizer_loss_input(
     logits: torch.Tensor,
     data: Mapping[str, Any],
@@ -1010,11 +1074,28 @@ def prepare_xtoken_cross_tokenizer_loss_input(
         cp_group = context_parallel_group
         tp_group = vocab_parallel_group
 
-    teacher_full_logits = rebuild_teacher_full_logits_from_ipc(
-        data["teacher_full_logits_ipc"],
-        cp_group=cp_group,
-        device=torch.cuda.current_device(),
-    )
+    # Transport switch (loss stays transport-blind): the producer/driver writes
+    # exactly one of these keys per the configured ``xtoken.transport``. IPC ships
+    # full-vocab logits node-locally via CUDA IPC handles; cross-cluster ships
+    # them bf16 + seq-chunked over the data_plane. Both reassemble to the same
+    # ``[B, T_t/CP_s, V_t]`` contract.
+    if "teacher_full_logits_ipc" in data:
+        teacher_full_logits = rebuild_teacher_full_logits_from_ipc(
+            data["teacher_full_logits_ipc"],
+            cp_group=cp_group,
+            device=torch.cuda.current_device(),
+        )
+    elif "teacher_full_logits_cross_cluster" in data:
+        teacher_full_logits = rebuild_teacher_full_logits_cross_cluster(
+            data["teacher_full_logits_cross_cluster"],
+            cp_group=cp_group,
+        )
+    else:
+        raise KeyError(
+            "cross-tokenizer loss input is missing the teacher logits: expected "
+            "'teacher_full_logits_ipc' (IPC transport) or "
+            "'teacher_full_logits_cross_cluster' (data_plane transport) in data."
+        )
     student_logits = cp_load_balanced_to_contiguous(logits, cp_group=cp_group)
     align = localize_alignment(
         data, teacher_seq_len=teacher_full_logits.shape[1], cp_group=cp_group

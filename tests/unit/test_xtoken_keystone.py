@@ -83,6 +83,45 @@ def test_keystone_next_token_shifts_chunk_ids(monkeypatch):
     assert align.teacher_chunk_id.tolist() == [[1, 2, -1, -1]]
 
 
+def test_keystone_cross_cluster_branch_end_to_end():
+    # The cross-cluster branch reassembles bf16 seq-chunks (no IPC / cuda), so the
+    # full keystone runs on CPU end-to-end when data carries the cross-cluster key.
+    from dockyard_rl.algorithms.x_token.loss_utils import (
+        chunk_teacher_logits_for_cross_cluster,
+    )
+
+    teacher = torch.randn(1, 4, 6)
+    data = _data()
+    del data["teacher_full_logits_ipc"]
+    data["teacher_full_logits_cross_cluster"] = chunk_teacher_logits_for_cross_cluster(
+        teacher, num_seq_chunks=2
+    )
+    logits = torch.randn(1, 4, 8)
+    tfl, student_contig, align, tp_group, cp_group = (
+        prepare_xtoken_cross_tokenizer_loss_input(
+            logits, data, vocab_parallel_group=None, context_parallel_group=None,
+        )
+    )
+    assert torch.equal(tfl, teacher.to(torch.bfloat16).float())
+    assert torch.equal(student_contig, logits)
+    assert align.student_input_ids is not None  # Contract 3 still honored
+    assert align.student_chunk_id.tolist() == [[1, 2, -1, -1]]
+
+
+def test_keystone_missing_teacher_logits_raises(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    data = _data()
+    del data["teacher_full_logits_ipc"]  # neither transport key present
+    try:
+        prepare_xtoken_cross_tokenizer_loss_input(
+            torch.randn(1, 4, 8), data,
+            vocab_parallel_group=None, context_parallel_group=None,
+        )
+        assert False, "expected KeyError"
+    except KeyError:
+        pass
+
+
 def test_keystone_falls_back_to_passed_tp_group_for_plain_logits(monkeypatch):
     # Non-DTensor logits => tp_group comes from the passed vocab_parallel_group
     # (tp_group is only returned, never used in a distributed op here, so a
