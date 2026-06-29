@@ -1,0 +1,217 @@
+# Cross-tokenizer off-policy distillation configuration.
+#
+# Distill a student from a teacher whose tokenizer DIFFERS from the student's.
+# The collator tokenizes the same source text twice (student + teacher) and
+# aligns the two tokenizations (TokenAligner); the teacher exports full-vocab
+# logits over the configured transport; the loss projects the student
+# distribution onto the teacher vocab and matches chunk-averaged distributions
+# (CrossTokenizerDistillationLossFn).
+#
+# Default pairing: a Qwen2.5 student distilled from a Llama-3.1 teacher — two
+# genuinely different tokenizers (the point of the cross-tokenizer path). Swap
+# model_name / tokenizer to retarget; the projection matrix must match the pair.
+#
+# Usage:
+#   python3 examples/run_xtoken_distillation.py \
+#     --config examples/configs/xtoken_distillation.yaml \
+#     loss_fn.projection_matrix_path=/path/to/student_to_teacher_projection.pt \
+#     cluster.gpus_per_node=8 cluster.num_nodes=2
+
+distillation:
+  num_prompts_per_step: 32
+  max_num_steps: 1000
+  max_num_epochs: 1
+  seed: 42
+  val_period: 100
+  val_at_start: true
+  val_at_end: true
+  # Teacher microbatch size for the validation logits export.
+  val_teacher_micro_batch_size: ${teacher_policy.train_micro_batch_size}
+
+  # DUAL teacher-logit transport (dockyard extension over upstream's IPC-only):
+  #   ipc           — node-local CUDA IPC (zero-copy; teacher+student co-located
+  #                   per node). Fastest; requires the placement to satisfy
+  #                   assert_xtoken_ipc_node_local.
+  #   cross_cluster — full-vocab teacher logits shipped bf16 + seq-chunked over
+  #                   the data_plane (teacher and student as separate fleets).
+  transport: "ipc"
+  # cross_cluster only: number of sequence-axis chunks for the bf16 ship (bounds
+  # per-message size for a large teacher vocab). Inert when transport=ipc.
+  num_seq_chunks: 4
+
+  # Cross-tokenizer collation: tokenize twice + align. ctx lengths cap each side;
+  # make_seq_div_by rounds each sequence up (TP*CP*2 for the DTensor V2 worker).
+  ctx_length_student: ${policy.max_total_sequence_length}
+  ctx_length_teacher: ${teacher_policy.max_total_sequence_length}
+  make_seq_div_by_student: ${policy.make_sequence_length_divisible_by}
+  make_seq_div_by_teacher: 1
+
+# CrossTokenizerDistillationLossFn. Mode = (gold_loss, xtoken_loss):
+#   (false,false) P-KL: full-vocab projection KL over a microbatch-global top-k
+#                 teacher subset + next-token CE.
+#   (true, false) gold-loss: KL on the exact-mapped common vocab + L1 on the
+#                 uncommon tail + CE.
+#   (true, true)  gold-loss with the xtoken modifier (relaxed exact-map threshold).
+# student_vocab_size / teacher_vocab_size are runtime-injected from the tokenizers.
+loss_fn:
+  # student->teacher vocab projection (.pt). REQUIRED at runtime (set via CLI).
+  projection_matrix_path: null
+  gold_loss: false
+  xtoken_loss: false
+  temperature: 1.0
+  vocab_topk: 128
+  uncommon_topk: 8192
+  reverse_kl: false
+  exact_token_match_only: false
+  kl_loss_weight: 1.0
+  ce_loss_scale: 1.0
+  dynamic_loss_scaling: true
+
+policy:
+  model_name: "Qwen/Qwen2.5-1.5B-Instruct"     # student
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template: null
+    chat_template_kwargs: null
+  hf_config_overrides: {}
+  train_global_batch_size: 32
+  train_micro_batch_size: 1
+  logprob_batch_size: ${policy.train_micro_batch_size}
+  max_total_sequence_length: 4096
+  precision: "bfloat16"
+  max_grad_norm: 1.0
+  make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
+
+  dtensor_cfg:
+    _v2: true
+    enabled: true
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    expert_parallel_size: 1
+    dp_replicate_size: 1
+    moe_parallelizer:
+      token_dispatcher: local
+      grouped_gemm: true
+      load_balance_coeff: null
+    custom_parallel_plan: null
+    automodel_kwargs: {}
+    lora_cfg:
+      enabled: false
+      target_modules: []
+      exclude_modules: []
+      match_all_linear: true
+      dim: 8
+      alpha: 32
+      dropout: 0.0
+      dropout_position: "post"
+      lora_A_init: "xavier"
+      use_triton: true
+
+  megatron_cfg:
+    enabled: false
+
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    sequence_length_round: 64
+
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 1.0e-5
+      weight_decay: 0.01
+      betas: [0.9, 0.999]
+      eps: 1.0e-8
+      foreach: false
+      fused: false
+
+  scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.1
+        end_factor: 1.0
+        total_iters: 20
+    - name: "torch.optim.lr_scheduler.ConstantLR"
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: [20]
+
+# Frozen teacher policy — a DIFFERENT tokenizer from the student (the whole point
+# of cross-tokenizer distillation). Separate resources from the student.
+teacher_policy:
+  model_name: "meta-llama/Llama-3.1-8B-Instruct"
+  tokenizer:
+    name: ${teacher_policy.model_name}
+    chat_template: null
+    chat_template_kwargs: null
+  dtype: "bfloat16"
+  max_total_sequence_length: 4096
+  train_micro_batch_size: 1
+  dtensor_cfg:
+    _v2: true
+    enabled: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+  resources:
+    gpus_per_node: 1
+    num_nodes: 1
+
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  shuffle: true
+  num_workers: 2
+  train:
+    dataset_name: "OpenMathInstruct-2"
+    split: "train"
+    split_validation_size: 0.02
+    seed: ${distillation.seed}
+  validation:
+    dataset_name: "OpenMathInstruct-2"
+    split: "train"
+    split_validation_size: 0.02
+    seed: ${distillation.seed}
+  default:
+    processor: "kd_data_processor"
+
+logger:
+  log_dir: "logs/xtoken_distillation"
+  num_val_samples_to_print: 3
+  wandb_enabled: false
+  tensorboard_enabled: true
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: true
+  wandb:
+    project: "dockyard-rl"
+    name: "xtoken_distillation"
+  tensorboard: {}
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+cluster:
+  gpus_per_node: 1
+  num_nodes: 1
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/xtoken_distillation"
+  metric_name: "val_loss"
+  higher_is_better: false
+  keep_top_k: 3
+  save_period: 100
+  checkpoint_must_save_by: null
+  model_save_format: "safetensors"
+  save_consolidated: false
+  save_optimizer: true
