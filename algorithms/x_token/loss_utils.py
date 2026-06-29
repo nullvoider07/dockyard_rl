@@ -963,3 +963,76 @@ def rebuild_teacher_full_logits_from_ipc(
         for entry in per_sample_entries
     ]
     return torch.stack(rebuilt, dim=0)
+
+
+def prepare_xtoken_cross_tokenizer_loss_input(
+    logits: torch.Tensor,
+    data: Mapping[str, Any],
+    *,
+    vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    LocalizedAlignment,
+    Optional[torch.distributed.ProcessGroup],
+    Optional[torch.distributed.ProcessGroup],
+]:
+    """Assemble the cross-tokenizer loss inputs from student logits + teacher transport.
+
+    The keystone the ``DISTILLATION_CROSS_TOKENIZER`` branch of
+    :func:`dockyard_rl.algorithms.loss.utils.prepare_loss_input` calls. Rebuilds
+    the teacher full-vocab logits from the per-rank CUDA IPC handles and does the
+    shared CP-resolution both loss paths need (contiguous student logits +
+    localized, next-token-shifted alignment), plus the contiguous student
+    ``input_ids`` / ``token_mask`` the accuracy metric consumes (Contract 3 — the
+    P-KL ``next_token_accuracy`` reads them). TP/CP groups come from the student
+    ``logits``' device mesh, falling back to the passed groups for non-DTensor
+    logits. The teacher rebuild + ``cuda.current_device`` are GPU-only; the
+    CP-relayout / localize / shift glue collapses to the local op at world=1. The
+    cross-cluster transport (M3.b) reassembles teacher logits to the same
+    ``[B, T_t/CP_s, V_t]`` contract and plugs in at the rebuild step.
+
+    Returns:
+        ``(teacher_full_logits, student_logits_contig, align, tp_group, cp_group)``.
+    """
+    from dockyard_rl.distributed.model_utils import (
+        cp_load_balanced_to_contiguous,
+        cp_shift_next,
+    )
+
+    if isinstance(logits, DTensor):
+        mesh = logits.device_mesh
+        mesh_names = mesh.mesh_dim_names or ()
+        cp_group = mesh.get_group("cp") if "cp" in mesh_names else None
+        tp_group = mesh.get_group("tp") if "tp" in mesh_names else None
+    else:
+        cp_group = context_parallel_group
+        tp_group = vocab_parallel_group
+
+    teacher_full_logits = rebuild_teacher_full_logits_from_ipc(
+        data["teacher_full_logits_ipc"],
+        cp_group=cp_group,
+        device=torch.cuda.current_device(),
+    )
+    student_logits = cp_load_balanced_to_contiguous(logits, cp_group=cp_group)
+    align = localize_alignment(
+        data, teacher_seq_len=teacher_full_logits.shape[1], cp_group=cp_group
+    )
+    align.student_chunk_id = cp_shift_next(
+        cp_load_balanced_to_contiguous(align.student_chunk_id, cp_group=cp_group),
+        cp_group,
+        fill=-1,
+    )
+    align.teacher_chunk_id = cp_shift_next(align.teacher_chunk_id, cp_group, fill=-1)
+    # Relay the student input_ids / token_mask from CP load-balanced to this
+    # rank's contiguous window so the next-token accuracy metric (which applies
+    # its own contiguous next-token shift) stays consistent with the contiguous
+    # student logits. Unshifted here: the metric does the shift itself.
+    align.student_input_ids = cp_load_balanced_to_contiguous(
+        data["input_ids"], cp_group=cp_group
+    )
+    align.student_token_mask = cp_load_balanced_to_contiguous(
+        data["token_mask"], cp_group=cp_group
+    )
+    return teacher_full_logits, student_logits, align, tp_group, cp_group

@@ -183,15 +183,36 @@ def test_unknown_input_type_raises_value_error():
         )
 
 
-# -- DISTILLATION_CROSS_TOKENIZER (branch reached; keystone M3-deferred) -------
+# -- DISTILLATION_CROSS_TOKENIZER (routes to the M3.c keystone) ---------------
 
-def test_cross_tokenizer_branch_reaches_deferred_keystone():
-    # The branch lazy-imports prepare_xtoken_cross_tokenizer_loss_input, which is
-    # not built until M3, so reaching the branch raises ImportError. This pins
-    # that the new enum routes to the xtoken path (not the unknown-type error).
-    with pytest.raises(ImportError):
-        prepare_loss_input(
-            torch.randn(1, 3, 4),
-            _data(input_ids=torch.zeros(1, 3, dtype=torch.long)),
-            _loss_fn(LossInputType.DISTILLATION_CROSS_TOKENIZER),
-        )
+def test_cross_tokenizer_branch_routes_to_keystone(monkeypatch):
+    # The branch lazy-imports prepare_xtoken_cross_tokenizer_loss_input (M3.c) and
+    # packs its 5-tuple into the loss_input dict. Monkeypatch the keystone (the
+    # function-local import resolves the name at call time) and assert routing +
+    # the forwarded args + the packed result.
+    import dockyard_rl.algorithms.x_token.loss_utils as xlu
+
+    captured = {}
+    out = (object(), object(), object(), object(), object())  # tfl, sc, align, tp, cp
+
+    def fake_keystone(logits, data, *, vocab_parallel_group=None,
+                      context_parallel_group=None):
+        captured["logits"] = logits
+        captured["data"] = data
+        return out
+
+    monkeypatch.setattr(
+        xlu, "prepare_xtoken_cross_tokenizer_loss_input", fake_keystone
+    )
+    logits = torch.randn(1, 3, 4)
+    data = _data(input_ids=torch.zeros(1, 3, dtype=torch.long))
+    loss_input, _ = prepare_loss_input(
+        logits, data, _loss_fn(LossInputType.DISTILLATION_CROSS_TOKENIZER),
+    )
+    assert captured["logits"] is logits and captured["data"] is data
+    assert loss_input["logits"] is logits
+    assert loss_input["teacher_full_logits"] is out[0]
+    assert loss_input["student_logits_contig"] is out[1]
+    assert loss_input["align"] is out[2]
+    assert loss_input["tp_group"] is out[3]
+    assert loss_input["cp_group"] is out[4]
