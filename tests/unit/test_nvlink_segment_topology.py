@@ -9,8 +9,9 @@ import pytest
 
 from dockyard_rl.distributed.virtual_cluster import (
     NVLINK_DOMAIN_UNKNOWN,
-    TOPO_RANK_UNKNOWN,
+    RayVirtualCluster,
     ResourceInsufficiencyError,
+    TOPO_RANK_UNKNOWN,
     _parse_topology_from_resources,
     _sort_bundle_indices_by_topology,
     prepare_segment_topology,
@@ -153,3 +154,46 @@ def test_sort_segment_size_drops_incomplete_domain_bundles():
         bundle_data, segment_size=2, gpus_per_node=1
     )
     assert order == [0, 1]  # B's lone node discarded
+
+
+# -- RayVirtualCluster wiring (constructor params + bundle-spec pinning) -------
+# Constructing the cluster only stores params (no Ray); the placement-group
+# scheduling + the topology actor reads are cluster-bound (HV-deferred).
+
+def test_cluster_stores_segment_size_and_constraints():
+    vc = RayVirtualCluster(
+        [2, 2], segment_size=1,
+        node_resource_constraints=[{"nvlink_domain_A": 0.001}, {"nvlink_domain_B": 0.001}],
+    )
+    assert vc._segment_size == 1
+    assert len(vc._node_resource_constraints) == 2
+
+
+def test_cluster_defaults_have_no_topology():
+    vc = RayVirtualCluster([2])
+    assert vc._segment_size is None
+    assert vc._node_resource_constraints is None
+
+
+def test_node_bundle_specs_merge_domain_pin():
+    vc = RayVirtualCluster(
+        [2, 2],
+        node_resource_constraints=[{"nvlink_domain_A": 0.001}, {"nvlink_domain_B": 0.001}],
+    )
+    b0 = vc._node_bundle_specs(0, 2, 1.0, 1.0)
+    assert b0 == [{"CPU": 1.0, "GPU": 1.0, "nvlink_domain_A": 0.001}] * 2
+    b1 = vc._node_bundle_specs(1, 2, 1.0, 1.0)
+    assert b1[0]["nvlink_domain_B"] == 0.001
+    # Each bundle is an independent dict (no shared mutable state).
+    b0[0]["CPU"] = 99.0
+    assert b0[1]["CPU"] == 1.0
+
+
+def test_node_bundle_specs_plain_without_constraints():
+    vc = RayVirtualCluster([2])
+    assert vc._node_bundle_specs(0, 2, 1.0, 1.0) == [{"CPU": 1.0, "GPU": 1.0}] * 2
+
+
+def test_cluster_rejects_mismatched_constraint_length():
+    with pytest.raises(AssertionError, match="one entry per logical node"):
+        RayVirtualCluster([2, 2], node_resource_constraints=[{"nvlink_domain_A": 0.001}])

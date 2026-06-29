@@ -412,6 +412,8 @@ class RayVirtualCluster:
         num_gpus_per_node: int = 8,
         name: str = "",
         placement_group_strategy: str = "SPREAD",
+        segment_size: int | None = None,
+        node_resource_constraints: list[dict[str, float]] | None = None,
     ) -> None:
         """Initialise a virtual cluster.
 
@@ -433,12 +435,22 @@ class RayVirtualCluster:
                 Ray placement group strategy for the top-level group
                 (SPREAD | PACK | STRICT_PACK).  Per-node sub-groups
                 always use STRICT_PACK regardless of this setting.
+            segment_size:
+                NVLink-domain segment size for topology-aware bundle
+                ordering in the unified-PG path. ``None`` keeps the legacy
+                ``(node_id, gpu_id)`` ordering. See
+                :func:`prepare_segment_topology` for producing the matching
+                ``node_resource_constraints``.
+            node_resource_constraints:
+                Per-logical-node domain-pinning dicts (e.g.
+                ``{"nvlink_domain_X": 0.001}``) from
+                :func:`prepare_segment_topology`; merged into each node's
+                bundle specs so Ray schedules them on the selected NVLink
+                domains. ``None`` (default) reserves no domain resource.
+                When set, length must equal ``len(bundle_ct_per_node_list)``.
         """
-        if use_gpus:
-            assert num_gpus_per_node > 0, (
-                "num_gpus_per_node must be > 0 when use_gpus=True"
-            )
-
+        # Set instance state before validating so a failed assert still leaves a
+        # GC-safe object (shutdown reads _node_placement_groups at __del__ time).
         self._bundle_ct_per_node_list    = bundle_ct_per_node_list
         self._world_size                 = sum(bundle_ct_per_node_list)
         self._node_placement_groups: Optional[list[PlacementGroup]] = None
@@ -449,6 +461,37 @@ class RayVirtualCluster:
         self.max_colocated_worker_groups   = max_colocated_worker_groups
         self.name                          = name
         self.placement_group_strategy      = placement_group_strategy
+        self._segment_size                 = segment_size
+        self._node_resource_constraints    = node_resource_constraints
+
+        if use_gpus:
+            assert num_gpus_per_node > 0, (
+                "num_gpus_per_node must be > 0 when use_gpus=True"
+            )
+        if node_resource_constraints is not None:
+            assert len(node_resource_constraints) == len(bundle_ct_per_node_list), (
+                "node_resource_constraints must have one entry per logical node "
+                f"({len(node_resource_constraints)} != "
+                f"{len(bundle_ct_per_node_list)})."
+            )
+
+    def _node_bundle_specs(
+        self,
+        node_idx: int,
+        count: int,
+        cpus_per_bundle: float,
+        gpus_per_bundle: float,
+    ) -> list[dict[str, float]]:
+        """Bundle specs for one logical node, with the NVLink-domain pin merged in.
+
+        Each bundle reserves ``{CPU, GPU}``; when ``node_resource_constraints`` is
+        set, this node's domain constraint (e.g. ``{nvlink_domain_X: 0.001}``) is
+        merged into every bundle so Ray pins the node to that NVLink domain.
+        """
+        base: dict[str, float] = {"CPU": cpus_per_bundle, "GPU": gpus_per_bundle}
+        if self._node_resource_constraints is not None:
+            base = {**base, **self._node_resource_constraints[node_idx]}
+        return [dict(base) for _ in range(count)]
 
     # Public placement group API
     def _init_placement_groups(
@@ -665,11 +708,14 @@ class RayVirtualCluster:
 
         if use_unified_pg:
             # Single group spanning all nodes — required for cross-node TP.
-            all_bundles: list[dict[str, float]] = [
-                {"CPU": cpus_per_bundle, "GPU": gpus_per_bundle}
-                for count in self._bundle_ct_per_node_list
-                for _ in range(count)
-            ]
+            # Each node's bundles carry that node's NVLink-domain pin (if any).
+            all_bundles: list[dict[str, float]] = []
+            for node_idx, count in enumerate(self._bundle_ct_per_node_list):
+                all_bundles.extend(
+                    self._node_bundle_specs(
+                        node_idx, count, cpus_per_bundle, gpus_per_bundle
+                    )
+                )
             pgs = [
                 placement_group(
                     bundles=all_bundles,
@@ -686,10 +732,9 @@ class RayVirtualCluster:
             for node_idx, count in enumerate(self._bundle_ct_per_node_list):
                 if count <= 0:
                     continue
-                node_bundles: list[dict[str, float]] = [
-                    {"CPU": cpus_per_bundle, "GPU": gpus_per_bundle}
-                    for _ in range(count)
-                ]
+                node_bundles = self._node_bundle_specs(
+                    node_idx, count, cpus_per_bundle, gpus_per_bundle
+                )
                 pgs.append(
                     placement_group(
                         bundles=node_bundles,
@@ -722,10 +767,14 @@ class RayVirtualCluster:
         return pgs
 
     def _get_sorted_bundle_indices(self) -> Optional[list[int]]:
-        """Return bundle indices sorted by (node_id, gpu_id).
+        """Return bundle indices in topology-aware order.
 
-        Only valid after a unified placement group has been created.
-        Returns None for CPU-only or per-node cluster types.
+        Reads each bundle's ``(gpu_id, nvlink_domain, topo_rank, node_id)`` and
+        delegates to :func:`_sort_bundle_indices_by_topology`: with NVLink-domain
+        info present, ranks follow the physical topology (and ``segment_size``, if
+        set, discards incomplete-segment domains); otherwise it falls back to the
+        legacy ``(node_id, gpu_id)`` order. Only valid after a unified placement
+        group; returns ``None`` for CPU-only or per-node cluster types.
         """
         if self._node_placement_groups is None:
             raise ValueError(
@@ -759,9 +808,18 @@ class RayVirtualCluster:
         for a in info_actors:
             ray.kill(a)  # type: ignore[arg-type]
 
-        # Sort: primary key = node_id, secondary = gpu_id.
-        bundle_infos = [(i, node_ids[i], gpu_ids[i]) for i in range(n)]
-        return [
-            b[0]
-            for b in sorted(bundle_infos, key=lambda x: (x[1], x[2]))
+        # Look up each bundle's NVLink domain / topo_rank from the registered Ray
+        # resources, then delegate to the (unit-tested) topology sort. With no
+        # domain info this reproduces the legacy (node_id, gpu_id) order.
+        topology = get_ray_cluster_topology()
+        bundle_data = [
+            (gpu_ids[i], *topology.get(
+                node_ids[i], (NVLINK_DOMAIN_UNKNOWN, TOPO_RANK_UNKNOWN)
+            ), node_ids[i])
+            for i in range(n)
         ]
+        return _sort_bundle_indices_by_topology(
+            bundle_data,
+            segment_size=self._segment_size,
+            gpus_per_node=self.num_gpus_per_node,
+        )
