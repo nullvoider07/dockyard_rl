@@ -2288,6 +2288,36 @@ def vocab_parallel_log_softmax(
     return torch.log_softmax(scaled, dim=-1)
 
 
+def vocab_parallel_full_log_softmax(
+    logits: torch.Tensor,
+    temperature: float,
+    *,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> torch.Tensor:
+    """TP-aware ``log_softmax`` gathered to the full vocab ``[B, T, V]``.
+
+    Unlike :func:`vocab_parallel_log_softmax` (which keeps the result
+    vocab-sharded), callers that slice arbitrary vocab indices need the full
+    vocab axis. With ``tp_group`` world > 1 the sharded log-probs are gathered
+    with the autograd-aware ``torch.distributed.nn.functional.all_gather`` (so the
+    gradient routes back to each rank's shard) and concatenated in rank order — a
+    framework-free tensor-model-parallel vocab gather. Otherwise a plain local
+    ``log_softmax``. DTensor inputs are unwrapped to their local shard.
+    """
+    if isinstance(logits, DTensor):
+        logits = logits.to_local()
+    scaled = logits.float() / temperature
+    if tp_group is not None and torch.distributed.get_world_size(tp_group) > 1:
+        from torch.distributed.nn.functional import all_gather as _autograd_all_gather
+
+        sharded_log_probs = _compute_distributed_log_softmax_with_grad(
+            scaled, group=tp_group
+        )
+        gathered = _autograd_all_gather(sharded_log_probs, group=tp_group)
+        return torch.cat(list(gathered), dim=-1)
+    return torch.log_softmax(scaled, dim=-1)
+
+
 def vocab_parallel_argmax(
     logits: torch.Tensor,
     *,

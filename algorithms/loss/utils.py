@@ -134,8 +134,9 @@ def prepare_loss_input(
         (possibly updated) data dict.
 
     Raises:
-        NotImplementedError: ``DRAFT`` input prep is not ported (Megatron-coupled
-            upstream; the draft path is outside the cross-tokenizer scope).
+        NotImplementedError: ``DRAFT`` input prep is not ported (the upstream
+            draft branch depends on the model-parallel framework dockyard
+            excludes; the draft path is outside the cross-tokenizer scope).
         ValueError: unknown ``input_type``.
     """
     if loss_fn.input_type == LossInputType.LOGIT:
@@ -242,10 +243,10 @@ def prepare_loss_input(
     elif loss_fn.input_type == LossInputType.DRAFT:
         raise NotImplementedError(
             "DRAFT loss-input preparation is not ported: the upstream DRAFT "
-            "branch is Megatron-coupled (roll_tensor / "
-            "gather_from_tensor_model_parallel_region) and the speculative-decode "
-            "draft path is outside the cross-tokenizer scope. Build a "
-            "DTensor-native DRAFT branch when that path is taken up."
+            "branch depends on the model-parallel framework dockyard excludes "
+            "(its next-token tensor roll + vocab-parallel gather), and the "
+            "speculative-decode draft path is outside the cross-tokenizer scope. "
+            "Build a DTensor-native DRAFT branch when that path is taken up."
         )
 
     else:
