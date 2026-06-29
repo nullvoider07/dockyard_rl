@@ -197,3 +197,60 @@ def test_node_bundle_specs_plain_without_constraints():
 def test_cluster_rejects_mismatched_constraint_length():
     with pytest.raises(AssertionError, match="one entry per logical node"):
         RayVirtualCluster([2, 2], node_resource_constraints=[{"nvlink_domain_A": 0.001}])
+
+
+# -- FleetSpec topology threading ---------------------------------------------
+# FleetSpec is a pure dataclass; build_cluster with segment_size=None does no
+# live Ray read. The segment_size>0 build path (prepare_segment_topology ->
+# ray.nodes()) is cluster-bound (HV-deferred).
+
+def test_fleetspec_segment_size_defaults_none_and_stores():
+    from dockyard_rl.cluster.fleet import FLEET_TRAINER, FleetSpec
+
+    assert FleetSpec(
+        role=FLEET_TRAINER, num_nodes=1, gpus_per_node=8, placement_strategy="SPREAD"
+    ).segment_size is None
+    assert FleetSpec(
+        role=FLEET_TRAINER, num_nodes=4, gpus_per_node=8,
+        placement_strategy="SPREAD", segment_size=2,
+    ).segment_size == 2
+
+
+def test_fleetspec_segment_size_validations():
+    from dockyard_rl.cluster.fleet import FLEET_SANDBOX, FLEET_TRAINER, FleetSpec
+
+    # indivisible num_nodes
+    with pytest.raises(ValueError, match="divisible"):
+        FleetSpec(role=FLEET_TRAINER, num_nodes=3, gpus_per_node=8,
+                  placement_strategy="SPREAD", segment_size=2)
+    # below 1
+    with pytest.raises(ValueError, match="segment_size must be >= 1"):
+        FleetSpec(role=FLEET_TRAINER, num_nodes=4, gpus_per_node=8,
+                  placement_strategy="SPREAD", segment_size=0)
+    # sandbox (CPU) forbidden
+    with pytest.raises(ValueError, match="sandbox"):
+        FleetSpec(role=FLEET_SANDBOX, num_nodes=4, gpus_per_node=0,
+                  placement_strategy="SPREAD", segment_size=2)
+
+
+def test_fleetspec_from_env_parses_segment_size(monkeypatch):
+    from dockyard_rl.cluster.fleet import FleetSpec
+
+    monkeypatch.setenv("DOCKYARD_FLEET_ROLE", "trainer")
+    monkeypatch.setenv("DOCKYARD_NUM_NODES", "4")
+    monkeypatch.setenv("DOCKYARD_GPUS_PER_NODE", "8")
+    monkeypatch.setenv("DOCKYARD_SEGMENT_SIZE", "2")
+    assert FleetSpec.from_env().segment_size == 2
+    monkeypatch.delenv("DOCKYARD_SEGMENT_SIZE")
+    assert FleetSpec.from_env().segment_size is None
+
+
+def test_build_cluster_without_segment_size_is_legacy():
+    # segment_size=None => no live topology read => cluster has no constraints.
+    from dockyard_rl.cluster.fleet import FLEET_TRAINER, FleetSpec, build_cluster
+
+    vc = build_cluster(FleetSpec(
+        role=FLEET_TRAINER, num_nodes=2, gpus_per_node=8, placement_strategy="SPREAD",
+    ))
+    assert vc._segment_size is None
+    assert vc._node_resource_constraints is None

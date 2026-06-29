@@ -248,9 +248,28 @@ fi
 # request env.osworld.node_resources={kvm: ...} land only here. Mirrors the local
 # auto-declare in cluster/bootstrap.py (DOCKYARD_KVM_SLOTS, default 8).
 cat <<EOFI | tee /launch-head.sh
+# NVLink-domain topology probe (J): when DOCKYARD_SEGMENT_SIZE is set, register
+# this node's NVLink fabric id + topological rank as Ray custom resources so
+# virtual_cluster's topology-aware placement (prepare_segment_topology /
+# _sort_bundle_indices_by_topology) can group collective ranks within one fabric.
+# Emits a leading-comma JSON fragment, or stays empty (default path unchanged).
+RAY_TOPOLOGY_RESOURCES=""
+if [[ -n "\${DOCKYARD_SEGMENT_SIZE:-}" ]]; then
+    CLUSTER_UUID=\$(nvidia-smi -q 2>/dev/null \\
+        | grep -m1 -i "ClusterUUID" | awk -F: '{gsub(/[ \\t]/,"",\$2); print \$2}')
+    if [[ -n "\$CLUSTER_UUID" ]]; then
+        TOPO_RANK=\$(echo "\${SLURM_TOPOLOGY_ADDR:-}" | grep -oE '[0-9]+' | tail -1)
+        TOPO_RANK="\${TOPO_RANK:-\${SLURM_PROCID:-\$(hostname | grep -oE '[0-9]+' | tail -1)}}"
+        TOPO_RANK="\${TOPO_RANK:-0}"
+        RAY_TOPOLOGY_RESOURCES=", \"nvlink_domain_\${CLUSTER_UUID}\": 1, \"topo_rank\": \${TOPO_RANK}"
+        echo "[TOPOLOGY] head node: nvlink_domain_\${CLUSTER_UUID}, topo_rank \${TOPO_RANK}"
+    else
+        echo "[TOPOLOGY] DOCKYARD_SEGMENT_SIZE set but no ClusterUUID from nvidia-smi; unordered allocation"
+    fi
+fi
 ray start --head \\
     --disable-usage-stats \\
-    --resources='{"worker_units": $GPUS_PER_NODE, "dockyard_managed_ray_cluster": 1}' \\
+    --resources="{\"worker_units\": $GPUS_PER_NODE, \"dockyard_managed_ray_cluster\": 1\${RAY_TOPOLOGY_RESOURCES}}" \\
     --node-ip-address="$head_node_ip" \\
     --port=${PORT} \\
     --ray-client-server-port=${RAY_CLIENT_SERVER_PORT} \\
@@ -357,9 +376,26 @@ if [[ -f "\$NSIGHT_PY" ]]; then
 fi
 
 cat <<EOFI | tee /launch-worker.sh
+# NVLink-domain topology probe (J) — see /launch-head.sh for rationale. Each
+# worker node registers its own nvlink_domain_<ClusterUUID> + topo_rank so the
+# cluster topology read sees every node. Empty fragment => default path unchanged.
+RAY_TOPOLOGY_RESOURCES=""
+if [[ -n "\${DOCKYARD_SEGMENT_SIZE:-}" ]]; then
+    CLUSTER_UUID=\$(nvidia-smi -q 2>/dev/null \\
+        | grep -m1 -i "ClusterUUID" | awk -F: '{gsub(/[ \\t]/,"",\$2); print \$2}')
+    if [[ -n "\$CLUSTER_UUID" ]]; then
+        TOPO_RANK=\$(echo "\${SLURM_TOPOLOGY_ADDR:-}" | grep -oE '[0-9]+' | tail -1)
+        TOPO_RANK="\${TOPO_RANK:-\${SLURM_PROCID:-\$(hostname | grep -oE '[0-9]+' | tail -1)}}"
+        TOPO_RANK="\${TOPO_RANK:-0}"
+        RAY_TOPOLOGY_RESOURCES=", \"nvlink_domain_\${CLUSTER_UUID}\": 1, \"topo_rank\": \${TOPO_RANK}"
+        echo "[TOPOLOGY] worker node: nvlink_domain_\${CLUSTER_UUID}, topo_rank \${TOPO_RANK}"
+    else
+        echo "[TOPOLOGY] DOCKYARD_SEGMENT_SIZE set but no ClusterUUID from nvidia-smi; unordered allocation"
+    fi
+fi
 ray start --address "$ip_head" \\
     --disable-usage-stats \\
-    --resources='{"worker_units": $GPUS_PER_NODE, "dockyard_managed_ray_cluster": 1}' \\
+    --resources="{\"worker_units\": $GPUS_PER_NODE, \"dockyard_managed_ray_cluster\": 1\${RAY_TOPOLOGY_RESOURCES}}" \\
     --min-worker-port=${MIN_WORKER_PORT} \\
     --max-worker-port=${MAX_WORKER_PORT} \\
     --node-manager-port=${NODE_MANAGER_PORT} \\
