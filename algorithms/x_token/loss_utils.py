@@ -756,3 +756,210 @@ def next_token_accuracy(
             torch.distributed.all_reduce(stats, group=cp_group)
             correct, denom = stats[0], stats[1]
         return correct / denom.clamp(min=1.0)
+
+
+# ---------------------------------------------------------------------------
+# Node-local CUDA-IPC teacher-logit transport (consumer side).
+#
+# The producer (teacher worker) exports full-vocab logit shards as CUDA-IPC
+# handle dicts; these functions reassemble them into the student rank's
+# ``[B, T_t/CP_s, V_t]`` teacher logits. ``collect_overlapping_teacher_shards``
+# is pure seq/vocab-overlap arithmetic (CPU-testable); the IPC reads route
+# through ``rebuild_cuda_tensor_from_ipc`` (imported function-locally; GPU-only,
+# HV-deferred). The cross-cluster transport reassembles to the same contract so
+# the loss body stays transport-blind.
+# ---------------------------------------------------------------------------
+def collect_overlapping_teacher_shards(
+    teacher_shards: list[dict[str, Any]],
+    student_cp_rank: int,
+    student_cp_size: int,
+    full_seq_len: int,
+) -> list[tuple[dict[str, Any], slice, slice, slice, slice]]:
+    """Plan ``(src_seq, src_vocab, dest_seq, dest_vocab)`` slices per teacher shard.
+
+    Dest is ``[T_t/CP_s, V_t]`` (vocab fully reassembled, seq is this student CP
+    rank's range). Shards with no seq overlap are skipped.
+    """
+    student_seq_start = student_cp_rank * full_seq_len // student_cp_size
+    student_seq_end = (student_cp_rank + 1) * full_seq_len // student_cp_size
+
+    matches: list[tuple[dict[str, Any], slice, slice, slice, slice]] = []
+    for handle in teacher_shards:
+        teacher_vocab_start = int(handle["vocab_start_index"])
+        teacher_vocab_end = int(handle["vocab_end_index"])
+        teacher_seq_start = int(handle["global_seq_start"])
+        teacher_seq_end = teacher_seq_start + int(handle["actual_shape"][0])
+
+        overlap_seq_start = max(student_seq_start, teacher_seq_start)
+        overlap_seq_end = min(student_seq_end, teacher_seq_end)
+        if overlap_seq_end <= overlap_seq_start:
+            continue
+
+        src_seq = slice(
+            overlap_seq_start - teacher_seq_start,
+            overlap_seq_end - teacher_seq_start,
+        )
+        src_vocab = slice(0, teacher_vocab_end - teacher_vocab_start)
+        dest_seq = slice(
+            overlap_seq_start - student_seq_start,
+            overlap_seq_end - student_seq_start,
+        )
+        dest_vocab = slice(teacher_vocab_start, teacher_vocab_end)
+        matches.append((handle, src_seq, src_vocab, dest_seq, dest_vocab))
+    return matches
+
+
+def assemble_teacher_logits_from_shards(
+    teacher_shards: list[dict[str, Any]],
+    student_cp_rank: int,
+    student_cp_size: int,
+    device: int,
+) -> torch.Tensor:
+    """P2P-IPC-read overlapping teacher shards into a ``[T_t/CP_s, V_t]`` dest.
+
+    ``device`` is a CUDA device index (matches
+    :func:`rebuild_cuda_tensor_from_ipc`'s ``device_id`` signature).
+    """
+    from dockyard_rl.models.policy.utils import rebuild_cuda_tensor_from_ipc
+
+    if not teacher_shards:
+        raise ValueError("teacher_shards must be non-empty")
+    full_seq_len = int(teacher_shards[0]["full_seq_len"])
+    full_vocab_size = int(teacher_shards[0]["full_vocab_size"])
+    # CP seq-padding guarantees this; assert it so the contiguous-window math
+    # below (and the `dest` size) can't silently go out of bounds if a caller
+    # ever passes an unpadded length.
+    assert full_seq_len % student_cp_size == 0, (
+        f"full_seq_len={full_seq_len} not divisible by student_cp_size={student_cp_size}"
+    )
+    local_seq_len = full_seq_len // student_cp_size
+
+    dest = torch.zeros(
+        (local_seq_len, full_vocab_size),
+        dtype=torch.float32,
+        device=device,
+    )
+    matches = collect_overlapping_teacher_shards(
+        teacher_shards,
+        student_cp_rank=student_cp_rank,
+        student_cp_size=student_cp_size,
+        full_seq_len=full_seq_len,
+    )
+    for handle, src_seq, src_vocab, dest_seq, dest_vocab in matches:
+        # Producer's IPC payload is the full contiguous storage
+        # [N_microbatches, B_mb, T_t_local, V_t_local]; index the slot then the
+        # sample row, then apply the seq/vocab overlap slices.
+        src_full = rebuild_cuda_tensor_from_ipc(handle["payload_ipc"], device).detach()
+        buf_idx = int(handle["buf_idx"])
+        sample_idx = int(handle["sample_index_in_buf"])
+        local_seq_t, local_vocab_t = handle["actual_shape"]
+        src = src_full[buf_idx, sample_idx, :local_seq_t, :local_vocab_t]
+        dest[dest_seq, dest_vocab] = src[src_seq, src_vocab].to(torch.float32)
+    return dest
+
+
+def _try_zero_copy_teacher_logits(
+    per_sample_entries: list[dict[str, Any]],
+    *,
+    student_cp_rank: int,
+    student_cp_size: int,
+    device: int,
+) -> Optional[torch.Tensor]:
+    """Zero-copy ``[B, T_t/CP_s, V_t]`` view of the teacher logits, or None.
+
+    Returns a view into the producer's IPC storage only when reassembly is
+    unnecessary: every sample's seq range is covered by a single full-vocab
+    teacher shard (i.e. teacher ``tp_size == 1`` and ``teacher_cp == student_cp``
+    or ``teacher_cp == 1``), and the microbatch's samples are a contiguous slab
+    (same payload + ``buf_idx``, sample rows ``0..B-1``) in one storage slot.
+    Otherwise returns None and the caller falls back to assemble + stack.
+    """
+    if not per_sample_entries:
+        return None
+    from dockyard_rl.models.policy.utils import rebuild_cuda_tensor_from_ipc
+
+    first_shards = per_sample_entries[0]["teacher_shards"]
+    if not first_shards:
+        return None
+    full_seq_len = int(first_shards[0]["full_seq_len"])
+    full_vocab_size = int(first_shards[0]["full_vocab_size"])
+    student_seq_start = student_cp_rank * full_seq_len // student_cp_size
+    student_seq_end = (student_cp_rank + 1) * full_seq_len // student_cp_size
+
+    # Exactly one full-vocab shard must cover this student rank's seq range.
+    chosen: list[dict[str, Any]] = []
+    for entry in per_sample_entries:
+        covering = [
+            h
+            for h in entry["teacher_shards"]
+            if int(h["vocab_start_index"]) == 0
+            and int(h["vocab_end_index"]) == full_vocab_size
+            and int(h["global_seq_start"]) <= student_seq_start
+            and int(h["global_seq_start"]) + int(h["actual_shape"][0])
+            >= student_seq_end
+        ]
+        if len(covering) != 1:
+            return None
+        chosen.append(covering[0])
+
+    # All samples must form a contiguous slab in one storage slot.
+    h0 = chosen[0]
+    payload = h0["payload_ipc"]
+    buf_idx = int(h0["buf_idx"])
+    teacher_seq_start = int(h0["global_seq_start"])
+    for i, h in enumerate(chosen):
+        if (
+            h["payload_ipc"] != payload
+            or int(h["buf_idx"]) != buf_idx
+            or int(h["sample_index_in_buf"]) != i
+            or int(h["global_seq_start"]) != teacher_seq_start
+        ):
+            return None
+
+    src_full = rebuild_cuda_tensor_from_ipc(payload, device).detach()
+    seq_lo = student_seq_start - teacher_seq_start
+    seq_hi = student_seq_end - teacher_seq_start
+    return src_full[buf_idx, : len(chosen), seq_lo:seq_hi, :full_vocab_size]
+
+
+def rebuild_teacher_full_logits_from_ipc(
+    per_sample_entries: list[dict[str, Any]],
+    cp_group: Optional[torch.distributed.ProcessGroup],
+    device: int,
+) -> torch.Tensor:
+    """Rebuild ``[B, T_t/CP_s, V_t]`` teacher logits for this student rank.
+
+    Fast path (zero-copy view via :func:`_try_zero_copy_teacher_logits`): when the
+    teacher is not vocab-sharded and each sample's seq range is covered by a
+    single shard, return a view into the IPC storage. Otherwise reassemble each
+    sample from its overlapping shards and stack.
+    """
+    student_cp_rank = (
+        torch.distributed.get_rank(cp_group) if cp_group is not None else 0
+    )
+    student_cp_size = (
+        torch.distributed.get_world_size(cp_group) if cp_group is not None else 1
+    )
+
+    # Bypass: when the teacher layout lines up with this student rank (no vocab
+    # sharding, seq covered by one shard), skip reassembly and return a zero-copy
+    # view of the IPC storage. Returns None when reassembly is needed.
+    view = _try_zero_copy_teacher_logits(
+        per_sample_entries,
+        student_cp_rank=student_cp_rank,
+        student_cp_size=student_cp_size,
+        device=device,
+    )
+    if view is not None:
+        return view
+
+    rebuilt = [
+        assemble_teacher_logits_from_shards(
+            entry["teacher_shards"],
+            student_cp_rank=student_cp_rank,
+            student_cp_size=student_cp_size,
+            device=device,
+        )
+        for entry in per_sample_entries
+    ]
+    return torch.stack(rebuilt, dim=0)
