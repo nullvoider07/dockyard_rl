@@ -1,4 +1,4 @@
-"""CPU tests for the xtoken CP-localized CE / accuracy helpers (M2.c).
+"""CPU tests for the xtoken CP-localized CE / accuracy helpers.
 
 Covers the single-rank / non-DTensor paths of student_next_token_ce,
 ce_label_mask, next_token_accuracy, and localize_alignment. The DTensor and

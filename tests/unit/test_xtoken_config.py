@@ -1,4 +1,4 @@
-"""CPU validation of the xtoken_distillation example config (M4.b).
+"""CPU validation of the xtoken_distillation example config.
 
 Confirms the example YAML is coherent: the loss_fn section constructs
 CrossTokenizerDistillationLossFn (with runtime-injected vocab sizes), the

@@ -20,10 +20,10 @@ transport and no live process group, so they validate on CPU:
   data-dict keys into an :class:`AlignmentBatch`.
 
 The TP/CP-collective wrappers (``group_all_reduce_sum_with_grad`` and the
-CP-localization / IPC teacher-logit rebuild) are deferred to the M3 transport
-layer; the two functions here that reduce across a TP/CP group import that
-helper lazily inside the ``world > 1`` branch, so the single-rank CPU path
-stays import-clean before those primitives land.
+CP-localization / IPC teacher-logit rebuild) live in the distributed and
+transport layers; the two functions here that reduce across a TP/CP group import
+that helper lazily inside the ``world > 1`` branch, so the single-rank CPU path
+stays import-clean.
 """
 
 from __future__ import annotations
@@ -138,8 +138,8 @@ def chunk_average_log_probs(
     """
     chunk_sums, chunk_sizes = chunk_log_prob_sums(log_probs, chunk_id, max_chunks)
     if cp_group is not None and torch.distributed.get_world_size(cp_group) > 1:
-        # CP/TP collective lands with the M3 transport layer; imported lazily
-        # so the single-rank CPU path here stays import-clean until then.
+        # CP/TP collective lives in the distributed layer; imported lazily so
+        # the single-rank CPU path here stays import-clean.
         from dockyard_rl.distributed.model_utils import group_all_reduce_sum_with_grad
 
         chunk_sums = group_all_reduce_sum_with_grad(chunk_sums, cp_group)
@@ -199,8 +199,8 @@ def project_student_to_teacher_vocab(
     flat = student_probs.reshape(batch_size * seq_len, local_vocab_size)
     tp_world = torch.distributed.get_world_size(tp_group) if tp_group is not None else 1
     if tp_world > 1:
-        # CP/TP collective lands with the M3 transport layer; imported lazily
-        # so the single-rank CPU path here stays import-clean until then.
+        # CP/TP collective lives in the distributed layer; imported lazily so
+        # the single-rank CPU path here stays import-clean.
         from dockyard_rl.distributed.model_utils import group_all_reduce_sum_with_grad
 
         tp_rank = torch.distributed.get_rank(tp_group)
@@ -1049,13 +1049,14 @@ def prepare_xtoken_cross_tokenizer_loss_input(
     the teacher full-vocab logits from the per-rank CUDA IPC handles and does the
     shared CP-resolution both loss paths need (contiguous student logits +
     localized, next-token-shifted alignment), plus the contiguous student
-    ``input_ids`` / ``token_mask`` the accuracy metric consumes (Contract 3 — the
-    P-KL ``next_token_accuracy`` reads them). TP/CP groups come from the student
-    ``logits``' device mesh, falling back to the passed groups for non-DTensor
-    logits. The teacher rebuild + ``cuda.current_device`` are GPU-only; the
-    CP-relayout / localize / shift glue collapses to the local op at world=1. The
-    cross-cluster transport (M3.b) reassembles teacher logits to the same
-    ``[B, T_t/CP_s, V_t]`` contract and plugs in at the rebuild step.
+    ``input_ids`` / ``token_mask`` the P-KL ``next_token_accuracy`` metric reads
+    (it requires them set here — ``localize_alignment`` leaves them ``None``).
+    TP/CP groups come from the student ``logits``' device mesh, falling back to
+    the passed groups for non-DTensor logits. The teacher rebuild +
+    ``cuda.current_device`` are GPU-only; the CP-relayout / localize / shift glue
+    collapses to the local op at world=1. The cross-cluster transport reassembles
+    teacher logits to the same ``[B, T_t/CP_s, V_t]`` contract and plugs in at the
+    rebuild step.
 
     Returns:
         ``(teacher_full_logits, student_logits_contig, align, tp_group, cp_group)``.

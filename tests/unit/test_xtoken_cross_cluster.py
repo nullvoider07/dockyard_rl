@@ -1,4 +1,4 @@
-"""CPU tests for the cross-cluster teacher-logit transport kernel (M3.b).
+"""CPU tests for the cross-cluster teacher-logit transport kernel.
 
 The encode (bf16 + seq-chunk) / decode (concat + CP-slice + fp32) round-trip is
 pure tensor logic and CPU round-trip testable; the data_plane put/get wiring is

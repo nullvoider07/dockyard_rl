@@ -1,10 +1,11 @@
-"""CPU tests for the cross-tokenizer loss-input keystone (M3.c).
+"""CPU tests for the cross-tokenizer loss-input keystone.
 
 prepare_xtoken_cross_tokenizer_loss_input rebuilds teacher logits from the
 transport and does the CP-resolution glue. The teacher rebuild + cuda device are
 GPU-only, so they're monkeypatched; the world=1 / non-DTensor glue (group
-derivation, identity CP relayout, next-token chunk-id shift, Contract 3
-student_input_ids / token_mask population) is exercised on CPU.
+derivation, identity CP relayout, next-token chunk-id shift, and the
+student_input_ids / token_mask population the accuracy metric requires) is
+exercised on CPU.
 """
 
 import torch
@@ -62,8 +63,8 @@ def test_keystone_sets_contract3_student_fields(monkeypatch):
     _, _, align, _, _ = prepare_xtoken_cross_tokenizer_loss_input(
         logits, data, vocab_parallel_group=None, context_parallel_group=None,
     )
-    # Contract 3: student_input_ids / token_mask populated (the P-KL accuracy
-    # metric reads them; localize_alignment leaves them None).
+    # student_input_ids / token_mask populated (the P-KL accuracy metric reads
+    # them; localize_alignment leaves them None).
     assert align.student_input_ids is not None
     assert align.student_token_mask is not None
     assert torch.equal(align.student_input_ids, data["input_ids"])  # world=1 identity
@@ -104,7 +105,7 @@ def test_keystone_cross_cluster_branch_end_to_end():
     )
     assert torch.equal(tfl, teacher.to(torch.bfloat16).float())
     assert torch.equal(student_contig, logits)
-    assert align.student_input_ids is not None  # Contract 3 still honored
+    assert align.student_input_ids is not None  # accuracy-metric fields still set
     assert align.student_chunk_id.tolist() == [[1, 2, -1, -1]]
 
 

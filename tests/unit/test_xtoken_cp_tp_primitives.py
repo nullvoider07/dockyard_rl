@@ -1,4 +1,4 @@
-"""CPU tests for the cross-tokenizer CP/TP primitives (M2.b).
+"""CPU tests for the cross-tokenizer CP/TP primitives.
 
 The cross-tokenizer loss body and the teacher-logit transport keystone invoke
 these unconditionally, so they must collapse to the plain local op at world<=1

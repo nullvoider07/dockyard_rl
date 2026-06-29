@@ -1,4 +1,4 @@
-"""CPU tests for the CrossTokenizerCollator (M4.a).
+"""CPU tests for the CrossTokenizerCollator.
 
 Exercised with a char-level fake tokenizer (the collator + TokenAligner only use
 a small tokenizer surface: __call__ -> input_ids/attention_mask,

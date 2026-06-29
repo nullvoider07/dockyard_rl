@@ -1,7 +1,7 @@
-"""CPU tests for the xtoken canonicalization layer (M1.a).
+"""CPU tests for the xtoken canonicalization layer.
 
-The DP alignment core (M1.b) depends on these pure string transforms, so they
-are built and tested first: token canonicalization, multi-token mojibake merges,
+The DP alignment core depends on these pure string transforms, so they are built
+and tested first: token canonicalization, multi-token mojibake merges,
 byte-value lookup, and byte-fallback re-merging into Unicode characters.
 """
 
@@ -158,7 +158,7 @@ def test_strings_equal_flexible_exact_vs_canonical():
     assert ta._strings_equal_flexible("Ġ.", ".", ignore_leading_char_diff=True)
 
 
-# -- DP core (M1.b): AlignmentPair + _align_single ----------------------------
+# -- DP core: AlignmentPair + _align_single -----------------------------------
 
 def _aligner():
     # Tokenizers are unused by _align_single / _align_dp (they take token lists).
@@ -240,7 +240,7 @@ def test_align_dp_score_and_traceback_identical():
     assert [p.s_start for p in pairs] == [0, 1]
 
 
-# -- M1.c: batch assembly + align() entry -------------------------------------
+# -- batch assembly + align() entry -------------------------------------------
 
 def test_pairs_to_batch_dense_tensors():
     pairs = [

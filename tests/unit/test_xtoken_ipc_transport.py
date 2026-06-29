@@ -1,4 +1,4 @@
-"""CPU tests for the node-local IPC transport slice-planning (M3.a).
+"""CPU tests for the node-local IPC transport slice-planning.
 
 Only collect_overlapping_teacher_shards is CPU-testable — it's pure seq/vocab
 overlap arithmetic that plans where each teacher shard lands in the student

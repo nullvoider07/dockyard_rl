@@ -1,11 +1,11 @@
-"""CPU tests for the xtoken loss math (M1.d).
+"""CPU tests for the xtoken loss math.
 
 These cover the single-rank, transport-free pieces of the cross-tokenizer
 distillation loss: the FP32 sparse-dense matmul autograd function, the
 chunk-average reductions, the sparse-projection contraction, top-k teacher
 selection, the projection-file loaders/caches, the common/uncommon exact-token
 partition, and the flat-batch rehydrator. The TP/CP-collective and CUDA-IPC
-paths are M3 and validate on hardware.
+paths are GPU-only and validate on hardware.
 """
 
 import torch

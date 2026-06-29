@@ -115,7 +115,8 @@ def prepare_loss_input(
     helpers and the cross-tokenizer keystone are imported inside their branches:
     ``mask_out_neg_inf_logprobs`` lives in ``dockyard_rl.algorithms.utils``,
     which imports this module (``calculate_kl``), so a module-level import would
-    be circular; and the cross-tokenizer teacher-logit rebuild is M3-deferred.
+    be circular; and the cross-tokenizer teacher-logit rebuild lives in the
+    transport layer (``x_token.loss_utils``).
 
     Args:
         logits: Student logits ``[B, T, V]`` from the worker forward (or, on the
@@ -217,8 +218,8 @@ def prepare_loss_input(
         # and do the shared CP-resolution both loss paths need; the loss fn does
         # the projection / chunk-average / KL reductions. The TP/CP groups are
         # derived from the student logits' device mesh. The keystone
-        # prepare_xtoken_cross_tokenizer_loss_input lands with the M3 transport
-        # layer; imported lazily so this dispatcher stays import-clean until then.
+        # prepare_xtoken_cross_tokenizer_loss_input lives in the transport layer
+        # and is imported lazily to keep this dispatcher import-clean.
         from dockyard_rl.algorithms.x_token.loss_utils import (
             prepare_xtoken_cross_tokenizer_loss_input,
         )

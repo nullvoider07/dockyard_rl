@@ -1,10 +1,10 @@
-"""CPU tests for CrossTokenizerDistillationLossFn (M2.d).
+"""CPU tests for CrossTokenizerDistillationLossFn.
 
 The loss is exercised single-rank / non-DTensor by passing synthetic
-teacher_full_logits + a LocalizedAlignment straight in (bypassing the M3
+teacher_full_logits + a LocalizedAlignment straight in (bypassing the
 transport). Covers the P-KL and gold paths, reverse-KL, dynamic loss scaling,
 the empty-valid-chunk early return, the (False gold, True xtoken) reject, and
-that sample_mask gating neutralizes a masked sample (M1-audit Contract 2).
+that sample_mask gating neutralizes a masked sample.
 """
 
 import torch
@@ -141,8 +141,8 @@ def test_all_samples_masked_gives_zero_loss_no_nan(tmp_path):
 
 
 def test_sample_mask_gates_a_masked_row_out_of_kl(tmp_path):
-    # Contract 2: a sample_mask=0 row must not contribute to the KL term. With
-    # two samples where the second is masked, num_valid_pairs counts only the
+    # A sample_mask=0 row must not contribute to the KL term. With two samples
+    # where the second is masked, num_valid_pairs counts only the
     # first sample's chunks.
     fn = CrossTokenizerDistillationLossFn(_cfg(_projection_file(tmp_path)))
     (loss, metrics), _ = _run(fn, b=2, sample_mask=torch.tensor([1.0, 0.0]))

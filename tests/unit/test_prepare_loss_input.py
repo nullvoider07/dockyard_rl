@@ -1,10 +1,10 @@
-"""CPU tests for the prepare_loss_input dispatcher (M2.a).
+"""CPU tests for the prepare_loss_input dispatcher.
 
 The dispatcher turns raw student logits into the per-input-type kwargs each loss
 fn consumes. These cover the non-parallel CPU paths of LOGIT / LOGPROB /
 DISTILLATION routing, the DRAFT NotImplementedError, the unknown-type
-ValueError, and that the DISTILLATION_CROSS_TOKENIZER branch is reached (its
-keystone is M3-deferred, so it raises ImportError until then).
+ValueError, and that the DISTILLATION_CROSS_TOKENIZER branch routes to the
+cross-tokenizer keystone and packs its result.
 """
 
 from types import SimpleNamespace
@@ -183,11 +183,11 @@ def test_unknown_input_type_raises_value_error():
         )
 
 
-# -- DISTILLATION_CROSS_TOKENIZER (routes to the M3.c keystone) ---------------
+# -- DISTILLATION_CROSS_TOKENIZER (routes to the keystone) --------------------
 
 def test_cross_tokenizer_branch_routes_to_keystone(monkeypatch):
-    # The branch lazy-imports prepare_xtoken_cross_tokenizer_loss_input (M3.c) and
-    # packs its 5-tuple into the loss_input dict. Monkeypatch the keystone (the
+    # The branch lazy-imports prepare_xtoken_cross_tokenizer_loss_input and packs
+    # its 5-tuple into the loss_input dict. Monkeypatch the keystone (the
     # function-local import resolves the name at call time) and assert routing +
     # the forwarded args + the packed result.
     import dockyard_rl.algorithms.x_token.loss_utils as xlu
