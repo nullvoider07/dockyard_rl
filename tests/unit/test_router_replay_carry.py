@@ -16,7 +16,10 @@ from typing import Optional
 import torch
 from torch import nn
 
-from dockyard_rl.data.llm_message_utils import batched_message_log_to_flat_message
+from dockyard_rl.data.llm_message_utils import (
+    backfill_routed_experts,
+    batched_message_log_to_flat_message,
+)
 from dockyard_rl.models.dtensor.moe.block import MoEBlock
 from dockyard_rl.models.dtensor.moe.router import TokenChoiceTopKRouter
 from dockyard_rl.models.dtensor.moe.router_replay import bind_router_replay
@@ -68,6 +71,9 @@ def _message_log(msg_len: int, start: int) -> list:
 
 
 def _collate(batch):
+    # Mirror the real pipeline order: the routing backfill (run inside
+    # add_grpo_token_loss_masks_and_generation_logprobs) precedes the flatten.
+    backfill_routed_experts(batch, sentinel=MISSING_ROUTE_SENTINEL)
     return batched_message_log_to_flat_message(
         batch,
         pad_value_dict={
@@ -132,6 +138,36 @@ def test_carried_column_layer_count_mismatch_raises():
         assert "does not match" in str(e)
     else:
         raise AssertionError("expected ValueError on layer-count mismatch")
+
+
+def test_prompt_message_routing_stays_position_aligned():
+    # Regression: a realistic log has a prompt message (tokens, no routing)
+    # before the assistant turn. Without the routing backfill the assistant
+    # routes are silently placed onto the prompt positions; with it they must
+    # land at the assistant positions and the prompt stays sentinel.
+    log = [
+        {"role": "user", "token_ids": torch.arange(4, dtype=torch.int64)},
+        {
+            "role": "assistant",
+            "token_ids": torch.arange(3, dtype=torch.int64),
+            "routed_experts": _routes(3, 0),
+        },
+    ]
+    flat, _ = _collate([log])
+    assert flat["token_ids"].shape[1] == flat["routed_experts"].shape[1], (
+        f"MISALIGNED length: token_ids={tuple(flat['token_ids'].shape)} "
+        f"routed_experts={tuple(flat['routed_experts'].shape)}"
+    )
+    routed = flat["routed_experts"][0]
+    # The assistant routes must land at the ASSISTANT token positions [4:7],
+    # not at the prompt positions [0:4]; prompt positions must be sentinel.
+    assert (routed[:4] == MISSING_ROUTE_SENTINEL).all(), (
+        "prompt positions should be sentinel; assistant routing was misplaced "
+        "onto the prompt region"
+    )
+    assert torch.equal(routed[4:7], _routes(3, 0)), (
+        "assistant routing not aligned to the assistant token positions"
+    )
 
 
 def test_multi_turn_message_log_concatenates_routes():

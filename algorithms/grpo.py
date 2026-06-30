@@ -55,6 +55,7 @@ from dockyard_rl.data.dataloader import MultipleDataloaderWrapper
 from dockyard_rl.data.datasets.utils import extract_necessary_env_names
 from dockyard_rl.data_plane.interfaces import DataPlaneConfig
 from dockyard_rl.data.llm_message_utils import (
+    backfill_routed_experts,
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
 )
@@ -964,7 +965,16 @@ def add_grpo_token_loss_masks_and_generation_logprobs(message_logs: list) -> Non
     field — not the role alone — marks the trainable tokens. Mutates each message
     in place: sets token_loss_mask, and fills a zero generation_logprobs when
     absent.
+
+    Router-replay (#2908): the captured routed_experts column rides only on
+    rollout-generated assistant messages, so — exactly like generation_logprobs —
+    every other message must be backfilled with a sentinel placeholder of the
+    right token length, or the message_log->flat concatenation would place the
+    assistant routing at the wrong (prompt) token offsets
+    (backfill_routed_experts; the sentinel makes the trainer fall back to its own
+    routing on the non-replayed positions).
     """
+    backfill_routed_experts(message_logs, sentinel=MISSING_ROUTE_SENTINEL)
     for message_log in message_logs:
         for message in message_log:
             token_ids = message["token_ids"]
