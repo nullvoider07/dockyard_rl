@@ -173,6 +173,16 @@ policy:
   megatron_cfg:
     enabled: false
 
+  # MoE router-replay (#2908): capture generation's per-token top-K expert
+  # selection (vLLM) and replay it in the trainer's MoE forward so train/logprob
+  # routing matches generation, removing the router-nondeterminism component of
+  # the train/generation logprob mismatch. MoE models only. Incompatible with
+  # sequence_packing / dynamic_batching / context parallelism (the recorded
+  # routing is bound to the unpacked right-padded token layout; fails fast at
+  # worker setup). Off by default — the generation/train paths are unchanged.
+  router_replay:
+    enabled: false
+
   draft:
     enabled: false
     model_name: null

@@ -67,6 +67,9 @@ from dockyard_rl.experience.rollouts import (
 from dockyard_rl.models.generation.interfaces import GenerationInterface
 from dockyard_rl.models.generation.sglang import SGLangConfig, SGLangGeneration
 from dockyard_rl.models.generation.vllm import VllmConfig, VllmGeneration
+from dockyard_rl.models.generation.vllm.router_capture import (
+    MISSING_ROUTE_SENTINEL,
+)
 from dockyard_rl.models.policy.lm_policy import Policy
 from dockyard_rl.utils.checkpoint import CheckpointManager, CheckpointingConfig
 from dockyard_rl.utils.logger import Logger, LoggerConfig, print_message_log_samples
@@ -1577,7 +1580,12 @@ def grpo_train(
 
                     flat_messages, input_lengths = batched_message_log_to_flat_message(
                         repeated_batch["message_log"],
-                        pad_value_dict=cast(dict[str, int], {"token_ids": tokenizer.pad_token_id}),
+                        pad_value_dict=cast(dict[str, int], {
+                            "token_ids": tokenizer.pad_token_id,
+                            # Router-replay (#2908): pad the per-token route column
+                            # with the missing-route sentinel (inert when absent).
+                            "routed_experts": MISSING_ROUTE_SENTINEL,
+                        }),
                         make_sequence_length_divisible_by=master_config.policy[
                             "make_sequence_length_divisible_by"
                         ],
@@ -1592,6 +1600,10 @@ def grpo_train(
                             "sample_mask":         repeated_batch["loss_multiplier"],
                         }
                     )
+                    # Router-replay (#2908): carry the recorded routing into the
+                    # train forward (present only when capture ran).
+                    if "routed_experts" in flat_messages:
+                        train_data["routed_experts"] = flat_messages["routed_experts"]
                     extra_multimodal_data = flat_messages.get_multimodal_dict(
                         as_tensors=False
                     )
@@ -1623,6 +1635,11 @@ def grpo_train(
                             **extra_multimodal_data,
                         }
                     )
+                    # Router-replay (#2908): get_logprobs is the PRIMARY replay
+                    # consumer (prev_logprob recompute drives the train/gen logprob
+                    # error filter), so its data dict must carry the routing too.
+                    if "routed_experts" in train_data:
+                        logprob_data["routed_experts"] = train_data["routed_experts"]
                     if not skip_prev_logprobs:
                         train_data["prev_logprobs"] = policy.get_logprobs(
                             logprob_data, timer=timer
@@ -2572,7 +2589,11 @@ def async_grpo_train(
 
                         flat_messages, input_lengths = batched_message_log_to_flat_message(
                             repeated_batch["message_log"],
-                            pad_value_dict=cast(dict[str, int], {"token_ids": tokenizer.pad_token_id}),
+                            pad_value_dict=cast(dict[str, int], {
+                                "token_ids": tokenizer.pad_token_id,
+                                # Router-replay (#2908): sentinel-pad the route column.
+                                "routed_experts": MISSING_ROUTE_SENTINEL,
+                            }),
                             make_sequence_length_divisible_by=master_config.policy[
                                 "make_sequence_length_divisible_by"
                             ],
@@ -2587,6 +2608,12 @@ def async_grpo_train(
                                 "sample_mask":         repeated_batch["loss_multiplier"],
                             }
                         )
+                        # Router-replay (#2908): the async path reuses this single
+                        # train_data for both get_logprobs (primary replay consumer)
+                        # and policy.train, so one carry covers both. Present only
+                        # when capture ran.
+                        if "routed_experts" in flat_messages:
+                            train_data["routed_experts"] = flat_messages["routed_experts"]
                         # Thread per-message multimodal tensors (pixel_values,
                         # image_grid_thw, …) into train_data so the VLM policy forward
                         # receives them. The async path reuses this single train_data for

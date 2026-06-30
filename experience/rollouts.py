@@ -19,6 +19,9 @@ from dockyard_rl.models.generation.interfaces import (
     GenerationInterface,
     GenerationOutputSpec,
 )
+from dockyard_rl.models.generation.vllm.router_capture import (
+    MISSING_ROUTE_SENTINEL,
+)
 from dockyard_rl.rewards.invalid_action import (
     InvalidActionPenaltyConfig,
     assess_assistant_turn,
@@ -252,6 +255,15 @@ def generate_responses(
                 i, input_length:total_length
             ]
 
+        # MoE router-replay (#2908): carry the per-token recorded routing for
+        # this assistant turn, sliced exactly like generation_logprobs, so it
+        # rides the message_log -> flat-batch collation into the train batch.
+        # Present only when capture ran (policy.router_replay.enabled + MoE).
+        if "routed_experts" in generation_outputs:
+            assistant_message["routed_experts"] = generation_outputs["routed_experts"][
+                i, input_length:total_length
+            ]
+
         batch["message_log"][i].append(assistant_message)
 
     # Generation metrics
@@ -325,7 +337,13 @@ async def generate_responses_async(
 
     generation_outputs = BatchedDataDict.from_batches(
         ordered_batched_data_dicts,
-        pad_value_dict={"output_ids": tokenizer.pad_token_id, "logprobs": 0.0},
+        pad_value_dict={
+            "output_ids": tokenizer.pad_token_id,
+            "logprobs": 0.0,
+            # Router-replay (#2908): cross-sample sequence padding gets the
+            # missing-route sentinel; inert when the column is absent.
+            "routed_experts": MISSING_ROUTE_SENTINEL,
+        },
     )
 
     # Extract everything we need from the generation outputs
@@ -365,6 +383,15 @@ async def generate_responses_async(
 
         if include_logprobs and "logprobs" in generation_outputs:
             assistant_message["generation_logprobs"] = generation_outputs["logprobs"][
+                i, input_length:total_length
+            ]
+
+        # MoE router-replay (#2908): carry the per-token recorded routing for
+        # this assistant turn, sliced exactly like generation_logprobs, so it
+        # rides the message_log -> flat-batch collation into the train batch.
+        # Present only when capture ran (policy.router_replay.enabled + MoE).
+        if "routed_experts" in generation_outputs:
+            assistant_message["routed_experts"] = generation_outputs["routed_experts"][
                 i, input_length:total_length
             ]
 
