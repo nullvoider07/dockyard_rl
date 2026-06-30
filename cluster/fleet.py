@@ -31,7 +31,10 @@ from dockyard_rl.cluster.bootstrap import (
     FLEET_TRAINER,
     get_fleet_role,
 )
-from dockyard_rl.distributed.virtual_cluster import RayVirtualCluster
+from dockyard_rl.distributed.virtual_cluster import (
+    RayVirtualCluster,
+    prepare_segment_topology,
+)
 
 # Placement strategy constants
 # Pass these to FleetSpec.placement_strategy.
@@ -68,6 +71,7 @@ class FleetSpec:
     placement_strategy:          str
     max_colocated_worker_groups: int = 1
     name:                        str = ""
+    segment_size:                int | None = None
 
     def __post_init__(self) -> None:
         if self.role not in (FLEET_TRAINER, FLEET_INFERENCE, FLEET_SANDBOX):
@@ -78,6 +82,21 @@ class FleetSpec:
             raise ValueError(
                 f"gpus_per_node must be >= 0, got {self.gpus_per_node}"
             )
+        if self.segment_size is not None:
+            if self.segment_size < 1:
+                raise ValueError(
+                    f"segment_size must be >= 1, got {self.segment_size}"
+                )
+            if self.role == FLEET_SANDBOX:
+                raise ValueError(
+                    "segment_size (NVLink-domain topology) is GPU-fleet only; "
+                    "the CPU sandbox fleet must leave it None."
+                )
+            if self.num_nodes % self.segment_size != 0:
+                raise ValueError(
+                    f"num_nodes ({self.num_nodes}) must be divisible by "
+                    f"segment_size ({self.segment_size})."
+                )
         if self.role == FLEET_SANDBOX and self.gpus_per_node != 0:
             raise ValueError(
                 "Sandbox fleet is CPU-only; gpus_per_node must be 0"
@@ -147,12 +166,18 @@ class FleetSpec:
         else:
             max_colocated = int(defaults["max_colocated"])
 
+        # Optional NVLink-domain segment size for topology-aware placement.
+        # Absent (or empty) => None => legacy unordered allocation.
+        segment_raw = os.environ.get("DOCKYARD_SEGMENT_SIZE", "").strip()
+        segment_size = int(segment_raw) if segment_raw else None
+
         return cls(
             role=role,
             num_nodes=num_nodes,
             gpus_per_node=gpus_per_node,
             placement_strategy=placement_strategy,
             max_colocated_worker_groups=max_colocated,
+            segment_size=segment_size,
         )
 
 # Virtual cluster builders
@@ -169,12 +194,30 @@ def build_cluster(spec: FleetSpec) -> RayVirtualCluster:
     }
     return builders[spec.role](spec)
 
+def _segment_constraints(spec: FleetSpec) -> list[dict[str, float]] | None:
+    """Per-node NVLink-domain constraints for a GPU fleet, or None.
+
+    Returns ``None`` (legacy unordered placement) when ``segment_size`` is unset
+    or when no NVLink-domain info is registered in the Ray cluster. Otherwise
+    selects ``num_nodes`` segment-aligned nodes via :func:`prepare_segment_topology`
+    and returns their domain-pinning dicts. The topology read is cluster-bound;
+    callers only reach it with ``segment_size`` set.
+    """
+    if spec.segment_size is None:
+        return None
+    node_resource_constraints, _remaining, _topology = prepare_segment_topology(
+        spec.segment_size, spec.num_nodes, role=spec.role
+    )
+    return node_resource_constraints
+
 def _build_trainer_cluster(spec: FleetSpec) -> RayVirtualCluster:
     """One bundle per GPU, SPREAD across nodes.
 
     SPREAD ensures each node gets its own placement group so intra-node
     NVLink bandwidth is fully available for tensor-parallel communication,
     while inter-node RDMA handles pipeline and data-parallel collectives.
+    With ``segment_size`` set, bundles are additionally pinned to selected
+    NVLink domains and ordered by physical topology.
     """
     return RayVirtualCluster(
         bundle_ct_per_node_list=[spec.gpus_per_node] * spec.num_nodes,
@@ -183,6 +226,8 @@ def _build_trainer_cluster(spec: FleetSpec) -> RayVirtualCluster:
         num_gpus_per_node=spec.gpus_per_node,
         name=spec.name,
         placement_group_strategy=spec.placement_strategy,
+        segment_size=spec.segment_size,
+        node_resource_constraints=_segment_constraints(spec),
     )
 
 def _build_inference_cluster(spec: FleetSpec) -> RayVirtualCluster:
@@ -191,7 +236,8 @@ def _build_inference_cluster(spec: FleetSpec) -> RayVirtualCluster:
     PACK keeps TP ranks on the same node together in one placement group.
     When TP > gpus_per_node (large model spanning nodes), VllmGeneration
     detects this and promotes to a unified cross-node placement group
-    automatically — no change needed here.
+    automatically — no change needed here. With ``segment_size`` set, bundles
+    are additionally pinned to selected NVLink domains and topology-ordered.
     """
     return RayVirtualCluster(
         bundle_ct_per_node_list=[spec.gpus_per_node] * spec.num_nodes,
@@ -200,6 +246,8 @@ def _build_inference_cluster(spec: FleetSpec) -> RayVirtualCluster:
         num_gpus_per_node=spec.gpus_per_node,
         name=spec.name,
         placement_group_strategy=spec.placement_strategy,
+        segment_size=spec.segment_size,
+        node_resource_constraints=_segment_constraints(spec),
     )
 
 def _build_sandbox_cluster(spec: FleetSpec) -> RayVirtualCluster:
