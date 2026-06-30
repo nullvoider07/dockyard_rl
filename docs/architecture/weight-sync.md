@@ -54,6 +54,16 @@ This distinction shapes what `sync_weights()` does:
   run on separate GPU clusters, so there are no phase transitions; it only
   forwards weights (and optional FP8 KV-cache scales) over the collective.
 
+For colocated **SGLang** the engine's GPU memory is released and re-acquired
+around each generation phase when `enable_memory_saver` is set: `finish_generation`
+posts `release_memory_occupation` so the server stops holding `mem_fraction_static`
+of the device during training, and `prepare_for_generation` issues a two-phase
+`wake_up` (weights, then KV cache) to resume it. With `enable_memory_saver` off the
+server stays resident (the historical always-on behaviour). A colocated generation
+worker also reserves only a capped GPU fraction
+(`min(0.2, 1/max_colocated_worker_groups)`), while the dedicated, non-colocated
+path still claims a full GPU.
+
 `sync_weights()` accepts an optional `kv_scales` dict; only the collective
 transport honors it, forwarding to `policy.broadcast_weights_for_collective()`.
 IPC and HTTP ignore it.
