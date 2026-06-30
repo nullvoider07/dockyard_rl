@@ -24,7 +24,19 @@ from dockyard_rl.models.dtensor.moe.block import (
     routing_map_and_counts,
 )
 from dockyard_rl.models.dtensor.moe.experts import GroupedExperts
-from dockyard_rl.models.dtensor.moe.router import TokenChoiceTopKRouter
+from dockyard_rl.models.dtensor.moe.router import (
+    MISSING_ROUTE_SENTINEL,
+    TokenChoiceTopKRouter,
+)
+from dockyard_rl.models.dtensor.moe.router_replay import (
+    bind_router_replay,
+    count_moe_blocks,
+    iter_moe_blocks,
+    resolve_router_replay_enabled,
+    router_replay_context,
+    validate_router_replay_config,
+    validate_router_replay_generation_compat,
+)
 from dockyard_rl.models.dtensor.moe.parallelize_moe import (
     parallelize_grouped_experts,
     parallelize_router_gate,
@@ -73,6 +85,14 @@ __all__ = [
     "MoEBlock",
     "routing_map_and_counts",
     "TokenChoiceTopKRouter",
+    "MISSING_ROUTE_SENTINEL",
+    "bind_router_replay",
+    "count_moe_blocks",
+    "iter_moe_blocks",
+    "resolve_router_replay_enabled",
+    "router_replay_context",
+    "validate_router_replay_config",
+    "validate_router_replay_generation_compat",
     "parallelize_grouped_experts",
     "parallelize_router_gate",
     "expand_grouped_expert_info",

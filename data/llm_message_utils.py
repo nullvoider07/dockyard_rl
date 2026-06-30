@@ -134,6 +134,43 @@ def add_loss_mask_to_message_log(
                         cast(Tensor, message["token_ids"])
                     )
 
+def backfill_routed_experts(message_logs: list, *, sentinel: int) -> None:
+    """Backfill MoE router-replay routing placeholders (#2908) in place.
+
+    The captured ``routed_experts`` column rides only on rollout-generated
+    assistant messages. Without a placeholder on the other messages (prompt /
+    tool / non-generated turns), ``message_log_to_flat_messages`` concatenates a
+    short tensor that then right-pads to the front — silently placing the
+    assistant routing at the wrong (prompt) token offsets. For every message log
+    that carries routing on at least one turn, this fills each message lacking it
+    with a ``[token_len, L, K]`` ``sentinel`` tensor, so the flat column
+    interleaves at the same offsets as ``token_ids`` (mirrors the
+    ``generation_logprobs`` zero-backfill). Logs with no routing at all are left
+    untouched.
+    """
+    for message_log in message_logs:
+        reference = None
+        for message in message_log:
+            recorded = message.get("routed_experts")
+            if recorded is not None:
+                reference = cast(Tensor, recorded)
+                break
+        if reference is None:
+            continue
+        route_shape = tuple(reference.shape[1:])
+        for message in message_log:
+            if "routed_experts" not in message:
+                token_ids = cast(Tensor, message["token_ids"])
+                # Match the captured routing's dtype/device so the per-key
+                # consistency check in the flatten does not trip.
+                message["routed_experts"] = torch.full(
+                    (token_ids.shape[0], *route_shape),
+                    sentinel,
+                    dtype=reference.dtype,
+                    device=reference.device,
+                )
+
+
 def _pad_tensor(
     tensor: Tensor,
     max_len: int,

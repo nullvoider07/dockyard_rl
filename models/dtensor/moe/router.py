@@ -24,6 +24,13 @@ from torch import nn
 
 ScoreFunc = Literal["softmax", "sigmoid"]
 
+# Router-replay sentinel: a recorded route position the generation backend did
+# not return (see models/generation/vllm/router_capture.py). The replay path
+# falls back to the model's own routing for sentinel positions rather than
+# indexing an out-of-range expert id. Canonical consumer-side definition; the
+# producer side mirrors it (drift-guarded in tests).
+MISSING_ROUTE_SENTINEL = -1
+
 
 class TokenChoiceTopKRouter(nn.Module):
     """Top-K token-choice gating.
@@ -105,8 +112,57 @@ class TokenChoiceTopKRouter(nn.Module):
         drop_mask.scatter_(-1, keep_idx, False)
         return grouped.masked_fill(drop_mask.unsqueeze(-1), float("-inf")).flatten(-2)
 
+    def _choose_topk_ids(
+        self, scores_BLE: torch.Tensor, expert_bias_E: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        """Top-K expert ids from the (optionally biased, group-limited) scores."""
+        scores_for_choice_BLE = (
+            scores_BLE if expert_bias_E is None else scores_BLE + expert_bias_E
+        )
+        if self.num_expert_groups is not None:
+            scores_for_choice_BLE = self._node_limited_scores(scores_for_choice_BLE)
+        _, topk_expert_ids_BLK = torch.topk(
+            scores_for_choice_BLE, k=self.top_k, dim=-1, sorted=False
+        )
+        return topk_expert_ids_BLK
+
+    def _replayed_topk_ids(
+        self,
+        scores_BLE: torch.Tensor,
+        expert_bias_E: Optional[torch.Tensor],
+        replay_route_BLK: torch.Tensor,
+    ) -> torch.Tensor:
+        """Forced top-K ids from a recorded route, falling back on sentinels.
+
+        ``replay_route_BLK`` is the generation-recorded selection ``(B, L, K)``.
+        Positions marked ``MISSING_ROUTE_SENTINEL`` (a whole-K row the backend
+        did not return) fall back to this model's own top-K choice rather than
+        indexing an out-of-range expert; all other positions are forced to the
+        recorded ids exactly.
+        """
+        if replay_route_BLK.shape[-1] != self.top_k:
+            raise ValueError(
+                f"replay_route_BLK last dim ({replay_route_BLK.shape[-1]}) must "
+                f"equal top_k ({self.top_k})"
+            )
+        if replay_route_BLK.shape[:2] != scores_BLE.shape[:2]:
+            raise ValueError(
+                f"replay_route_BLK batch/seq {tuple(replay_route_BLK.shape[:2])} "
+                f"must match scores {tuple(scores_BLE.shape[:2])}"
+            )
+        replay_ids_BLK = replay_route_BLK.to(torch.long)
+        sentinel_BLK = replay_route_BLK == MISSING_ROUTE_SENTINEL
+        if bool(sentinel_BLK.any()):
+            computed_BLK = self._choose_topk_ids(scores_BLE, expert_bias_E)
+            valid_BL1 = (~sentinel_BLK).all(dim=-1, keepdim=True)
+            return torch.where(valid_BL1, replay_ids_BLK, computed_BLK)
+        return replay_ids_BLK
+
     def forward(
-        self, x_BLD: torch.Tensor, expert_bias_E: Optional[torch.Tensor] = None
+        self,
+        x_BLD: torch.Tensor,
+        expert_bias_E: Optional[torch.Tensor] = None,
+        replay_route_BLK: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Route tokens to their top-K experts.
 
@@ -115,6 +171,11 @@ class TokenChoiceTopKRouter(nn.Module):
             expert_bias_E: Optional aux-loss-free load-balance bias ``(E,)``,
                 added to the scores for the top-K CHOICE only (the returned
                 gating scores still come from the unbiased scores).
+            replay_route_BLK: Optional recorded routing ``(B, L, K)`` (MoE
+                router-replay). When given, the top-K CHOICE is forced to these
+                ids instead of computed from the scores (sentinel positions fall
+                back to the computed choice); the gating WEIGHTS still come from
+                this model's own ``scores_BLE``, so the gate gradient is intact.
 
         Returns:
             topk_scores_BLK: Gating weights for the selected experts ``(B, L, K)``.
@@ -138,15 +199,13 @@ class TokenChoiceTopKRouter(nn.Module):
         else:
             raise NotImplementedError(f"Unknown score function {self.score_func}")
 
-        scores_for_choice_BLE = (
-            scores_BLE if expert_bias_E is None else scores_BLE + expert_bias_E
-        )
-        if self.num_expert_groups is not None:
-            scores_for_choice_BLE = self._node_limited_scores(scores_for_choice_BLE)
+        if replay_route_BLK is None:
+            topk_expert_ids_BLK = self._choose_topk_ids(scores_BLE, expert_bias_E)
+        else:
+            topk_expert_ids_BLK = self._replayed_topk_ids(
+                scores_BLE, expert_bias_E, replay_route_BLK
+            )
 
-        _, topk_expert_ids_BLK = torch.topk(
-            scores_for_choice_BLE, k=self.top_k, dim=-1, sorted=False
-        )
         # Gating weights derive from the UNBIASED scores (bias is routing-only).
         topk_scores_BLK = scores_BLE.gather(dim=-1, index=topk_expert_ids_BLK)
 

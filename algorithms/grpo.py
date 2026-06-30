@@ -56,6 +56,7 @@ from dockyard_rl.data.dataloader import MultipleDataloaderWrapper
 from dockyard_rl.data.datasets.utils import extract_necessary_env_names
 from dockyard_rl.data_plane.interfaces import DataPlaneConfig
 from dockyard_rl.data.llm_message_utils import (
+    backfill_routed_experts,
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
 )
@@ -68,6 +69,12 @@ from dockyard_rl.experience.rollouts import (
 from dockyard_rl.models.generation.interfaces import GenerationInterface
 from dockyard_rl.models.generation.sglang import SGLangConfig, SGLangGeneration
 from dockyard_rl.models.generation.vllm import VllmConfig, VllmGeneration
+from dockyard_rl.models.generation.vllm.router_capture import (
+    MISSING_ROUTE_SENTINEL,
+)
+from dockyard_rl.models.dtensor.moe.router_replay import (
+    validate_router_replay_generation_compat,
+)
 from dockyard_rl.models.policy.lm_policy import Policy
 from dockyard_rl.utils.checkpoint import CheckpointManager, CheckpointingConfig
 from dockyard_rl.utils.logger import Logger, LoggerConfig, print_message_log_samples
@@ -176,6 +183,30 @@ class MasterConfig(BaseModel, extra="allow"):
 # ============================================================
 # Setup & Initialisation
 # ============================================================
+
+def _validate_router_replay_compat(
+    master_config: MasterConfig,
+    generation_config: Any,
+    backend: str,
+) -> None:
+    """Marshal config for ``validate_router_replay_generation_compat`` (#2908).
+
+    Extracts the router-replay flag, data_plane state and vLLM engine config
+    from the master/generation configs and delegates the pure compatibility
+    checks. Inert when router replay is disabled.
+    """
+    rr = generation_config.get("router_replay") if generation_config else None
+    enabled = bool(rr.get("enabled", False)) if isinstance(rr, dict) else False
+    dp_cfg = getattr(master_config, "data_plane", None)
+    data_plane_enabled = bool(dp_cfg.get("enabled", False)) if dp_cfg else False
+    validate_router_replay_generation_compat(
+        enabled=enabled,
+        backend=backend,
+        data_plane_enabled=data_plane_enabled,
+        vllm_cfg=generation_config.get("vllm_cfg", {}),
+        vllm_kwargs=generation_config.get("vllm_kwargs", {}),
+    )
+
 
 def setup(
     master_config: MasterConfig,
@@ -467,6 +498,18 @@ def setup(
     print("\n▶ Setting up model and training...", flush=True)
 
     generation_config["model_name"] = policy_config["model_name"]
+    # MoE router-replay (#2908): surface policy.router_replay to the generation
+    # workers as a plain {"enabled": bool} dict so the vLLM worker can gate
+    # enable_return_routed_experts + per-token route capture. Inert (and the
+    # generation path byte-unchanged) when unset / disabled.
+    _router_replay_cfg = policy_config.get("router_replay")
+    generation_config["router_replay"] = {
+        "enabled": bool(
+            _router_replay_cfg.get("enabled", False)
+            if isinstance(_router_replay_cfg, dict)
+            else getattr(_router_replay_cfg, "enabled", False)
+        )
+    }
     worker_init_timing_metrics: dict[str, float] = {}
 
     weights_path, optimizer_path = checkpointer.get_resume_paths(last_checkpoint_path)
@@ -569,6 +612,10 @@ def setup(
         return policy_generation, policy
 
     backend = generation_config["backend"]
+
+    # Router-replay (#2908): fail fast on incompatible backend / data_plane /
+    # vLLM-engine configs before any worker is constructed.
+    _validate_router_replay_compat(master_config, generation_config, backend)
 
     if backend == "vllm":
         generation_config = cast(VllmConfig, generation_config)
@@ -994,7 +1041,16 @@ def add_grpo_token_loss_masks_and_generation_logprobs(message_logs: list) -> Non
     field — not the role alone — marks the trainable tokens. Mutates each message
     in place: sets token_loss_mask, and fills a zero generation_logprobs when
     absent.
+
+    Router-replay (#2908): the captured routed_experts column rides only on
+    rollout-generated assistant messages, so — exactly like generation_logprobs —
+    every other message must be backfilled with a sentinel placeholder of the
+    right token length, or the message_log->flat concatenation would place the
+    assistant routing at the wrong (prompt) token offsets
+    (backfill_routed_experts; the sentinel makes the trainer fall back to its own
+    routing on the non-replayed positions).
     """
+    backfill_routed_experts(message_logs, sentinel=MISSING_ROUTE_SENTINEL)
     for message_log in message_logs:
         for message in message_log:
             token_ids = message["token_ids"]
@@ -1610,7 +1666,12 @@ def grpo_train(
 
                     flat_messages, input_lengths = batched_message_log_to_flat_message(
                         repeated_batch["message_log"],
-                        pad_value_dict=cast(dict[str, int], {"token_ids": tokenizer.pad_token_id}),
+                        pad_value_dict=cast(dict[str, int], {
+                            "token_ids": tokenizer.pad_token_id,
+                            # Router-replay (#2908): pad the per-token route column
+                            # with the missing-route sentinel (inert when absent).
+                            "routed_experts": MISSING_ROUTE_SENTINEL,
+                        }),
                         make_sequence_length_divisible_by=master_config.policy[
                             "make_sequence_length_divisible_by"
                         ],
@@ -1625,6 +1686,10 @@ def grpo_train(
                             "sample_mask":         repeated_batch["loss_multiplier"],
                         }
                     )
+                    # Router-replay (#2908): carry the recorded routing into the
+                    # train forward (present only when capture ran).
+                    if "routed_experts" in flat_messages:
+                        train_data["routed_experts"] = flat_messages["routed_experts"]
                     extra_multimodal_data = flat_messages.get_multimodal_dict(
                         as_tensors=False
                     )
@@ -1656,6 +1721,11 @@ def grpo_train(
                             **extra_multimodal_data,
                         }
                     )
+                    # Router-replay (#2908): get_logprobs is the PRIMARY replay
+                    # consumer (prev_logprob recompute drives the train/gen logprob
+                    # error filter), so its data dict must carry the routing too.
+                    if "routed_experts" in train_data:
+                        logprob_data["routed_experts"] = train_data["routed_experts"]
                     if not skip_prev_logprobs:
                         train_data["prev_logprobs"] = policy.get_logprobs(
                             logprob_data, timer=timer
@@ -2637,7 +2707,11 @@ def async_grpo_train(
 
                         flat_messages, input_lengths = batched_message_log_to_flat_message(
                             repeated_batch["message_log"],
-                            pad_value_dict=cast(dict[str, int], {"token_ids": tokenizer.pad_token_id}),
+                            pad_value_dict=cast(dict[str, int], {
+                                "token_ids": tokenizer.pad_token_id,
+                                # Router-replay (#2908): sentinel-pad the route column.
+                                "routed_experts": MISSING_ROUTE_SENTINEL,
+                            }),
                             make_sequence_length_divisible_by=master_config.policy[
                                 "make_sequence_length_divisible_by"
                             ],
@@ -2652,6 +2726,12 @@ def async_grpo_train(
                                 "sample_mask":         repeated_batch["loss_multiplier"],
                             }
                         )
+                        # Router-replay (#2908): the async path reuses this single
+                        # train_data for both get_logprobs (primary replay consumer)
+                        # and policy.train, so one carry covers both. Present only
+                        # when capture ran.
+                        if "routed_experts" in flat_messages:
+                            train_data["routed_experts"] = flat_messages["routed_experts"]
                         # Thread per-message multimodal tensors (pixel_values,
                         # image_grid_thw, …) into train_data so the VLM policy forward
                         # receives them. The async path reuses this single train_data for

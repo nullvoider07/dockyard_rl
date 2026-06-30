@@ -236,6 +236,13 @@ class GenerationOutputSpec(TypedDict):
     # CPU-derivable; the exact per-token forced set inside the JSON is HV-gated
     # (vLLM 0.21 does not surface the matcher bitmask on CompletionOutput).
     structural_token_mask:       NotRequired[torch.Tensor]  # (batch, padded_total_len)
+    # Per-token recorded top-K expert selection for MoE router-replay (#2908),
+    # aligned to output_ids: [batch, padded_total_len, num_moe_layers, top_k]
+    # int32, with MISSING_ROUTE_SENTINEL (-1) on rows the backend did not route.
+    # Present only when policy.router_replay.enabled and the generation backend
+    # surfaced routing (vLLM enable_return_routed_experts); absent otherwise, so
+    # the default generation path is byte-unchanged.
+    routed_experts:              NotRequired[torch.Tensor]  # (batch, padded_total_len, L, top_k)
     __extra__:                   Any
 
 # Abstract interface
