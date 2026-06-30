@@ -18,6 +18,7 @@ import jax  # noqa: E402
 torch = pytest.importorskip("torch")
 
 from dockyard_rl.algorithms.loss.loss_functions import ClippedPGLossConfig, ClippedPGLossFn
+from dockyard_rl.algorithms.loss.utils import calculate_kl
 from dockyard_rl.models.jax import loss as jax_loss
 
 
@@ -264,3 +265,80 @@ def test_logprobs_from_logits_parity():
 
     assert lp_j.shape == (B, S - 1)
     np.testing.assert_allclose(lp_j, lp_t, atol=1e-5, rtol=1e-5)
+
+
+def test_kl_backward_score_function_term():
+    """#2506: the straight-through weight exp(x - sg(x)) injects the score-function
+    gradient into the KL term. With w = exp(curr - sg(curr)) (forward value 1, dw/dcurr
+    = 1), d/dcurr [w * kl] = kl + dkl/dcurr, so the weighted gradient exceeds the pure
+    pathwise gradient by exactly the per-token KL value. The old ones_like weight dropped
+    that `+ kl` term; this test fails on that regression."""
+    rng = np.random.default_rng(11)
+    curr_np = rng.standard_normal((3, 5)).astype(np.float32)
+    ref_np = rng.standard_normal((3, 5)).astype(np.float32)
+    # Clamps off so the identity is exact (clamp saturation is exercised separately).
+    kw = dict(input_clamp_value=None, output_clamp_value=None)
+
+    c1 = torch.from_numpy(curr_np).clone().requires_grad_(True)
+    calculate_kl(c1, torch.from_numpy(ref_np), **kw).sum().backward()
+    grad_pathwise = c1.grad.detach().numpy()
+
+    kl_val = calculate_kl(
+        torch.from_numpy(curr_np), torch.from_numpy(ref_np), **kw
+    ).detach().numpy()
+
+    c2 = torch.from_numpy(curr_np).clone().requires_grad_(True)
+    w = torch.exp(c2 - c2.detach())
+    calculate_kl(
+        c2, torch.from_numpy(ref_np), importance_sampling_weights=w, **kw
+    ).sum().backward()
+    grad_sf = c2.grad.detach().numpy()
+
+    # Score-function term adds exactly the per-token KL value.
+    np.testing.assert_allclose(grad_sf, grad_pathwise + kl_val, atol=1e-5, rtol=1e-5)
+    # And it genuinely differs from pathwise-only (guards against a ones_like regression).
+    assert np.abs(grad_sf - grad_pathwise).max() > 1e-3
+
+    # JAX mirror: same identity.
+    def kl_sf(c):
+        wj = jnp.exp(c - jax.lax.stop_gradient(c))
+        return jax_loss.calculate_kl(
+            c, jnp.asarray(ref_np), input_clamp_value=None, output_clamp_value=None,
+            importance_sampling_weights=wj,
+        ).sum()
+
+    grad_sf_j = np.asarray(jax.grad(kl_sf)(jnp.asarray(curr_np)))
+    np.testing.assert_allclose(grad_sf_j, grad_sf, atol=2e-4, rtol=2e-4)
+
+
+def test_kl_backward_clamp_saturation_detaches_weight():
+    """#2958: when input clamping saturates a token's log-ratio, the IS weight is
+    detached there, so the clamp suppresses BOTH the KL and the sampling-weight gradient
+    on that token (grad -> 0). Unsaturated tokens keep the score-function term. Without
+    the detach the weight gradient (kl) would still leak on saturated tokens."""
+    clamp = 5.0
+    # Token 0 saturates (|curr - ref| >> clamp); token 1 does not.
+    curr_np = np.array([[10.0, 0.3]], dtype=np.float32)
+    ref_np = np.array([[0.0, -0.2]], dtype=np.float32)
+
+    c = torch.from_numpy(curr_np).clone().requires_grad_(True)
+    w = torch.exp(c - c.detach())
+    calculate_kl(
+        c, torch.from_numpy(ref_np), input_clamp_value=clamp, output_clamp_value=None,
+        importance_sampling_weights=w,
+    ).sum().backward()
+    grad = c.grad.detach().numpy()[0]
+
+    assert abs(grad[0]) < 1e-6   # saturated: clamp kills pathwise, detach kills score-function
+    assert abs(grad[1]) > 1e-3   # unsaturated: score-function term present
+
+    def kl_sf(cj):
+        wj = jnp.exp(cj - jax.lax.stop_gradient(cj))
+        return jax_loss.calculate_kl(
+            cj, jnp.asarray(ref_np), input_clamp_value=clamp, output_clamp_value=None,
+            importance_sampling_weights=wj,
+        ).sum()
+
+    grad_j = np.asarray(jax.grad(kl_sf)(jnp.asarray(curr_np)))[0]
+    assert abs(grad_j[0]) < 1e-6
+    assert abs(grad_j[1]) > 1e-3

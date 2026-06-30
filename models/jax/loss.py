@@ -47,11 +47,19 @@ def calculate_kl(
     kl_type: str = "k3",
     input_clamp_value: Optional[float] = 20.0,
     output_clamp_value: Optional[float] = 10.0,
+    importance_sampling_weights: Optional[Array] = None,
 ) -> Array:
     """JAX mirror of ``algorithms/loss/utils.py::calculate_kl`` (k1/k2/k3)."""
     log_ratio = logprobs - logprobs_reference
     if input_clamp_value is not None:
-        log_ratio = jnp.clip(log_ratio, -input_clamp_value, input_clamp_value)
+        log_ratio_clamped = jnp.clip(log_ratio, -input_clamp_value, input_clamp_value)
+        if importance_sampling_weights is not None:
+            importance_sampling_weights = jnp.where(
+                log_ratio == log_ratio_clamped,
+                importance_sampling_weights,
+                jax.lax.stop_gradient(importance_sampling_weights),
+            )
+        log_ratio = log_ratio_clamped
 
     if kl_type == "k1":
         kl = log_ratio
@@ -61,6 +69,9 @@ def calculate_kl(
         kl = jnp.exp(log_ratio) - log_ratio - 1.0
     else:
         raise ValueError(f"Unknown kl_type {kl_type!r}. Valid: 'k1','k2','k3'.")
+
+    if importance_sampling_weights is not None:
+        kl = importance_sampling_weights * kl
 
     if output_clamp_value is not None:
         kl = jnp.clip(kl, -output_clamp_value, output_clamp_value)
@@ -195,16 +206,23 @@ def clipped_pg_loss(
         0.5 * kl_prev_to_mix + 0.5 * kl_gen_to_mix, mask, global_normalization_factor=global_valid_toks
     )
 
-    # --- KL regularization (on-policy approximation gated off in J3) ---
+    # --- KL regularization ---
+    # KL samples come from the optimized policy, so the KL loss carries the
+    # score-function gradient through the sampling probability (mirror of the
+    # torch ClippedPGLossFn; https://arxiv.org/abs/2506.09477v1). The on-policy
+    # ratio provides it; otherwise the straight-through exp(x - sg(x)) keeps the
+    # gradient with forward value 1.
     if kl_penalty != 0:
         reference_policy_logprobs = data["reference_policy_logprobs"][:, 1:]
         curr_unfiltered = data.get("curr_logprobs_unfiltered", curr_logprobs)
         if use_on_policy_kl:
-            kl_iw = _nan_to_num(jax.lax.stop_gradient(jnp.exp(curr_unfiltered - generation_logprobs)))
+            kl_iw = jnp.exp(curr_unfiltered - generation_logprobs)
         else:
-            kl_iw = jnp.ones_like(curr_unfiltered)
-        kl_tok = kl_iw * kl_penalty * calculate_kl(
-            curr_unfiltered, reference_policy_logprobs, kl_type, kl_in_clamp, kl_out_clamp
+            kl_iw = jnp.exp(curr_unfiltered - jax.lax.stop_gradient(curr_unfiltered))
+        kl_iw = _nan_to_num(kl_iw)
+        kl_tok = kl_penalty * calculate_kl(
+            curr_unfiltered, reference_policy_logprobs, kl_type, kl_in_clamp, kl_out_clamp,
+            importance_sampling_weights=kl_iw,
         )
         if token_level:
             kl = masked_mean(kl_tok, mask, global_normalization_factor=global_valid_toks)
