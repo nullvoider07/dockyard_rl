@@ -120,6 +120,12 @@ def _validate_cfg(cfg: Any) -> None:
         ratio = _get(cfg, "truncated_importance_sampling_ratio", None)
         if ratio is None or not ratio > 0:
             raise ValueError("truncated_importance_sampling_ratio must be positive")
+        ratio_min = _get(cfg, "truncated_importance_sampling_ratio_min", None)
+        if ratio_min is not None and ratio_min > ratio:
+            raise ValueError(
+                "truncated_importance_sampling_ratio_min must be <= "
+                "truncated_importance_sampling_ratio"
+            )
         if tis_type in ("icepop", "seq-mask-tis") and _get(cfg, "truncated_importance_sampling_ratio_min", None) is None:
             raise ValueError("truncated_importance_sampling_ratio_min required for icepop / seq-mask-tis")
         if tis_type == "seq-mask-tis" and seq_level_is:
@@ -277,9 +283,12 @@ def clipped_pg_loss(
     is_oob_ratio = jnp.asarray(0.0, dtype=curr_logprobs.dtype)
     if tis_ratio is not None:
         if tis_type == "tis":
-            token_in_bounds = (actor_iw <= tis_ratio).astype(curr_logprobs.dtype)
+            tis_min = 0.0 if tis_ratio_min is None else tis_ratio_min
+            token_in_bounds = (
+                (actor_iw <= tis_ratio) & (actor_iw >= tis_min)
+            ).astype(curr_logprobs.dtype)
             is_oob_ratio = 1.0 - masked_mean(token_in_bounds, mask, global_normalization_factor=global_valid_toks)
-            actor_iw = jnp.minimum(actor_iw, tis_ratio)
+            actor_iw = jnp.clip(actor_iw, tis_min, tis_ratio)
         elif tis_type == "icepop":
             token_kept = (actor_iw >= tis_ratio_min) & (actor_iw <= tis_ratio)
             is_oob_ratio = 1.0 - masked_mean(

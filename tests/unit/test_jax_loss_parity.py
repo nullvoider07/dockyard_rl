@@ -9,6 +9,7 @@ plus the logprobs_from_logits helper against the torch reference.
 from __future__ import annotations
 
 import itertools
+from typing import Any
 
 import numpy as np
 import pytest
@@ -277,7 +278,7 @@ def test_kl_backward_score_function_term():
     curr_np = rng.standard_normal((3, 5)).astype(np.float32)
     ref_np = rng.standard_normal((3, 5)).astype(np.float32)
     # Clamps off so the identity is exact (clamp saturation is exercised separately).
-    kw = dict(input_clamp_value=None, output_clamp_value=None)
+    kw: dict[str, Any] = dict(input_clamp_value=None, output_clamp_value=None)
 
     c1 = torch.from_numpy(curr_np).clone().requires_grad_(True)
     calculate_kl(c1, torch.from_numpy(ref_np), **kw).sum().backward()
@@ -342,3 +343,56 @@ def test_kl_backward_clamp_saturation_detaches_weight():
     grad_j = np.asarray(jax.grad(kl_sf)(jnp.asarray(curr_np)))[0]
     assert abs(grad_j[0]) < 1e-6
     assert abs(grad_j[1]) > 1e-3
+
+
+def test_tis_lower_bound_parity():
+    """#2886: the 'tis' truncation gains a lower clamp (min defaults to 0.0). torch and
+    JAX must clamp the IS weights to [tis_min, tis_ratio] and compute the OOB metric
+    identically."""
+    curr, prev, gen, ref, adv, token_mask, sample_mask = _fixtures(seed=9)
+    cfg = ClippedPGLossConfig(
+        token_level_loss=True,
+        reference_policy_kl_penalty=0.0,
+        use_importance_sampling_correction=True,
+        truncated_importance_sampling_type="tis",
+        truncated_importance_sampling_ratio=2.0,
+        truncated_importance_sampling_ratio_min=0.8,  # bites: some IS weights fall below
+    )
+    mask = token_mask * sample_mask[:, None]
+    gvt = torch.tensor(float(mask.sum()))
+    gvs = torch.tensor(float(sample_mask.sum()))
+
+    curr_t = torch.from_numpy(curr).clone().requires_grad_(True)
+    td = _torch_data(prev, gen, ref, adv, token_mask, sample_mask)
+    loss_t, _ = ClippedPGLossFn(cfg)(curr_t, td, gvs, gvt)  # pyright: ignore[reportArgumentType]
+    loss_t.backward()
+
+    def f(curr_j):
+        return jax_loss.clipped_pg_loss(
+            curr_j, _jax_data(prev, gen, ref, adv, token_mask, sample_mask),
+            jnp.asarray(float(sample_mask.sum())), jnp.asarray(float(mask.sum())), cfg,
+        )
+
+    (loss_j, _), grad_j = jax.value_and_grad(f, has_aux=True)(jnp.asarray(curr))
+    np.testing.assert_allclose(float(loss_j), float(loss_t.detach()), atol=2e-4, rtol=2e-4)
+    np.testing.assert_allclose(np.asarray(grad_j), curr_t.grad.detach().numpy(), atol=2e-4, rtol=2e-4)
+
+
+def test_tis_ratio_min_above_ratio_rejected():
+    """ratio_min must be <= ratio (torch asserts in __init__; JAX raises ValueError)."""
+    curr, prev, gen, ref, adv, token_mask, sample_mask = _fixtures(seed=10)
+    bad: dict[str, Any] = dict(
+        use_importance_sampling_correction=True,
+        truncated_importance_sampling_type="tis",
+        truncated_importance_sampling_ratio=2.0,
+        truncated_importance_sampling_ratio_min=3.0,
+    )
+    with pytest.raises(AssertionError):
+        ClippedPGLossFn(ClippedPGLossConfig(**bad))
+    mask = token_mask * sample_mask[:, None]
+    with pytest.raises(ValueError):
+        jax_loss.clipped_pg_loss(
+            jnp.asarray(curr), _jax_data(prev, gen, ref, adv, token_mask, sample_mask),
+            jnp.asarray(float(sample_mask.sum())), jnp.asarray(float(mask.sum())),
+            ClippedPGLossConfig(**bad),
+        )

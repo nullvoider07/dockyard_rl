@@ -113,9 +113,9 @@ IS ratios are heavy-tailed, **truncated importance sampling** caps them:
 
 | `truncated_importance_sampling_type` | Behaviour |
 | --- | --- |
-| `tis` | Truncate the ratio at `truncated_importance_sampling_ratio`. |
-| `icepop` | Two-sided clamp using the additional `..._ratio_min` floor. |
-| `seq-mask-tis` | Sequence-masking variant; incompatible with sequence-level IS ratios. |
+| `tis` | Clamp the ratio to `[..._ratio_min, truncated_importance_sampling_ratio]`. The lower bound `truncated_importance_sampling_ratio_min` is optional and defaults to `0.0` (upper-bound-only, backward compatible) when unset. |
+| `icepop` | Two-sided clamp; `..._ratio_min` is required (not defaulted). |
+| `seq-mask-tis` | Sequence-masking variant (also requires `..._ratio_min`); incompatible with sequence-level IS ratios. |
 
 Truncated IS requires `use_importance_sampling_correction=True`; the loss
 function asserts the valid combinations at construction so a misconfiguration

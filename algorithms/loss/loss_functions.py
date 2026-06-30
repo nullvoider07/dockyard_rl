@@ -186,6 +186,14 @@ class ClippedPGLossFn(LossFunction):
                 self.truncated_importance_sampling_ratio is not None
                 and self.truncated_importance_sampling_ratio > 0
             ), "truncated_importance_sampling_ratio must be positive"
+            if self.truncated_importance_sampling_ratio_min is not None:
+                assert (
+                    self.truncated_importance_sampling_ratio_min
+                    <= self.truncated_importance_sampling_ratio
+                ), (
+                    "truncated_importance_sampling_ratio_min must be <= "
+                    "truncated_importance_sampling_ratio"
+                )
             if self.truncated_importance_sampling_type in ("icepop", "seq-mask-tis"):
                 assert self.truncated_importance_sampling_ratio_min is not None, (
                     "truncated_importance_sampling_ratio_min required for icepop / seq-mask-tis"
@@ -371,9 +379,12 @@ class ClippedPGLossFn(LossFunction):
 
         if self.truncated_importance_sampling_ratio is not None:
             if self.truncated_importance_sampling_type == "tis":
+                tis_min = self.truncated_importance_sampling_ratio_min
+                if tis_min is None:
+                    tis_min = 0.0
                 token_in_bounds = (
                     actor_importance_weights_expanded <= self.truncated_importance_sampling_ratio
-                )
+                ) & (actor_importance_weights_expanded >= tis_min)
                 _is_filter_metrics = {
                     "is_oob_ratio": 1.0 - masked_mean(
                         token_in_bounds.float(), mask,
@@ -382,6 +393,7 @@ class ClippedPGLossFn(LossFunction):
                 }
                 actor_importance_weights_expanded = torch.clamp(
                     actor_importance_weights_expanded,
+                    min=tis_min,
                     max=self.truncated_importance_sampling_ratio,
                 )
             elif self.truncated_importance_sampling_type == "icepop":
