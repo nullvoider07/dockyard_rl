@@ -400,18 +400,65 @@ class SGLangGeneration(GenerationInterface):
 
         return url_to_uuids
 
+    def _memory_saver_enabled(self) -> bool:
+        """Whether the colocated server time-shares GPU via memory occupation.
+
+        Gated by sglang_cfg.enable_memory_saver: when set, the server is launched
+        with SGLang's memory-saver adapter and exposes
+        release/resume_memory_occupation, so prepare_for_generation/
+        finish_generation drive the wake/sleep lifecycle. When unset the server is
+        always-on and both hooks are no-ops (the historical behavior).
+        """
+        return bool(self.sglang_cfg.get("enable_memory_saver", False))
+
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:
-        """No-op for non-collocated SGLang servers, which are always on."""
-        return True
+        """Reacquire the colocated server's GPU memory before a generation round.
+
+        SGLang is always colocated in dockyard (it shares GPUs with the trainer),
+        so with memory-saver enabled the server releases its GPU memory during the
+        training phase (see finish_generation) and must resume it here. An optional
+        ``tags`` kwarg (e.g. ["weights"], ["kv_cache"]) selects a partial resume:
+        the HTTP weight-sync lifecycle calls this twice — once to stage refreshed
+        weights, once to rebuild the KV cache. With memory-saver off the server is
+        always-on and this is a no-op.
+        """
+        if not self._memory_saver_enabled():
+            return True
+        futures = self.worker_group.run_all_workers_single_data(
+            "wake_up",
+            run_rank_0_only_axes=["tensor_parallel"],
+            tags=kwargs.get("tags"),
+        )
+        try:
+            results = ray.get(futures, timeout=300)
+        except Exception as exc:
+            logger.error(f"[sglang colocation] resume_memory_occupation failed: {exc}")
+            return False
+        return all(r is not False for r in results)
 
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
-        """No-op at batch boundaries.
+        """Release the colocated server's GPU memory at the end of a round.
 
-        The prefix/KV cache is deliberately preserved between rollout batches so
-        SGLang's RadixAttention prefix caching stays warm; it is flushed only at
-        weight-sync time via invalidate_kv_cache().
+        With memory-saver enabled the server releases all GPU memory occupation so
+        the co-resident trainer can use it during the training phase;
+        prepare_for_generation resumes it next round. With memory-saver off this is
+        a no-op: the prefix/KV cache is deliberately preserved between rollout
+        batches so SGLang's RadixAttention prefix caching stays warm (it is flushed
+        only at weight-sync time via invalidate_kv_cache()).
         """
-        return True
+        if not self._memory_saver_enabled():
+            return True
+        futures = self.worker_group.run_all_workers_single_data(
+            "sleep",
+            run_rank_0_only_axes=["tensor_parallel"],
+            tags=kwargs.get("tags"),
+        )
+        try:
+            results = ray.get(futures, timeout=300)
+        except Exception as exc:
+            logger.error(f"[sglang colocation] release_memory_occupation failed: {exc}")
+            return False
+        return all(r is not False for r in results)
 
     def shutdown(self) -> bool:
         """Shut down all SGLang workers and clean up resources."""

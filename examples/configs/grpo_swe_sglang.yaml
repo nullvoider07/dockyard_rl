@@ -193,14 +193,14 @@ policy:
       dtype: ${policy.precision}     # bfloat16 — matches the trainer policy precision
       mem_fraction_static: 0.85      # SGLang static GPU memory fraction (≈ vLLM gpu_memory_utilization)
       context_length: ${policy.max_total_sequence_length}
-      enable_memory_saver: true      # release server GPU memory between rounds (non-colocated refit)
+      enable_memory_saver: true      # time-share GPU: release server memory during training, resume before generation
       skip_server_warmup: true       # avoid warmup timeout on cluster startup
     sglang_kwargs: {}
     colocated:
-      enabled: false                 # non-collocated: dedicated inference fleet
+      enabled: true                  # SGLang is colocated-only (shares GPUs with the trainer)
       resources:
         gpus_per_node: 8
-        num_nodes: 1                 # 1 of the 4 nodes dedicated to inference
+        num_nodes: 1
 
 data:
   max_input_seq_length: ${policy.max_total_sequence_length}
