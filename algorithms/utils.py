@@ -5,7 +5,7 @@ Contains:
   get_tokenizer                      — HF tokenizer with chat-template config
   calculate_baseline_and_std_per_prompt — per-prompt GRPO baseline
   calculate_kl                       — re-exported from loss/utils
-  get_gdpo_reward_component_keys     — detect reward1/reward2/… keys
+  get_gdpo_reward_component_keys     — detect named reward/<name> component keys
   mask_out_neg_inf_logprobs          — handle top-k/p sampling mask mismatch
   maybe_pad_last_batch               — pad validation batches for DP
   print_performance_metrics          — throughput / FLOP metrics to stdout
@@ -15,7 +15,6 @@ Contains:
 
 import math
 import random
-import re
 import warnings
 from functools import partial, wraps
 from typing import Any, Optional
@@ -53,9 +52,10 @@ def set_seed(seed: int) -> None:
 
 # GDPO reward component detection and GRPO baseline calculation
 def get_gdpo_reward_component_keys(batch) -> list[str]:
-    """Return batch keys matching reward<N> in sorted order."""
-    keys = [k for k in batch.keys() if re.match(r"reward\d+$", str(k))]
-    return sorted(keys, key=lambda k: int(re.search(r"\d+", str(k)).group()))  # type: ignore[union-attr]
+    """Return batch keys that are named reward components (e.g. reward/correctness) in sorted order."""
+    return sorted(
+        k for k in batch.keys() if isinstance(k, str) and k.startswith("reward/")
+    )
 
 # Per-prompt baseline and std calculation for GRPO-style advantage estimation
 def calculate_baseline_and_std_per_prompt(

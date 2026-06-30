@@ -77,9 +77,9 @@ class GDPOAdvantageEstimator:
     """Multi-reward (multi-objective) advantage estimator — a GRPO generalisation.
 
     Where GRPO scores each rollout by a single scalar reward, GDPO handles an
-    environment that emits several reward components per rollout (reward1,
-    reward2, …) — e.g. tests-pass AND lint-clean AND a runtime budget, or several
-    independent graders. For each component it computes a GRPO-style per-prompt
+    environment that emits several named reward components per rollout
+    (reward/correctness, reward/format, …) — e.g. tests-pass AND lint-clean AND a
+    runtime budget, or several independent graders. For each component it computes a GRPO-style per-prompt
     leave-one-out baseline (and optionally per-prompt std-normalises), sums the
     per-component advantages, then renormalises the total to zero mean / unit std.
     Keeping each objective on its own baseline before combining stops a component
@@ -113,7 +113,7 @@ class GDPOAdvantageEstimator:
             prompt_ids:     (batch,)       Per-sample prompt identifier.
             rewards:        Unused; present for interface consistency.
             mask:           (batch, seq)   Response token mask.
-            repeated_batch: BatchedDataDict containing reward1, reward2, … keys.
+            repeated_batch: BatchedDataDict containing named reward/<name> component keys.
             **kwargs:       Ignored.
 
         Returns:
@@ -122,8 +122,8 @@ class GDPOAdvantageEstimator:
         reward_component_keys = get_gdpo_reward_component_keys(repeated_batch)
         if len(reward_component_keys) < 2:
             raise ValueError(
-                f"GDPO requires multiple reward components (reward1, reward2, …). "
-                f"This batch has {len(reward_component_keys)} component(s). "
+                f"GDPO requires multiple reward components (reward/name1, reward/name2, …). "
+                f"This batch has {len(reward_component_keys)} component(s): {reward_component_keys}. "
                 "Switch to GRPO by setting grpo.adv_estimator.name='grpo'."
             )
 

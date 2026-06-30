@@ -41,7 +41,8 @@ for _name in ["nccl", "nccl.core", "nccl.core.communicator", "nccl.core.utils"]:
 # module top. tensorboard is a logging-only dep present on the training image but
 # absent on a plain host, and SummaryWriter is never instantiated in unit tests.
 # Register a minimal stub only when the real module is unavailable so logger-
-# importing modules (e.g. algorithms.rm) load on a plain host; the image is unaffected.
+# importing modules (e.g. algorithms.rm, algorithms.utils) load on a plain host;
+# the image is unaffected.
 import importlib.util as _importlib_util
 
 if _importlib_util.find_spec("tensorboard") is None:
