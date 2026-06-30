@@ -153,12 +153,33 @@ class AsyncTrajectoryCollectorImpl:
         master_config: Any,
         replay_buffer: Any,
         start_step: int,
+        teacher_worker_groups: Optional[dict[str, Any]] = None,
+        alias_to_group_alias: Optional[dict[str, str]] = None,
+        teacher_seq_pad_multiple: int = 1,
     ) -> None:
         self._policy_generation = policy_generation
         self._tokenizer = tokenizer
         self._task_to_env = task_to_env
         self._master_config = master_config
         self._replay_buffer = replay_buffer
+
+        # On-policy distillation teachers (OPD). When teachers are present the
+        # collector scores each generated trajectory through the routed teacher
+        # and stamps `teacher_reference_logprobs` onto the batch so the trainer's
+        # OPDAdvantageEstimator can form `Â = sg[teacher - student]`.
+        import threading
+        from collections import defaultdict
+
+        from dockyard_rl.algorithms import opd as _opd_module
+
+        self._teacher_worker_groups: dict[str, Any] = teacher_worker_groups or {}
+        self._alias_to_group_alias: dict[str, str] = alias_to_group_alias or {}
+        self._teacher_seq_pad_multiple = int(teacher_seq_pad_multiple)
+        self._has_distillation_teachers = bool(self._teacher_worker_groups)
+        self._on_policy_distillation_cfg = _opd_module._opd_cfg(master_config)
+        # One lock per teacher group: serialize forwards on a given teacher to
+        # avoid NCCL collective desync when groups are fanned out concurrently.
+        self._teacher_locks: dict[str, Any] = defaultdict(threading.Lock)
 
         grpo_cfg = master_config.grpo
         self._num_generations_per_prompt = int(grpo_cfg["num_generations_per_prompt"])
@@ -277,6 +298,19 @@ class AsyncTrajectoryCollectorImpl:
                     )
                 except Exception as exc:  # noqa: BLE001 - surface and continue
                     print(f"⚠️ AsyncTrajectoryCollector rollout failed: {exc}")
+                    await asyncio.sleep(0.5)
+                    continue
+
+            # OPD: score the generated trajectories through the routed teacher(s)
+            # and stamp teacher_reference_logprobs onto the batch (off the event
+            # loop, like generation). No-op when no teachers are configured.
+            if self._has_distillation_teachers:
+                try:
+                    await loop.run_in_executor(
+                        None, self._score_teacher_logprobs, repeated_batch
+                    )
+                except Exception as exc:  # noqa: BLE001 - surface and continue
+                    print(f"⚠️ OPD teacher scoring failed: {exc}")
                     await asyncio.sleep(0.5)
                     continue
 
@@ -424,6 +458,126 @@ class AsyncTrajectoryCollectorImpl:
             weight_version=weight_version,
             target_weight_version=target,
         )
+
+    # On-policy distillation: teacher scoring
+    def _score_teacher_logprobs(self, repeated_batch: Any) -> None:
+        """Score the rollout batch through the routed teacher(s) in place.
+
+        Flattens the trajectory message logs to the teacher's pad grid, computes
+        per-token teacher logprobs, and stamps ``teacher_reference_logprobs`` onto
+        ``repeated_batch`` (``from_batches`` then carries it through the per-group
+        slicing into the trainer's advantage computation). No-op when there are no
+        teachers. Runs off the event loop (called via run_in_executor).
+        """
+        from dockyard_rl.data.llm_message_utils import (
+            batched_message_log_to_flat_message,
+        )
+
+        if "message_log" not in repeated_batch:
+            return
+
+        flat_for_teacher, teacher_input_lengths = batched_message_log_to_flat_message(
+            repeated_batch["message_log"],
+            pad_value_dict={"token_ids": self._tokenizer.pad_token_id},
+            make_sequence_length_divisible_by=self._teacher_seq_pad_multiple,
+        )
+        token_ids = flat_for_teacher["token_ids"]
+        batch_size = int(token_ids.shape[0])
+
+        # Per-sample agent routing. Without per-sample agent refs (single-teacher
+        # recipes), route every sample to the default teacher alias.
+        agent_refs = repeated_batch.get("agent_ref")
+        if not isinstance(agent_refs, list) or len(agent_refs) != batch_size:
+            agent_refs = [{"name": "__opd_default__"}] * batch_size
+
+        teacher_logprobs, _ = self._compute_teacher_logprobs(
+            token_ids, agent_refs, input_lengths=teacher_input_lengths
+        )
+        repeated_batch["teacher_reference_logprobs"] = teacher_logprobs
+
+    def _compute_teacher_logprobs(
+        self,
+        input_ids: Any,
+        agent_refs: list[dict[str, Any]],
+        input_lengths: Optional[Any] = None,
+    ) -> tuple[Any, float]:
+        """Compute teacher logprobs for non-colocated teachers.
+
+        Groups samples by routed teacher, fans out in parallel (one thread per
+        teacher, serialized per teacher by a lock), and stitches the results back
+        into a ``[B, S]`` tensor index-aligned with ``input_ids``.
+        """
+        import concurrent.futures
+        import time
+        from collections import defaultdict
+
+        import torch
+
+        from dockyard_rl.algorithms.opd import resolve_reference_aliases
+        from dockyard_rl.distributed.batched_data_dict import BatchedDataDict
+
+        opd_cfg = self._on_policy_distillation_cfg
+        teacher_model_by_agent_name = opd_cfg.get("teacher_model_by_agent_name", {})
+        default_teacher_alias = opd_cfg.get("default_teacher_alias")
+        strict = opd_cfg.get("strict_agent_name_match", False)
+
+        reference_aliases = resolve_reference_aliases(
+            agent_refs,
+            teacher_model_by_agent_name,
+            default_teacher_alias=default_teacher_alias,
+            strict_agent_name_match=strict,
+        )
+        group_keys = [self._alias_to_group_alias.get(a, a) for a in reference_aliases]
+
+        group_to_indices: dict[str, list[int]] = defaultdict(list)
+        for i, gk in enumerate(group_keys):
+            group_to_indices[gk].append(i)
+
+        B, S = input_ids.shape
+        result = torch.zeros(B, S, dtype=torch.float32)
+        if not group_to_indices:  # empty batch — nothing to route
+            return result, 0.0
+
+        def _get_logprobs_for_group(group_key, indices):
+            twg = self._teacher_worker_groups[group_key]
+            sub_input_ids = input_ids[indices]
+            sub_lengths = input_lengths[indices] if input_lengths is not None else None
+
+            # Pad the sub-batch to a multiple of the teacher's DP size.
+            dp_size = twg.sharding_annotations.get_axis_size("data_parallel")
+            actual_batch_size = sub_input_ids.shape[0]
+            remainder = actual_batch_size % dp_size
+            if remainder != 0:
+                pad_count = dp_size - remainder
+                pad_rows = sub_input_ids[-1:].expand(pad_count, -1)
+                sub_input_ids = torch.cat([sub_input_ids, pad_rows], dim=0)
+                if sub_lengths is not None:
+                    sub_lengths = torch.cat(
+                        [sub_lengths, sub_lengths[-1:].expand(pad_count)], dim=0
+                    )
+
+            sub_data = BatchedDataDict({"input_ids": sub_input_ids})
+            if sub_lengths is not None:
+                sub_data["input_lengths"] = sub_lengths
+
+            # Serialize forwards on a given teacher (NCCL collective safety).
+            with self._teacher_locks[group_key]:
+                logprobs_result = twg.get_logprobs(sub_data)
+            logprobs = logprobs_result["reference_logprobs"][:actual_batch_size]
+            return indices, logprobs
+
+        t_total_start = time.time()
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(group_to_indices)
+        ) as executor:
+            futures = {
+                executor.submit(_get_logprobs_for_group, gk, idxs): gk
+                for gk, idxs in group_to_indices.items()
+            }
+            for future in concurrent.futures.as_completed(futures):
+                indices, logprobs = future.result()
+                result[indices] = logprobs
+        return result, time.time() - t_total_start
 
 
 @ray.remote  # pragma: no cover

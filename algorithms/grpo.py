@@ -24,6 +24,7 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from dockyard_rl.algorithms.advantage_estimator import (
     GDPOAdvantageEstimator,
     GRPOAdvantageEstimator,
+    OPDAdvantageEstimator,
     ReinforcePlusPlusAdvantageEstimator,
 )
 from dockyard_rl.algorithms.async_utils import AsyncTrajectoryCollector, ReplayBuffer
@@ -908,9 +909,53 @@ def _create_advantage_estimator(master_config: MasterConfig):
     elif name == "reinforce_plus_plus":
         adv = ReinforcePlusPlusAdvantageEstimator(_adv_cfg, loss_config)
         print("  ✓ Using Reinforce++ advantage estimator")
+    elif name == "opd":
+        adv = OPDAdvantageEstimator(_adv_cfg, loss_config)
+        print("  ✓ Using OPD advantage estimator (on-policy distillation)")
     else:
         raise ValueError(f"Invalid adv_estimator name: {name!r}")
     return adv
+
+
+def _pad_teacher_logprobs(teacher_logprobs: torch.Tensor, train_S: int) -> torch.Tensor:
+    """Right-zero-pad teacher logprobs ``[B, teacher_S]`` to ``train_S``.
+
+    ``from_batches`` pads teacher logprobs to ``max(S_i)`` across prompt groups;
+    the trainer's ``train_data`` may be padded to a larger ``train_S``. The mask
+    zeros the padding in advantage computation, so right-padding is safe.
+    ``teacher_S > train_S`` (teacher padded to a finer grid than the student) is
+    unexpected and raises.
+    """
+    teacher_S = teacher_logprobs.shape[1]
+    if teacher_S > train_S:
+        raise ValueError(
+            f"Teacher logprobs seq length ({teacher_S}) > train_data seq length "
+            f"({train_S}); teacher pad grid is finer than the student's."
+        )
+    if teacher_S < train_S:
+        teacher_logprobs = torch.nn.functional.pad(
+            teacher_logprobs, (0, train_S - teacher_S), value=0.0
+        )
+    return teacher_logprobs
+
+
+def _opd_teacher_logprobs_for_advantage(
+    repeated_batch: Any, train_data: Any
+) -> Optional[torch.Tensor]:
+    """Extract + pad teacher logprobs for the OPD advantage, or None.
+
+    Reads ``teacher_reference_logprobs`` (stamped by the async collector) from the
+    reassembled batch and pads it to the train sequence length. Returns None when
+    no teacher logprobs are present (non-OPD runs).
+    """
+    teacher_lp = None
+    if "teacher_reference_logprobs" in repeated_batch:
+        teacher_lp = repeated_batch["teacher_reference_logprobs"]
+    elif "teacher_reference_logprobs" in train_data:
+        teacher_lp = train_data["teacher_reference_logprobs"]
+    if teacher_lp is None:
+        return None
+    return _pad_teacher_logprobs(teacher_lp, train_data["input_ids"].shape[1])
 
 def extract_initial_prompt_messages(
     message_logs: list,
@@ -2222,6 +2267,35 @@ def async_grpo_train(
         "good convergence due to off-policy samples!"
     )
 
+    # On-policy distillation (OPD): validate config and bring up frozen teacher
+    # worker group(s). The async collector scores each trajectory through the
+    # routed teacher and stamps teacher_reference_logprobs for OPDAdvantageEstimator.
+    from dockyard_rl.algorithms import opd as _opd
+
+    _teacher_worker_groups: dict[str, Any] = {}
+    _teacher_alias_to_group: dict[str, str] = {}
+    _teacher_seq_pad_multiple = 1
+    if _opd.is_opd_enabled(master_config):
+        _opd.assert_prev_logprobs_available(master_config)
+        _opd_dp_cfg = getattr(master_config, "data_plane", None)
+        if _opd_dp_cfg and _opd_dp_cfg.get("enabled", False):
+            raise NotImplementedError(
+                "On-policy distillation (adv_estimator='opd') is not supported on "
+                "the data-plane async path yet; use the in-buffer async path "
+                "(data_plane.enabled=false)."
+            )
+        if _opd.is_non_colocated_teachers_enabled(master_config):
+            print("\n▶ Setting up on-policy distillation teacher(s)...", flush=True)
+            _teacher_worker_groups, _teacher_alias_to_group = (
+                _opd.create_teacher_worker_groups(
+                    master_config, master_config.policy, tokenizer
+                )
+            )
+            _teacher_seq_pad_multiple = _opd.teacher_seq_pad_multiple(
+                _teacher_worker_groups,
+                master_config.policy["make_sequence_length_divisible_by"],
+            )
+
     _async_grpo_cfg = master_config.grpo.get("async_grpo", {})
     if _async_grpo_cfg.get("max_trajectory_age_steps", 1) > 1:
         if not _async_grpo_cfg.get("in_flight_weight_updates", False):
@@ -2293,12 +2367,15 @@ def async_grpo_train(
     trajectory_collector: Any = AsyncTrajectoryCollector.options(
         runtime_env=actor_runtime_env
     ).remote(
-        policy_generation = policy_generation,
-        tokenizer         = tokenizer,
-        task_to_env       = task_to_env,
-        master_config     = master_config,
-        replay_buffer     = replay_buffer,
-        start_step        = step,
+        policy_generation        = policy_generation,
+        tokenizer                = tokenizer,
+        task_to_env              = task_to_env,
+        master_config            = master_config,
+        replay_buffer            = replay_buffer,
+        start_step               = step,
+        teacher_worker_groups    = _teacher_worker_groups,
+        alias_to_group_alias     = _teacher_alias_to_group,
+        teacher_seq_pad_multiple = _teacher_seq_pad_multiple,
     )
 
     collection_task = trajectory_collector.start_collection.remote(dataloader)
@@ -2657,6 +2734,9 @@ def async_grpo_train(
                             logprobs_policy    = train_data["prev_logprobs"],
                             logprobs_reference = train_data.get(
                                 "reference_policy_logprobs"
+                            ),
+                            teacher_logprobs   = _opd_teacher_logprobs_for_advantage(
+                                repeated_batch, train_data
                             ),
                         )
                         train_data["advantages"] = _clip_grpo_advantages(
@@ -3034,4 +3114,11 @@ def async_grpo_train(
             ray.kill(replay_buffer)  # type: ignore[arg-type]
         except Exception as e:
             print(f"Error stopping replay buffer: {e}")
+        # Shut down OPD teacher worker groups (separate clusters) so their GPUs
+        # are released (after the collector that drives them is stopped).
+        for _alias, _twg in _teacher_worker_groups.items():
+            try:
+                _twg.shutdown()
+            except Exception as e:
+                print(f"Error shutting down teacher '{_alias}': {e}")
         print("Async GRPO training complete!")

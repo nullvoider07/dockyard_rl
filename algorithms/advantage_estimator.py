@@ -235,3 +235,87 @@ class ReinforcePlusPlusAdvantageEstimator:
         adv       = (adv - adv_mean) * adv_rstd
 
         return adv.expand(mask.shape)
+
+
+class OPDAdvantageEstimator:
+    """Multi-Teacher On-Policy Distillation (MOPD) advantage estimator (arXiv:2601.02780).
+
+    Token-level distillation advantage (Eq. 8):
+
+        Â_MOPD,t = sg[log π_teacher - log π_student]
+
+    The importance-sampling truncation (the hard gate on the training-to-inference
+    ratio) is handled separately by ICE-POP mode in ClippedPGLoss, not here. The
+    loss should be configured with:
+
+        disable_ppo_ratio: true                          (REINFORCE, no PPO ratio)
+        use_importance_sampling_correction: true
+        truncated_importance_sampling_type: icepop
+        truncated_importance_sampling_ratio_min: <eps_low>
+        truncated_importance_sampling_ratio: <eps_high>
+
+    Selected by ``grpo.adv_estimator.name='opd'``. Requires per-token teacher
+    logprobs (``teacher_logprobs``) and student training-engine logprobs
+    (``logprobs_policy``, dockyard's ``prev_logprobs``).
+    """
+
+    def __init__(
+        self,
+        estimator_config: dict,
+        loss_config: ClippedPGLossConfig,
+    ) -> None:
+        self.last_metrics: dict[str, float] = {}
+
+    def compute_advantage(
+        self,
+        prompt_ids,
+        rewards,
+        mask,
+        logprobs_policy=None,
+        teacher_logprobs=None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Compute OPD token-level distillation advantages.
+
+        Args:
+            prompt_ids: (batch,) prompt IDs (unused; interface compatibility).
+            rewards:    (batch,) rewards (unused for pure distillation).
+            mask:       (batch, seq) 1 = valid response token, 0 = padding.
+            logprobs_policy:  (batch, seq) student training-engine logprobs
+                              (dockyard's prev_logprobs). Required.
+            teacher_logprobs: (batch, seq) teacher model logprobs. Required.
+            **kwargs:   Ignored (e.g. logprobs_reference).
+
+        Returns:
+            (batch, seq) token-level distillation advantages (stop-gradient).
+        """
+        if teacher_logprobs is None:
+            raise ValueError("OPD advantage estimator requires teacher_logprobs")
+        if logprobs_policy is None:
+            raise ValueError(
+                "OPD advantage estimator requires logprobs_policy (student "
+                "prev_logprobs); the config must not zero prev_logprobs"
+            )
+
+        # Â_MOPD,t = sg[log π_teacher - log π_student]  (Eq. 8)
+        distill_advantages = (teacher_logprobs - logprobs_policy).detach()
+        advantages = distill_advantages * mask
+
+        self._compute_metrics(distill_advantages, advantages, mask)
+        return advantages
+
+    def _compute_metrics(self, distill_advantages, advantages, mask) -> None:
+        """Compute OPD logging metrics into self.last_metrics."""
+        valid_bool = mask.bool()
+        distill_valid = torch.masked_select(distill_advantages, valid_bool)
+        adv_valid = torch.masked_select(advantages, valid_bool)
+
+        distill_mean = distill_valid.mean().item() if distill_valid.numel() > 0 else 0.0
+        adv_mean = adv_valid.mean().item() if adv_valid.numel() > 0 else 0.0
+        adv_std = adv_valid.std().item() if adv_valid.numel() > 1 else 0.0
+
+        self.last_metrics = {
+            "on_policy_distillation/teacher_student_logprob_gap_mean": distill_mean,
+            "on_policy_distillation/adv_mean": adv_mean,
+            "on_policy_distillation/adv_std": adv_std,
+        }
