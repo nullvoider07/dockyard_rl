@@ -71,6 +71,9 @@ from dockyard_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from dockyard_rl.models.generation.vllm.router_capture import (
     MISSING_ROUTE_SENTINEL,
 )
+from dockyard_rl.models.dtensor.moe.router_replay import (
+    validate_router_replay_generation_compat,
+)
 from dockyard_rl.models.policy.lm_policy import Policy
 from dockyard_rl.utils.checkpoint import CheckpointManager, CheckpointingConfig
 from dockyard_rl.utils.logger import Logger, LoggerConfig, print_message_log_samples
@@ -179,6 +182,30 @@ class MasterConfig(BaseModel, extra="allow"):
 # ============================================================
 # Setup & Initialisation
 # ============================================================
+
+def _validate_router_replay_compat(
+    master_config: MasterConfig,
+    generation_config: Any,
+    backend: str,
+) -> None:
+    """Marshal config for ``validate_router_replay_generation_compat`` (#2908).
+
+    Extracts the router-replay flag, data_plane state and vLLM engine config
+    from the master/generation configs and delegates the pure compatibility
+    checks. Inert when router replay is disabled.
+    """
+    rr = generation_config.get("router_replay") if generation_config else None
+    enabled = bool(rr.get("enabled", False)) if isinstance(rr, dict) else False
+    dp_cfg = getattr(master_config, "data_plane", None)
+    data_plane_enabled = bool(dp_cfg.get("enabled", False)) if dp_cfg else False
+    validate_router_replay_generation_compat(
+        enabled=enabled,
+        backend=backend,
+        data_plane_enabled=data_plane_enabled,
+        vllm_cfg=generation_config.get("vllm_cfg", {}),
+        vllm_kwargs=generation_config.get("vllm_kwargs", {}),
+    )
+
 
 def setup(
     master_config: MasterConfig,
@@ -584,6 +611,10 @@ def setup(
         return policy_generation, policy
 
     backend = generation_config["backend"]
+
+    # Router-replay (#2908): fail fast on incompatible backend / data_plane /
+    # vLLM-engine configs before any worker is constructed.
+    _validate_router_replay_compat(master_config, generation_config, backend)
 
     if backend == "vllm":
         generation_config = cast(VllmConfig, generation_config)

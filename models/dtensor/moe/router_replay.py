@@ -140,3 +140,68 @@ def validate_router_replay_config(enabled: bool, model: nn.Module) -> None:
             "policy.router_replay.enabled=true requires an MoE model, but the "
             "policy model has no MoEBlock modules"
         )
+
+
+def validate_router_replay_generation_compat(
+    *,
+    enabled: bool,
+    backend: str,
+    data_plane_enabled: bool,
+    vllm_cfg: Any,
+    vllm_kwargs: Any,
+) -> None:
+    """Fail fast on generation/orchestration configs incompatible with capture.
+
+    Pure config-logic (no model / cluster objects) so the orchestrator can
+    pre-validate at setup and surface a dockyard-native message instead of a
+    deep failure later. Inert when ``enabled`` is false.
+
+    - Non-vLLM backend: routed-expert capture reads vLLM's
+      ``CompletionOutput.routed_experts``; other backends do not surface it.
+    - data_plane async: the 4D ``[B, T, L, K]`` route column does not ride the
+      data-plane bulk-field set (HV-47).
+    - vLLM engine config: ``enable_return_routed_experts`` is rejected by vLLM
+      under ``async_scheduling`` / pipeline parallelism / prefill- or
+      decode-context parallelism (validated scope is TP/EP/DP + prefix caching).
+    """
+    if not enabled:
+        return
+
+    if backend != "vllm":
+        raise ValueError(
+            "policy.router_replay.enabled=true requires the vLLM generation "
+            "backend: routed-expert capture reads vLLM CompletionOutput."
+            f"routed_experts, which the {backend!r} backend does not surface. "
+            "Use backend=vllm or disable router replay."
+        )
+
+    if data_plane_enabled:
+        raise ValueError(
+            "policy.router_replay.enabled=true is not supported on the "
+            "data_plane async path: the per-token routed_experts column does "
+            "not ride the data-plane bulk-field set (HV-47). Disable data_plane "
+            "or router replay."
+        )
+
+    cfg = vllm_cfg or {}
+    kwargs = vllm_kwargs or {}
+
+    def _val(name: str, default: int) -> int:
+        return kwargs.get(name, cfg.get(name, default))
+
+    rejected: list[str] = []
+    if cfg.get("pipeline_parallel_size", 1) > 1 or _val("pipeline_parallel_size", 1) > 1:
+        rejected.append("pipeline_parallel_size>1")
+    if kwargs.get("async_scheduling", False):
+        rejected.append("async_scheduling")
+    if _val("prefill_context_parallel_size", 1) > 1:
+        rejected.append("prefill_context_parallel_size>1")
+    if _val("decode_context_parallel_size", 1) > 1:
+        rejected.append("decode_context_parallel_size>1")
+    if rejected:
+        raise ValueError(
+            "policy.router_replay.enabled=true is rejected by vLLM under "
+            f"{', '.join(rejected)} (enable_return_routed_experts is only "
+            "validated for tensor/expert/data parallelism + prefix caching). "
+            "Disable the listed vLLM feature(s) or router replay."
+        )

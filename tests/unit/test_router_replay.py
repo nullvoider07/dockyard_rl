@@ -26,6 +26,7 @@ from dockyard_rl.models.dtensor.moe.router_replay import (
     resolve_router_replay_enabled,
     router_replay_context,
     validate_router_replay_config,
+    validate_router_replay_generation_compat,
 )
 from dockyard_rl.models.generation.vllm import router_capture
 
@@ -354,3 +355,95 @@ def test_context_packing_guard_inert_when_no_column():
         model, None, enabled=True, seq_packing=True, context_parallel=True
     ):
         pass  # no raise
+
+
+# --------------------------------------------------------------------------- #
+# I4 — generation / orchestration compatibility guards
+# --------------------------------------------------------------------------- #
+def _compat(**overrides):
+    kwargs = dict(
+        enabled=True,
+        backend="vllm",
+        data_plane_enabled=False,
+        vllm_cfg={},
+        vllm_kwargs={},
+    )
+    kwargs.update(overrides)
+    validate_router_replay_generation_compat(**kwargs)
+
+
+def test_compat_disabled_allows_anything():
+    # When replay is off, every otherwise-rejected combination is allowed.
+    _compat(
+        enabled=False,
+        backend="sglang",
+        data_plane_enabled=True,
+        vllm_cfg={"pipeline_parallel_size": 4},
+        vllm_kwargs={"async_scheduling": True},
+    )
+
+
+def test_compat_allows_supported_vllm_config():
+    # TP/EP/DP + prefix caching is the validated scope; PP=1, no CP/async.
+    _compat(
+        vllm_cfg={
+            "tensor_parallel_size": 4,
+            "expert_parallel_size": 2,
+            "pipeline_parallel_size": 1,
+            "enable_prefix_caching": True,
+        }
+    )
+
+
+def test_compat_rejects_non_vllm_backend():
+    try:
+        _compat(backend="sglang")
+    except ValueError as e:
+        assert "vLLM generation backend" in str(e)
+    else:
+        raise AssertionError("expected ValueError on sglang backend")
+
+
+def test_compat_rejects_data_plane():
+    try:
+        _compat(data_plane_enabled=True)
+    except ValueError as e:
+        assert "data_plane" in str(e)
+    else:
+        raise AssertionError("expected ValueError on data_plane")
+
+
+def test_compat_rejects_pipeline_parallel():
+    try:
+        _compat(vllm_cfg={"pipeline_parallel_size": 2})
+    except ValueError as e:
+        assert "pipeline_parallel_size>1" in str(e)
+    else:
+        raise AssertionError("expected ValueError on PP>1")
+
+
+def test_compat_rejects_async_scheduling():
+    try:
+        _compat(vllm_kwargs={"async_scheduling": True})
+    except ValueError as e:
+        assert "async_scheduling" in str(e)
+    else:
+        raise AssertionError("expected ValueError on async_scheduling")
+
+
+def test_compat_rejects_context_parallel_via_kwargs():
+    try:
+        _compat(vllm_kwargs={"decode_context_parallel_size": 2})
+    except ValueError as e:
+        assert "decode_context_parallel_size>1" in str(e)
+    else:
+        raise AssertionError("expected ValueError on DCP>1")
+
+
+def test_compat_rejects_prefill_context_parallel():
+    try:
+        _compat(vllm_kwargs={"prefill_context_parallel_size": 2})
+    except ValueError as e:
+        assert "prefill_context_parallel_size>1" in str(e)
+    else:
+        raise AssertionError("expected ValueError on PCP>1")
