@@ -36,3 +36,15 @@ for _name in ["nccl", "nccl.core", "nccl.core.communicator", "nccl.core.utils"]:
         if _name in _NCCL_PACKAGES:
             _mod.__path__ = []  # type: ignore[attr-defined]
         sys.modules[_name] = _mod
+
+# `dockyard_rl.utils.logger` imports `torch.utils.tensorboard.SummaryWriter` at
+# module top. tensorboard is a logging-only dep present on the training image but
+# absent on a plain host, and SummaryWriter is never instantiated in unit tests.
+# Register a minimal stub only when the real module is unavailable so logger-
+# importing modules (e.g. algorithms.rm) load on a plain host; the image is unaffected.
+import importlib.util as _importlib_util
+
+if _importlib_util.find_spec("tensorboard") is None:
+    _tb_stub = types.ModuleType("torch.utils.tensorboard")
+    _tb_stub.SummaryWriter = type("SummaryWriter", (), {})  # type: ignore[attr-defined]
+    sys.modules["torch.utils.tensorboard"] = _tb_stub
