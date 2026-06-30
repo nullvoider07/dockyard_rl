@@ -8,6 +8,9 @@ from dockyard_rl.algorithms.loss.loss_functions import (
     DistillationLossConfig,
     DistillationLossDataDict,
     DistillationLossFn,
+    CrossTokenizerDistillationLossConfig,
+    CrossTokenizerDistillationLossDataDict,
+    CrossTokenizerDistillationLossFn,
     CDPOLossFn,
     DPOLossConfig,
     DPOLossDataDict,
@@ -28,7 +31,7 @@ from dockyard_rl.algorithms.loss.loss_functions import (
     build_preference_loss,
     is_reference_free,
 )
-from dockyard_rl.algorithms.loss.utils import calculate_kl, masked_mean
+from dockyard_rl.algorithms.loss.utils import calculate_kl, masked_mean, prepare_loss_input
 
 __all__ = [
     # Interfaces
@@ -42,7 +45,9 @@ __all__ = [
     "SimPOLossFn", "ORPOLossFn",
     "PREFERENCE_LOSS_REGISTRY", "build_preference_loss", "is_reference_free",
     "DistillationLossConfig", "DistillationLossDataDict", "DistillationLossFn",
+    "CrossTokenizerDistillationLossConfig", "CrossTokenizerDistillationLossDataDict",
+    "CrossTokenizerDistillationLossFn",
     "DraftCrossEntropyLossConfig", "DraftCrossEntropyLossDataDict", "DraftCrossEntropyLossFn",
     # Utilities
-    "masked_mean", "calculate_kl",
+    "masked_mean", "calculate_kl", "prepare_loss_input",
 ]
