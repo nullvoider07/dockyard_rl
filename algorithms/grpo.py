@@ -37,6 +37,7 @@ from dockyard_rl.algorithms.loss.interfaces import LossFunction
 from dockyard_rl.algorithms.reward_functions import (
     RewardShapingConfig,
     apply_invalid_action_penalty,
+    apply_message_span_advantage_penalties,
     apply_reward_shaping,
 )
 from dockyard_rl.rewards.invalid_action import InvalidActionPenaltyConfig
@@ -1549,7 +1550,9 @@ def grpo_train(
                         repeated_batch, master_config.grpo["reward_shaping"]
                     )
                 repeated_batch = apply_invalid_action_penalty(
-                    repeated_batch, master_config.grpo.get("invalid_action_penalty")
+                    repeated_batch,
+                    master_config.grpo.get("invalid_action_penalty"),
+                    step=total_steps,
                 )
 
                 # Rewards & advantages
@@ -1789,6 +1792,13 @@ def grpo_train(
                         logprobs_reference = train_data.get(
                             "reference_policy_logprobs"
                         ),
+                    )
+                    # Advantage-locus invalid-action penalties on flagged spans (N2).
+                    train_data["advantages"], _ = apply_message_span_advantage_penalties(
+                        train_data["advantages"],
+                        repeated_batch["message_log"],
+                        master_config.grpo.get("invalid_action_penalty"),
+                        step=total_steps,
                     )
                     train_data["advantages"] = _clip_grpo_advantages(
                         train_data["advantages"], master_config.grpo
@@ -2691,6 +2701,7 @@ def async_grpo_train(
                         repeated_batch = apply_invalid_action_penalty(
                             repeated_batch,
                             master_config.grpo.get("invalid_action_penalty"),
+                            step=step,
                         )
                         rewards = repeated_batch["total_reward"]
                         print(
@@ -2818,6 +2829,16 @@ def async_grpo_train(
                             teacher_logprobs   = _opd_teacher_logprobs_for_advantage(
                                 repeated_batch, train_data
                             ),
+                        )
+                        # Advantage-locus invalid-action penalties on flagged spans (N2).
+                        (
+                            train_data["advantages"],
+                            _,
+                        ) = apply_message_span_advantage_penalties(
+                            train_data["advantages"],
+                            repeated_batch["message_log"],
+                            master_config.grpo.get("invalid_action_penalty"),
+                            step=step,
                         )
                         train_data["advantages"] = _clip_grpo_advantages(
                             train_data["advantages"], master_config.grpo
