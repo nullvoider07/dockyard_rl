@@ -859,6 +859,23 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         futures = self.worker_group.run_all_workers_single_data("get_free_memory_bytes")
         return min(ray.get(future) for future in futures)
 
+    def get_total_memory_bytes(self) -> int:
+        """Get the total GPU memory capacity (minimum across all workers)."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "get_total_memory_bytes"
+        )
+        return min(ray.get(future) for future in futures)
+
+    def get_model_parameter_count(self) -> int:
+        """Get the global (unsharded) model parameter count.
+
+        Every worker reports the same global count, so the first result is used.
+        """
+        futures = self.worker_group.run_all_workers_single_data(
+            "get_model_parameter_count"
+        )
+        return int(ray.get(futures)[0])
+
     def shutdown(self) -> bool:
         """Shut down all workers and clean up resources."""
         try:
