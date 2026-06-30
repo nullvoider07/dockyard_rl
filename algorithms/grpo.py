@@ -466,6 +466,18 @@ def setup(
     print("\n▶ Setting up model and training...", flush=True)
 
     generation_config["model_name"] = policy_config["model_name"]
+    # MoE router-replay (#2908): surface policy.router_replay to the generation
+    # workers as a plain {"enabled": bool} dict so the vLLM worker can gate
+    # enable_return_routed_experts + per-token route capture. Inert (and the
+    # generation path byte-unchanged) when unset / disabled.
+    _router_replay_cfg = policy_config.get("router_replay")
+    generation_config["router_replay"] = {
+        "enabled": bool(
+            _router_replay_cfg.get("enabled", False)
+            if isinstance(_router_replay_cfg, dict)
+            else getattr(_router_replay_cfg, "enabled", False)
+        )
+    }
     worker_init_timing_metrics: dict[str, float] = {}
 
     weights_path, optimizer_path = checkpointer.get_resume_paths(last_checkpoint_path)

@@ -19,6 +19,7 @@ from dockyard_rl.models.generation.vllm.router_capture import (
     align_routed_expert_indices,
     routed_experts_empty,
     routed_experts_from_vllm_output,
+    stack_routed_experts,
 )
 
 
@@ -224,3 +225,44 @@ def test_vllm_output_adapter_missing_fields_returns_none():
         request, completion, valid_length=4, padded_length=6
     )
     assert full is None
+
+
+def test_stack_all_none_returns_none():
+    assert stack_routed_experts([None, None], padded_length=5) is None
+
+
+def test_stack_builds_batch_with_arange_fill_for_none_samples():
+    # Sample 0 has routing; sample 1 is None -> filled with the default route.
+    sample0 = align_routed_expert_indices(
+        _routes(3, 2, 2), valid_length=4, padded_length=6
+    )
+    batch = stack_routed_experts([sample0, None], padded_length=6)
+    assert batch is not None
+    assert batch.shape == (2, 6, 2, 2)
+    assert batch.dtype == torch.int32
+    # Row 0 is the aligned sample; row 1 is the identity arange default route.
+    assert torch.equal(batch[0], sample0)
+    assert torch.equal(batch[1], routed_experts_empty(6, 2, 2))
+
+
+def test_stack_preserves_each_sample():
+    s0 = align_routed_expert_indices(_routes(2, 1, 2), valid_length=3, padded_length=4)
+    s1 = align_routed_expert_indices(
+        _routes(3, 1, 2, start=900), valid_length=4, padded_length=4
+    )
+    batch = stack_routed_experts([s0, s1], padded_length=4)
+    assert batch is not None
+    assert batch.shape == (2, 4, 1, 2)
+    assert torch.equal(batch[0], s0)
+    assert torch.equal(batch[1], s1)
+
+
+def test_stack_inconsistent_shape_raises():
+    s0 = routed_experts_empty(4, 2, 2)
+    s1 = routed_experts_empty(4, 3, 2)  # different L
+    try:
+        stack_routed_experts([s0, s1], padded_length=4)
+    except ValueError as e:
+        assert "inconsistent aligned routed_experts shapes" in str(e)
+    else:
+        raise AssertionError("expected ValueError on inconsistent shapes")

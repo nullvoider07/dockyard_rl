@@ -161,6 +161,56 @@ def align_routed_expert_indices(
     return (full, stats) if return_stats else full
 
 
+def stack_routed_experts(
+    per_sample: list[Optional[torch.Tensor]],
+    *,
+    padded_length: int,
+    device: Optional[torch.device] = None,
+) -> Optional[torch.Tensor]:
+    """Stack per-sample aligned routes into a batch ``[B, padded_length, L, K]``.
+
+    Each entry is an aligned ``[padded_length, L, topk]`` tensor (from
+    :func:`align_routed_expert_indices`) or ``None`` for a sample whose backend
+    returned no routing. Samples that are ``None`` are filled with the identity
+    default route (:func:`routed_experts_empty`) using the ``(L, topk)`` of the
+    first sample that did carry routing, so the batch is rectangular. Returns
+    ``None`` when no sample carried routing (the routed_experts column is then
+    simply absent and replay degenerates to a no-op).
+
+    Args:
+        per_sample: One entry per batch row; aligned route tensor or ``None``.
+        padded_length: Sequence length every entry is (or will be) aligned to.
+        device: Target device for synthesized empties / the stacked result.
+    """
+    reference = next((t for t in per_sample if t is not None), None)
+    if reference is None:
+        return None
+    if reference.dim() != 3:
+        raise ValueError(
+            "aligned routed_experts entries must be [padded_length, L, topk], "
+            f"got {tuple(reference.shape)}"
+        )
+    num_layers = int(reference.shape[1])
+    top_k = int(reference.shape[2])
+    rows: list[torch.Tensor] = []
+    for t in per_sample:
+        if t is None:
+            rows.append(
+                routed_experts_empty(
+                    padded_length, num_layers, top_k, device=device
+                )
+            )
+        else:
+            if tuple(t.shape) != (padded_length, num_layers, top_k):
+                raise ValueError(
+                    "inconsistent aligned routed_experts shapes in batch: "
+                    f"{tuple(t.shape)} vs "
+                    f"{(padded_length, num_layers, top_k)}"
+                )
+            rows.append(t.to(device) if device is not None else t)
+    return torch.stack(rows, dim=0)
+
+
 def routed_experts_from_vllm_output(
     request_output: Any,
     completion_output: Any,
