@@ -20,8 +20,8 @@ piece is built the way it is.
 - [The JAX trainer backend](jax-trainer.md) — the Flax NNX re-platform below the
   policy interface.
 - [Preference optimization (DPO)](dpo.md) — DPO and online DPO.
-- [Distillation](distillation.md) — off-policy, on-policy (OPD), and
-  cross-tokenizer distillation.
+- [Distillation](distillation.md) — on-policy logit distillation, advantage
+  distillation (OPD), and cross-tokenizer (xtoken) distillation.
 
 ```{toctree}
 :hidden:

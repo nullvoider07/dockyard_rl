@@ -1,19 +1,22 @@
 # Distillation
 
-Distillation trains a student to match a frozen teacher. dockyard supports three
-modes that differ in *what* the teacher scores and *whose* tokenizer is in play:
-off-policy (teacher scores a fixed dataset), on-policy (teacher scores the
-student's own rollouts), and cross-tokenizer (teacher and student tokenize
-differently). All three reduce to a KL between teacher and student distributions;
-the machinery differs in how the teacher signal is produced and transported.
+Distillation trains a student to match a frozen teacher. In dockyard the student
+always generates **on-policy** — every mode reuses the GRPO rollout +
+environment infrastructure, so the teacher scores the student's *own* rollouts.
+The modes differ in the **teacher signal** and how it enters the loss: a direct
+KL on the teacher's top-k logits, a teacher-log-prob advantage routed through the
+policy-gradient loss, or a cross-tokenizer projection when the two tokenizers
+disagree.
 
-## Off-policy distillation
+## Logit distillation
 
-The baseline path (`algorithms/distillation.py`). A frozen teacher scores a fixed
-prompt/response dataset and emits, per position, its **top-k** log-probabilities
-and indices; the student matches them with a top-k KL (`DistillationLossFn`,
-`LossInputType.DISTILLATION`). Shipping only the top-k — not the full vocab —
-keeps the teacher signal small enough to precompute or stream.
+The distillation loop (`algorithms/distillation.py`). The student generates
+rollouts against an environment; the frozen teacher scores those tokens and
+supplies its **top-k** log-probabilities and indices (`num_topk_logits`); the
+student is trained to match the teacher's distribution with a top-k KL
+(`DistillationLossFn`, `LossInputType.DISTILLATION`). Shipping only the top-k —
+not the full vocab — keeps the teacher signal small enough to transport each
+step.
 
 ### Colocated mode
 
@@ -28,12 +31,12 @@ peak from the model shapes and **refuses at startup** with an actionable
 shortfall rather than OOMing mid-run. The arithmetic is pure (no CUDA), so the
 safety property is unit-tested on CPU; the separate-cluster path is unchanged.
 
-## On-policy distillation (OPD)
+## Advantage distillation (OPD)
 
-On-policy distillation (`algorithms/opd.py`) moves the teacher onto the
-student's **own** rollouts inside async GRPO. The student generates on-policy;
-one or more frozen, non-colocated teacher groups score the generated tokens via
-log-probs; `OPDAdvantageEstimator` forms the token-level distillation advantage
+On-policy distillation (`algorithms/opd.py`) keeps the same on-policy rollouts but
+changes the teacher signal: instead of a direct KL on logits, the teacher scores
+the student's tokens with per-token **log-probs**, and `OPDAdvantageEstimator`
+turns the gap into a token-level advantage
 
 ```text
 Â = stop_grad[ log π_teacher − log π_student ]
@@ -41,12 +44,13 @@ log-probs; `OPDAdvantageEstimator` forms the token-level distillation advantage
 
 which flows into the same `ClippedPGLossFn` as every other estimator (selected by
 `grpo.adv_estimator.name='opd'`; the heavy-tailed ratio is truncated by the
-loss's ICE-POP mode). Multiple teachers are routed per sample by agent name, so a
-mixed batch can be scored by different teachers (MOPD). Teachers run as DTensor
-`Policy` worker groups on **dedicated fleets** (`STRICT_PACK`); when the cluster
-exposes NVLink topology they are placed on
-[NVLink segments](../architecture/cluster-and-fleets.md), otherwise on plain
-dedicated clusters.
+loss's ICE-POP mode). Casting distillation as an *advantage* rather than a
+separate loss lets it compose with the rest of the GRPO machinery. Multiple
+teachers are routed per sample by agent name (MOPD), so a mixed batch can be
+scored by different teachers. Teachers run as DTensor `Policy` worker groups on
+**dedicated fleets** (`STRICT_PACK`); when the cluster exposes NVLink topology
+they are placed on [NVLink segments](../architecture/cluster-and-fleets.md),
+otherwise on plain dedicated clusters.
 
 ## Cross-tokenizer distillation (xtoken)
 
