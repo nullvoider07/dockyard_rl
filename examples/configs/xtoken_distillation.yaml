@@ -26,7 +26,7 @@ distillation:
   val_at_start: true
   val_at_end: true
   # Teacher microbatch size for the validation logits export.
-  val_teacher_micro_batch_size: ${teacher_policy.train_micro_batch_size}
+  val_teacher_micro_batch_size: ${teachers.0.train_micro_batch_size}
 
   # DUAL teacher-logit transport (dockyard extension over upstream's IPC-only):
   #   ipc           — node-local CUDA IPC (zero-copy; teacher+student co-located
@@ -39,12 +39,14 @@ distillation:
   # per-message size for a large teacher vocab). Inert when transport=ipc.
   num_seq_chunks: 4
 
-  # Cross-tokenizer collation: tokenize twice + align. ctx lengths cap each side;
-  # make_seq_div_by rounds each sequence up (TP*CP*2 for the DTensor V2 worker).
+  # Cross-tokenizer collation: tokenize the student once + tokenize/align each
+  # teacher. ctx lengths cap each side; make_seq_div_by rounds each sequence up
+  # (TP*CP*2 for the DTensor V2 worker). The teacher caps/divisors are per-teacher
+  # lists (one entry per teachers[] below).
   ctx_length_student: ${policy.max_total_sequence_length}
-  ctx_length_teacher: ${teacher_policy.max_total_sequence_length}
+  ctx_length_teachers: ["${teachers.0.max_total_sequence_length}"]
   make_seq_div_by_student: ${policy.make_sequence_length_divisible_by}
-  make_seq_div_by_teacher: 1
+  make_seq_div_by_teachers: [1]
 
 # CrossTokenizerDistillationLossFn. Mode = (gold_loss, xtoken_loss):
 #   (false,false) P-KL: full-vocab projection KL over a microbatch-global top-k
@@ -54,8 +56,6 @@ distillation:
 #   (true, true)  gold-loss with the xtoken modifier (relaxed exact-map threshold).
 # student_vocab_size / teacher_vocab_size are runtime-injected from the tokenizers.
 loss_fn:
-  # student->teacher vocab projection (.pt). REQUIRED at runtime (set via CLI).
-  projection_matrix_path: null
   gold_loss: false
   xtoken_loss: false
   temperature: 1.0
@@ -66,6 +66,22 @@ loss_fn:
   kl_loss_weight: 1.0
   ce_loss_scale: 1.0
   dynamic_loss_scaling: true
+  # Multi-teacher aggregation. The per-teacher projection paths / weights / vocab
+  # sizes are taken from the teachers[] list below and injected by the driver;
+  # they are NOT loss_fn keys here.
+  #   sum             — weighted sum of per-teacher KD (static teacher weights, or
+  #                     dynamic via sum_weights_metric).
+  #   averaged_logits — convex-average the teacher logits, then one KL (all
+  #                     teachers must share the student tokenizer).
+  #   select_teacher  — use only the teacher with the lowest next-token CE.
+  kd_loss_mode: "sum"
+  # sum-mode only: scale each teacher's KD by log(V_t_i)/log(min_j V_t_j).
+  normalize_teacher_by_vocab: false
+  # softmax temperature on the dynamic teacher-weight scores (sum_weights_metric).
+  alpha: 1.0
+  # sum-mode only: "ce" | "entropy" | "max_prob" for dynamic weights; null = the
+  # static teachers[].weight values.
+  sum_weights_metric: null
 
 policy:
   model_name: "Qwen/Qwen2.5-1.5B-Instruct"     # student
@@ -147,25 +163,38 @@ policy:
         total_iters: 10000000000
     - milestones: [20]
 
-# Frozen teacher policy — a DIFFERENT tokenizer from the student (the whole point
-# of cross-tokenizer distillation). Separate resources from the student.
-teacher_policy:
-  model_name: "meta-llama/Llama-3.1-8B-Instruct"
-  tokenizer:
-    name: ${teacher_policy.model_name}
-    chat_template: null
-    chat_template_kwargs: null
-  dtype: "bfloat16"
-  max_total_sequence_length: 4096
-  train_micro_batch_size: 1
-  dtensor_cfg:
-    _v2: true
-    enabled: true
-    tensor_parallel_size: 1
-    context_parallel_size: 1
-  resources:
-    gpus_per_node: 1
-    num_nodes: 1
+# Frozen teacher(s). A list — one entry per teacher; the single-teacher case is a
+# length-1 list. Each teacher carries its own projection matrix (null = a
+# same-tokenizer teacher: direct KL, no projection), a static loss weight, and
+# optional per-teacher gold/xtoken overrides (honored only in kd_loss_mode=sum).
+# The driver injects the parallel per-teacher lists (projection_matrix_paths,
+# teacher_vocab_sizes, teacher_weights, teacher_gold_loss, teacher_xtoken_loss)
+# into loss_fn from this list. A cross-tokenizer teacher uses a DIFFERENT
+# tokenizer from the student (the whole point of cross-tokenizer distillation).
+teachers:
+  - model_name: "meta-llama/Llama-3.1-8B-Instruct"
+    # student->teacher vocab projection (.pt). REQUIRED at runtime for a
+    # cross-tokenizer teacher (set via CLI); null marks a same-tokenizer teacher.
+    projection_matrix_path: null
+    weight: 1.0
+    # per-teacher overrides of loss_fn.gold_loss / .xtoken_loss (null = inherit).
+    gold_loss: null
+    xtoken_loss: null
+    tokenizer:
+      name: ${teachers.0.model_name}
+      chat_template: null
+      chat_template_kwargs: null
+    dtype: "bfloat16"
+    max_total_sequence_length: 4096
+    train_micro_batch_size: 1
+    dtensor_cfg:
+      _v2: true
+      enabled: true
+      tensor_parallel_size: 1
+      context_parallel_size: 1
+    resources:
+      gpus_per_node: 1
+      num_nodes: 1
 
 data:
   max_input_seq_length: ${policy.max_total_sequence_length}
