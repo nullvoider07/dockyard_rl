@@ -35,6 +35,19 @@ GDPO
   codebase; read it as "multi-reward GRPO". See
   [GRPO and the loss](design-docs/grpo-and-loss.md).
 
+OPD
+  On-Policy Distillation — the student generates on-policy and a frozen teacher
+  scores those rollouts via log-probs; `OPDAdvantageEstimator` forms the
+  advantage `sg[log π_teacher − log π_student]` (selected by
+  `adv_estimator='opd'`). MOPD is the multi-teacher form (routed per sample).
+  See [Distillation](design-docs/distillation.md).
+
+xtoken
+  Cross-tokenizer distillation — distillation from a teacher whose tokenizer
+  differs from the student's: a token aligner maps teacher to student tokens and
+  the teacher's logits are projected onto the student vocabulary for a
+  chunk-averaged KL. See [Distillation](design-docs/distillation.md).
+
 RLOO
   REINFORCE Leave-One-Out — the leave-one-out baseline (each sample's baseline
   excludes itself), used by the GRPO estimator.
@@ -119,6 +132,12 @@ MoE
   Mixture of Experts — a sparse layer that routes each token to a few of many
   expert MLPs. See [Mixture of Experts](design-docs/moe.md).
 
+Router replay (R3)
+  Reusing generation's recorded per-token expert selection in the trainer's MoE
+  forward, so train-time routing matches generation and their log-probs line up
+  (removing the router-nondeterminism component of the log-prob error). Gated by
+  `policy.router_replay.enabled`. See [Mixture of Experts](design-docs/moe.md).
+
 GEMM
   General Matrix Multiply. "Grouped-GEMM" batches the per-expert matmuls of an
   MoE layer into one call.
@@ -130,6 +149,11 @@ LoRA
 FP8
   8-bit floating point — the optional quantized format for vLLM inference
   serving (training stays bf16).
+
+NVFP4
+  NVIDIA 4-bit floating point — a ModelOpt quantized format optionally served
+  during rollout (`real_quant`) through vLLM's FP4 kernel and re-applied across
+  refits. See [Quantized generation](design-docs/quantized-generation.md).
 
 bf16
   bfloat16 — 16-bit "brain" floating point; the default training precision.

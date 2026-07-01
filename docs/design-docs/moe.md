@@ -56,9 +56,46 @@ sharded representation back into the per-expert layout during weight sync, so th
 inference fleet receives weights in the shape its kernel consumes. This is the
 MoE-specific part of the [refit seam](../architecture/weight-sync.md).
 
+## Router replay (R3)
+
+An MoE router selects top-K experts per token. Re-running that router at
+train/log-prob time can pick *different* experts than generation did — batch
+composition, padding, and kernel/dtype nondeterminism all perturb the gate — so
+the same token gets a different log-prob than it was generated with. That biases
+the off-policy importance-sampling correction and inflates the
+train/generation log-prob error dockyard uses to filter stale rollouts. Router
+replay removes this nondeterminism by forcing the trainer's MoE forward to reuse
+generation's recorded expert selection. It is gated by
+`policy.router_replay.enabled` (default `false`) and is a no-op on dense models.
+
+- **Capture** (`models/generation/vllm/router_capture.py`) — vLLM exposes the
+  per-token selection on `CompletionOutput.routed_experts`
+  (`[tokens, num_moe_layers, top_k]`) when the engine is built with
+  `enable_return_routed_experts=True`. Capture aligns it onto the trainer's
+  right-padded `[padded_length, L, top_k]` layout. Routing is a **next-token**
+  quantity — the route at position `i` drove the prediction of token `i+1` — so
+  only the first `valid_length − 1` positions carry a real route; the final token
+  and padding take the identity route `arange(top_k)`, and genuinely-missing
+  interior routes (rare; prefix-caching + chunked prefill) are flagged with a
+  sentinel so the consumer rejects rather than silently mis-replays them.
+- **Replay** (`models/dtensor/moe/router_replay.py`) — the recorded routing
+  `[B, T, L_moe, K]` rides the rollout data dict into the trainer.
+  `bind_router_replay` walks the model's `MoEBlock` modules in module order and
+  binds each block's per-layer route slice (set-and-consume); the router
+  (`router.py`) consumes the bound slice, forcing `topk_expert_ids` to the
+  recorded ids while the **gating weights still come from the train model's own
+  gate, so the gradient is intact**. `L_moe` must equal the number of `MoEBlock`
+  modules — a mismatch is a hard error rather than a silent mis-bind.
+
+A compatibility guard (`validate_router_replay_generation_compat`) fails fast on
+generation/orchestration configs that cannot surface aligned routing (e.g.
+pipeline parallelism or async scheduling) instead of silently degrading.
+
 ## Validation
 
 The pure parts — router/dispatch identity, the grouped expert math, the
-load-balance bias update, the refit re-expansion round-trip — are CPU-tested. The
-live expert-parallel all-to-all collective is GPU-only and tracked in the
-hardware-deferred-validation ledger.
+load-balance bias update, the refit re-expansion round-trip, and the
+router-replay capture-alignment + set-and-consume binding — are CPU-tested. The
+live expert-parallel all-to-all collective and live capture + multi-rank replay
+(success metric: the log-prob error drops for an MoE policy) are GPU-only and
+tracked in the hardware-deferred-validation ledger.

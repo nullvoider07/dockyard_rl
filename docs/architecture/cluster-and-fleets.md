@@ -56,6 +56,36 @@ Independent of the fleet-level strategy, the per-node sub-groups inside a
 one strict-pack group per logical node guarantees every bundle of that group
 lands on the same physical node, preserving NVLink locality.
 
+## NVLink-segment placement
+
+`STRICT_PACK` keeps a bundle on one node, but a multi-node collective group (a
+tensor-parallel replica spanning nodes, or a dedicated teacher fleet) also wants
+its nodes to share one NVLink switch fabric rather than scatter across the
+cluster. A `FleetSpec` can request this with `segment_size` (default `None` —
+topology-agnostic placement, unchanged behaviour).
+
+`ray.sub` registers two custom Ray resources per node: `nvlink_domain_<UUID>`
+(the NVLink fabric, parsed from `nvidia-smi`) and `topo_rank` (the SLURM
+topological rank). `get_ray_cluster_topology()` reads them into
+`node_id → (nvlink_domain, topo_rank)`, and `select_segment_nodes(topology,
+segment_size, num_nodes)` greedily takes complete `segment_size`-node segments
+from each NVLink domain, in topological order, until `num_nodes` are chosen —
+returning the selected nodes plus the remainder. `segment_size` must divide
+`num_nodes`; if not enough complete segments can be formed it raises rather than
+spill a segment across fabrics.
+
+Nodes with no topology resources collapse into a single `unknown` pseudo-domain
+and are **excluded** from segment selection (they fall through to the remainder).
+Selecting them would emit a placement constraint naming a Ray resource `ray.sub`
+never registered, so the bundle could never schedule — excluding them pins
+segments only to real, registered NVLink domains. This underpins topology-aware
+teacher placement for [on-policy distillation](../design-docs/distillation.md)
+and any TP replica that must span nodes.
+
+The selection/sort logic is pure (CPU-tested); the `ray.nodes()` read, the
+domain-pinned placement, and the `ray.sub` topology probe are cluster-bound and
+hardware-deferred.
+
 ## Pre-flight validation
 
 `cluster/placement.py` is pure computation — it creates no Ray objects, so it
