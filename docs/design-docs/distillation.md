@@ -56,24 +56,38 @@ otherwise on plain dedicated clusters.
 
 When the teacher's tokenizer differs from the student's, position-aligned KL is
 meaningless — the two models segment the same text into different tokens. The
-`algorithms/x_token/` subsystem bridges this:
+`algorithms/x_token/` subsystem bridges this, and generalizes to **several
+teachers** distilled into one student at once (the single-teacher case is just a
+one-entry teacher list):
 
 - **Alignment** (`token_aligner.py`) — maps teacher token spans to student token
-  spans, producing the chunk structure over which the KL is averaged.
-- **Projection** (`loss_utils.py`) — the teacher's full-vocab logits are
-  projected onto the student vocabulary through a sparse projection matrix, then
+  spans, producing the chunk structure over which the KL is averaged. Each
+  cross-tokenizer teacher is aligned independently.
+- **Projection** (`loss_utils.py`) — a teacher's full-vocab logits are projected
+  onto the student vocabulary through *its own* sparse projection matrix, then
   reduced with a **chunk-averaged** cross-tokenizer KL so each aligned chunk
-  contributes once regardless of how many tokens it spans (`LossInputType.
-  DISTILLATION_CROSS_TOKENIZER`).
-- **Transport** — rebuilding the teacher's full-vocab logits is bandwidth-heavy.
-  Two transports are supported: node-local CUDA IPC (fast when teacher and
-  student share a node) and a cross-cluster transport (so cross-tokenizer
-  distillation works on a real multi-node cluster, not only single-node).
+  contributes once regardless of how many tokens it spans
+  (`LossInputType.DISTILLATION_CROSS_TOKENIZER`). A teacher that *shares* the
+  student's tokenizer sets no projection matrix (`projection_matrix_path: null`)
+  and takes a direct top-k KL with no alignment.
+- **Multi-teacher aggregation** — each teacher contributes a KD term; the terms
+  combine per `kd_loss_mode`: a **weighted sum** (static per-teacher `weight`, or
+  dynamic weights from a `sum_weights_metric` of teacher CE / entropy / max-prob
+  softmaxed at temperature `alpha`), an **averaged-logits** convex combination of
+  same-tokenizer teachers followed by one KL, or **select-teacher** (only the
+  lowest-CE teacher). The aggregate KD is combined with a single student
+  cross-entropy; per-teacher metrics are logged with a `_t{i}` suffix.
+- **Transport** — rebuilding each teacher's full-vocab logits is bandwidth-heavy.
+  Two transports are supported per teacher: node-local CUDA IPC (fast when
+  teacher and student share a node) and a cross-cluster transport (so
+  cross-tokenizer distillation works on a real multi-node cluster, not only
+  single-node).
 
 ## Validation
 
 The CPU-testable cores — the top-k KL math, the colocation memory accounting and
 schedule selection, the `OPDAdvantageEstimator` advantage, the token alignment
-and chunk-averaged projection math — are unit-tested. Live teacher scoring,
-multi-GPU IPC transport, and the dedicated-fleet teacher placement are GPU /
-multi-node and tracked in the hardware-deferred-validation ledger.
+and chunk-averaged projection math, and the multi-teacher aggregation modes and
+dynamic weighting — are unit-tested. Live teacher scoring, multi-GPU IPC
+transport, and the dedicated-fleet teacher placement are GPU / multi-node and
+tracked in the hardware-deferred-validation ledger.
