@@ -320,7 +320,11 @@ python3 examples/run_rlaif.py        --config examples/configs/rlaif.yaml
 - **Reward modeling** (`algorithms/rm.py`) — scalar RM on preference pairs
   (Bradley-Terry loss).
 - **On-policy distillation** (`algorithms/distillation.py`) — the student
-  generates against an environment; a frozen teacher supplies top-k logits.
+  generates against an environment; a frozen teacher supplies top-k logits
+  (top-k KL). The advantage-distillation variant (`algorithms/opd.py`,
+  `adv_estimator='opd'`, multi-teacher) and cross-tokenizer distillation
+  (`algorithms/x_token/`) extend it; see
+  [the distillation design doc](https://nullvoider07.github.io/dockyard_rl/design-docs/distillation.html).
 - **Online DPO** (`algorithms/online_dpo.py`) — on-policy: generate K candidates,
   judge them, train on best-vs-worst pairs.
 - **RLAIF / Constitutional-AI** (`algorithms/rlaif.py`) — critique→revise to build

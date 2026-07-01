@@ -203,6 +203,14 @@ class ClippedPGLossFn(LossFunction):
                 self.truncated_importance_sampling_ratio is not None
                 and self.truncated_importance_sampling_ratio > 0
             ), "truncated_importance_sampling_ratio must be positive"
+            if self.truncated_importance_sampling_ratio_min is not None:
+                assert (
+                    self.truncated_importance_sampling_ratio_min
+                    <= self.truncated_importance_sampling_ratio
+                ), (
+                    "truncated_importance_sampling_ratio_min must be <= "
+                    "truncated_importance_sampling_ratio"
+                )
             if self.truncated_importance_sampling_type in ("icepop", "seq-mask-tis"):
                 assert self.truncated_importance_sampling_ratio_min is not None, (
                     "truncated_importance_sampling_ratio_min required for icepop / seq-mask-tis"
@@ -296,26 +304,30 @@ class ClippedPGLossFn(LossFunction):
         if self.reference_policy_kl_penalty != 0:
             assert curr_logprobs_unfiltered is not None
             assert reference_policy_logprobs is not None
+            # KL samples are drawn from the optimized policy, so the KL loss must
+            # carry the score-function gradient through the sampling probability
+            # (https://arxiv.org/abs/2506.09477v1). The on-policy importance ratio
+            # exp(curr - generation) provides it; otherwise the straight-through
+            # exp(x - x.detach()) has forward value 1 while preserving that gradient.
             if self.use_on_policy_kl_approximation:
                 kl_importance_weights = torch.exp(
                     curr_logprobs_unfiltered - generation_logprobs
-                ).detach()
-                kl_importance_weights = torch.nan_to_num(
-                    kl_importance_weights, nan=0.0, posinf=0.0, neginf=0.0
                 )
             else:
-                kl_importance_weights = torch.ones_like(curr_logprobs_unfiltered)
-
-            kl = (
-                kl_importance_weights
-                * self.reference_policy_kl_penalty
-                * calculate_kl(
-                    logprobs=curr_logprobs_unfiltered,
-                    logprobs_reference=reference_policy_logprobs,
-                    kl_type=self.reference_policy_kl_type,
-                    input_clamp_value=self.kl_input_clamp_value,
-                    output_clamp_value=self.kl_output_clamp_value,
+                kl_importance_weights = torch.exp(
+                    curr_logprobs_unfiltered - curr_logprobs_unfiltered.detach()
                 )
+            kl_importance_weights = torch.nan_to_num(
+                kl_importance_weights, nan=0.0, posinf=0.0, neginf=0.0
+            )
+
+            kl = self.reference_policy_kl_penalty * calculate_kl(
+                logprobs=curr_logprobs_unfiltered,
+                logprobs_reference=reference_policy_logprobs,
+                kl_type=self.reference_policy_kl_type,
+                input_clamp_value=self.kl_input_clamp_value,
+                output_clamp_value=self.kl_output_clamp_value,
+                importance_sampling_weights=kl_importance_weights,
             )
 
             if self.loss_type == LossType.TOKEN_LEVEL:
@@ -384,9 +396,12 @@ class ClippedPGLossFn(LossFunction):
 
         if self.truncated_importance_sampling_ratio is not None:
             if self.truncated_importance_sampling_type == "tis":
+                tis_min = self.truncated_importance_sampling_ratio_min
+                if tis_min is None:
+                    tis_min = 0.0
                 token_in_bounds = (
                     actor_importance_weights_expanded <= self.truncated_importance_sampling_ratio
-                )
+                ) & (actor_importance_weights_expanded >= tis_min)
                 _is_filter_metrics = {
                     "is_oob_ratio": 1.0 - masked_mean(
                         token_in_bounds.float(), mask,
@@ -395,6 +410,7 @@ class ClippedPGLossFn(LossFunction):
                 }
                 actor_importance_weights_expanded = torch.clamp(
                     actor_importance_weights_expanded,
+                    min=tis_min,
                     max=self.truncated_importance_sampling_ratio,
                 )
             elif self.truncated_importance_sampling_type == "icepop":

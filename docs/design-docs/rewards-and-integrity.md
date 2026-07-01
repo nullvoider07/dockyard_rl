@@ -60,9 +60,31 @@ there is no gradient signal rewarding the attempt. Enable it per environment wit
 
 ## The invalid-action penalty
 
-Beyond test tampering, `rewards/invalid_action.py` applies a configurable reward
-penalty for malformed agent behaviour — invalid tool calls and malformed
-thinking blocks — sourced either from env-authoritative per-turn verdicts or a
-generic pattern fallback. Disabled (the default) is a strict no-op: no detection
-runs and rewards are untouched. It shares its signal with the
-[tool-use protocol](tool-use-protocol.md) validator.
+Beyond test tampering, `rewards/invalid_action.py` penalizes malformed agent
+behaviour — invalid tool calls and malformed thinking blocks — detected from
+env-authoritative per-turn verdicts, a generic text-pattern fallback, or (when
+the rollout supplies a tool registry) structured schema validation that flags a
+parsed call naming an unknown tool or failing its parameter schema
+(`enable_schema_validation`, shared with the [tool-use protocol](tool-use-protocol.md)
+validator). Disabled (the default) is a strict no-op: no detection runs and
+rewards are untouched.
+
+Detections are **typed and graded**: each violation carries a type
+(unexecuted-pattern, malformed-thinking, schema-unknown-tool, schema-arg, …) and
+a severity multiplier (`severity_weights`, merged over the built-in defaults), so
+a soft violation costs less than a hard one. An optional `penalty_step_scale`
+schedule scales every severity by a step-varying factor.
+
+A violation can be applied at two **loci**, selected by `penalty_mode`:
+
+- `reward` — subtract from the per-sample reward (the legacy per-turn penalty),
+- `advantage` — overwrite the advantage of the flagged assistant-message token
+  span after advantages are computed,
+- `auto` (default) — apply each violation type at its own default locus exactly
+  once (`locus_overrides` adjusts per type), avoiding double-counting,
+- `both` — apply at both loci (stacks; not recommended).
+
+For observability the penalty also emits per-step **rates** rather than raw
+counts — `violation_rate/<type>` plus the aggregate `invalid_action_msg_rate` /
+`malformed_thinking_msg_rate` (flagged messages over total assistant messages) —
+which the GRPO metric blocks log.

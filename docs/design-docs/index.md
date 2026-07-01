@@ -13,11 +13,15 @@ piece is built the way it is.
   executor and its client.
 - [Structured tool-use protocol](tool-use-protocol.md) — native Hermes
   tool-calls, validation, and RL-safe constraining.
-- [Mixture-of-Experts](moe.md) — expert parallelism, grouped GEMM, and
-  aux-loss-free load balancing.
+- [Mixture-of-Experts](moe.md) — expert parallelism, grouped GEMM, aux-loss-free
+  load balancing, and router replay.
+- [Quantized generation](quantized-generation.md) — block-wise FP8 and ModelOpt
+  NVFP4 real-quant rollout, re-applied across refits.
 - [The JAX trainer backend](jax-trainer.md) — the Flax NNX re-platform below the
   policy interface.
 - [Preference optimization (DPO)](dpo.md) — DPO and online DPO.
+- [Distillation](distillation.md) — on-policy logit distillation, advantage
+  distillation (OPD), and cross-tokenizer (xtoken) distillation.
 
 ```{toctree}
 :hidden:
@@ -28,6 +32,8 @@ rewards-and-integrity
 sandbox-executor
 tool-use-protocol
 moe
+quantized-generation
 jax-trainer
 dpo
+distillation
 ```
