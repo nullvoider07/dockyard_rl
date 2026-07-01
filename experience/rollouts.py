@@ -20,10 +20,14 @@ from dockyard_rl.models.generation.interfaces import (
     GenerationInterface,
     GenerationOutputSpec,
 )
+from dockyard_rl.models.generation.vllm.router_capture import (
+    MISSING_ROUTE_SENTINEL,
+)
 from dockyard_rl.rewards.invalid_action import (
     InvalidActionPenaltyConfig,
     assess_assistant_turn,
     pop_env_flags,
+    violation_rate_metrics,
 )
 from dockyard_rl.tool_protocol.protocol import (
     THINKING_PAIRED,
@@ -253,6 +257,15 @@ def generate_responses(
                 i, input_length:total_length
             ]
 
+        # MoE router-replay (#2908): carry the per-token recorded routing for
+        # this assistant turn, sliced exactly like generation_logprobs, so it
+        # rides the message_log -> flat-batch collation into the train batch.
+        # Present only when capture ran (policy.router_replay.enabled + MoE).
+        if "routed_experts" in generation_outputs:
+            assistant_message["routed_experts"] = generation_outputs["routed_experts"][
+                i, input_length:total_length
+            ]
+
         batch["message_log"][i].append(assistant_message)
 
     # Generation metrics
@@ -326,7 +339,13 @@ async def generate_responses_async(
 
     generation_outputs = BatchedDataDict.from_batches(
         ordered_batched_data_dicts,
-        pad_value_dict={"output_ids": tokenizer.pad_token_id, "logprobs": 0.0},
+        pad_value_dict={
+            "output_ids": tokenizer.pad_token_id,
+            "logprobs": 0.0,
+            # Router-replay (#2908): cross-sample sequence padding gets the
+            # missing-route sentinel; inert when the column is absent.
+            "routed_experts": MISSING_ROUTE_SENTINEL,
+        },
     )
 
     # Extract everything we need from the generation outputs
@@ -366,6 +385,15 @@ async def generate_responses_async(
 
         if include_logprobs and "logprobs" in generation_outputs:
             assistant_message["generation_logprobs"] = generation_outputs["logprobs"][
+                i, input_length:total_length
+            ]
+
+        # MoE router-replay (#2908): carry the per-token recorded routing for
+        # this assistant turn, sliced exactly like generation_logprobs, so it
+        # rides the message_log -> flat-batch collation into the train batch.
+        # Present only when capture ran (policy.router_replay.enabled + MoE).
+        if "routed_experts" in generation_outputs:
+            assistant_message["routed_experts"] = generation_outputs["routed_experts"][
                 i, input_length:total_length
             ]
 
@@ -594,6 +622,10 @@ def run_multi_turn_rollout(
     )
     sample_invalid_action_counts = torch.zeros(batch_size, dtype=torch.int32)
     sample_malformed_thinking_counts = torch.zeros(batch_size, dtype=torch.int32)
+    # Per-type violation counts + assistant-message tally for #2800 rate metrics
+    # (closure-safe containers: only item mutation, never rebinding).
+    rollout_violation_counts: dict[str, int] = {}
+    rollout_assistant_messages = [0]
     # Structured tool-use protocol (None = fenced-text path, unchanged).
     structured_enabled = structured_cfg is not None
     thinking_style = _structured_thinking_style(structured_cfg)
@@ -711,6 +743,17 @@ def run_multi_turn_rollout(
                 sample_malformed_thinking_counts[global_idx] += int(
                     verdict.malformed_thinking
                 )
+                rollout_assistant_messages[0] += 1
+                for _viol in verdict.violations:
+                    rollout_violation_counts[_viol.type] = (
+                        rollout_violation_counts.get(_viol.type, 0) + 1
+                    )
+                # Stamp typed violations on the assistant turn for the graded
+                # reward / advantage-span penalties (N2).
+                if verdict.violations:
+                    current_batch["message_log"][global_idx][-1][
+                        "invalid_action_violations"
+                    ] = list(verdict.violations)
             # Verdict keys are per-turn; never carry into next-turn extra_env_info.
             pop_env_flags(env_output.metadata[i])
 
@@ -820,6 +863,9 @@ def run_multi_turn_rollout(
                 ),
                 "malformed_thinking_rate": float(
                     (sample_malformed_thinking_counts > 0).float().mean().item()
+                ),
+                **violation_rate_metrics(
+                    rollout_violation_counts, rollout_assistant_messages[0]
                 ),
             }
             if detect_invalid
@@ -965,6 +1011,9 @@ async def run_sample_multi_turn_rollout(
     )
     invalid_action_count = 0
     malformed_thinking_count = 0
+    # Per-type violation counts + assistant-message tally for #2800 rate metrics.
+    async_violation_counts: dict[str, int] = {}
+    async_assistant_messages = 0
     # Structured tool-use protocol (None = fenced-text path, unchanged).
     structured_enabled = structured_cfg is not None
     thinking_style = _structured_thinking_style(structured_cfg)
@@ -1053,6 +1102,17 @@ async def run_sample_multi_turn_rollout(
             )
             invalid_action_count += int(verdict.invalid_action)
             malformed_thinking_count += int(verdict.malformed_thinking)
+            async_assistant_messages += 1
+            for _viol in verdict.violations:
+                async_violation_counts[_viol.type] = (
+                    async_violation_counts.get(_viol.type, 0) + 1
+                )
+            # Stamp typed violations on the assistant turn for the graded
+            # reward / advantage-span penalties (N2).
+            if verdict.violations:
+                current_message_log[-1]["invalid_action_violations"] = list(
+                    verdict.violations
+                )
         # Verdict keys are per-turn; never carry into next-turn extra_env_info.
         pop_env_flags(env_output.metadata[0])
 
@@ -1127,6 +1187,8 @@ async def run_sample_multi_turn_rollout(
     if detect_invalid:
         final_sample_state["invalid_action_count"] = invalid_action_count
         final_sample_state["malformed_thinking_count"] = malformed_thinking_count
+        final_sample_state["violation_counts"] = async_violation_counts
+        final_sample_state["num_assistant_messages"] = async_assistant_messages
     if multi_reward_seen:
         for name, acc in reward_acc_dict.items():
             final_sample_state[name] = torch.tensor(acc)
@@ -1339,6 +1401,19 @@ def run_async_multi_turn_rollout(
             )
             rollout_metrics["malformed_thinking_rate"] = float(
                 (final_batch["malformed_thinking_count"] > 0).float().mean().item()
+            )
+            agg_violation_counts: dict[str, int] = {}
+            for state in final_sample_states:
+                for vtype, vcount in state.get("violation_counts", {}).items():
+                    agg_violation_counts[vtype] = (
+                        agg_violation_counts.get(vtype, 0) + vcount
+                    )
+            total_assistant_messages = sum(
+                state.get("num_assistant_messages", 0)
+                for state in final_sample_states
+            )
+            rollout_metrics.update(
+                violation_rate_metrics(agg_violation_counts, total_assistant_messages)
             )
 
         # Calculate per-worker token counts

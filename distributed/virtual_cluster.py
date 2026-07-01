@@ -9,7 +9,7 @@ import logging
 import os
 import socket
 import time
-from typing import NotRequired, Optional, TypedDict
+from typing import NamedTuple, NotRequired, Optional, TypedDict
 
 import ray
 from ray.util.placement_group import (
@@ -111,6 +111,274 @@ class GetGPUIdActor:  # pragma: no cover
 class ResourceInsufficiencyError(Exception):
     """Raised when the cluster cannot satisfy a requested placement config."""
 
+
+# NVLink-domain topology for collective-local segment placement.
+#
+# ray.sub registers two custom Ray resources per node: ``nvlink_domain_<UUID>``
+# (the NVLink switch fabric, parsed from nvidia-smi) and ``topo_rank`` (the SLURM
+# topological rank). These functions read them to group/sort nodes by NVLink
+# domain so a collective group lands within one fabric. The selection/sort logic
+# is pure (operates on a topology dict / bundle list); the ``ray.nodes()`` read
+# and the domain-pinned placement are cluster-bound.
+NVLINK_DOMAIN_PREFIX = "nvlink_domain_"
+TOPO_RANK_KEY = "topo_rank"
+NVLINK_DOMAIN_UNKNOWN = "unknown"
+TOPO_RANK_UNKNOWN: int = -1
+
+
+def _parse_topology_from_resources(resources: dict[str, float]) -> tuple[str, int]:
+    """Extract ``(nvlink_domain, topo_rank)`` from a node's Ray custom resources.
+
+    Returns the ``NVLINK_DOMAIN_UNKNOWN`` / ``TOPO_RANK_UNKNOWN`` sentinels when
+    the node carries no topology resources.
+    """
+    nvlink_domain = NVLINK_DOMAIN_UNKNOWN
+    topo_rank = TOPO_RANK_UNKNOWN
+    for key, val in resources.items():
+        if key.startswith(NVLINK_DOMAIN_PREFIX):
+            nvlink_domain = key
+        if key == TOPO_RANK_KEY:
+            topo_rank = int(val)
+    return nvlink_domain, topo_rank
+
+
+def get_ray_cluster_topology() -> dict[str, tuple[str, int]]:
+    """Query all alive Ray nodes for their NVLink domain and topo_rank.
+
+    Returns ``node_id -> (nvlink_domain, topo_rank)``. The ``ray.nodes()`` read is
+    cluster-bound; the per-node parse is :func:`_parse_topology_from_resources`.
+    """
+    topology: dict[str, tuple[str, int]] = {}
+    for node in ray.nodes():
+        if not node.get("Alive", False):
+            continue
+        node_id = node.get("NodeID", "")
+        topology[node_id] = _parse_topology_from_resources(node.get("Resources", {}))
+    return topology
+
+
+def select_segment_nodes(
+    topology: dict[str, tuple[str, int]],
+    segment_size: int,
+    num_nodes: int,
+) -> tuple[list[str], list[str]]:
+    """Partition Ray node IDs into segment-aligned selected nodes and remainder.
+
+    Greedily selects complete segments (``segment_size`` nodes) from each NVLink
+    domain, in topological order, until ``num_nodes`` is reached.
+
+    Args:
+        topology: ``node_id -> (nvlink_domain, topo_rank)`` from
+            :func:`get_ray_cluster_topology`.
+        segment_size: Number of nodes per NVLink-domain segment.
+        num_nodes: Total number of nodes to select.
+
+    Returns:
+        ``(selected_node_ids, remaining_node_ids)`` — selected nodes in
+        topological order.
+
+    Raises:
+        ValueError: ``segment_size`` does not evenly divide ``num_nodes``.
+        ResourceInsufficiencyError: not enough complete segments can be formed.
+    """
+    if num_nodes % segment_size != 0:
+        raise ValueError(
+            f"num_nodes ({num_nodes}) must be divisible by "
+            f"segment_size ({segment_size})."
+        )
+
+    domain_nodes: dict[str, list[tuple[str, int]]] = {}
+    for nid, (domain, topo_rank) in topology.items():
+        # Skip nodes with no NVLink-domain info. They all collapse into a single
+        # NVLINK_DOMAIN_UNKNOWN pseudo-domain with TOPO_RANK_UNKNOWN (-1), so they
+        # would sort first and be selected — but the resulting placement-group
+        # constraint {NVLINK_DOMAIN_UNKNOWN: 0.001} names a Ray resource ray.sub
+        # never registers, so the bundle could never schedule. Excluding them here
+        # pins only to real, registered NVLink domains (these nodes fall through
+        # to remaining_node_ids).
+        if domain == NVLINK_DOMAIN_UNKNOWN:
+            continue
+        domain_nodes.setdefault(domain, []).append((nid, topo_rank))
+    for domain in domain_nodes:
+        domain_nodes[domain].sort(key=lambda x: x[1])
+
+    # Sort domains by the minimum topo_rank of their nodes.
+    sorted_domains = sorted(domain_nodes.items(), key=lambda item: item[1][0][1])
+
+    num_segments_needed = num_nodes // segment_size
+    selected_node_ids: list[str] = []
+    segments_taken = 0
+
+    for _domain, nodes in sorted_domains:
+        if segments_taken >= num_segments_needed:
+            break
+        segments_available = len(nodes) // segment_size
+        segments_to_take = min(segments_available, num_segments_needed - segments_taken)
+        nodes_to_take = segments_to_take * segment_size
+        for nid, _ in nodes[:nodes_to_take]:
+            selected_node_ids.append(nid)
+        segments_taken += segments_to_take
+
+    if segments_taken < num_segments_needed:
+        domain_summary = {d: len(ns) for d, ns in sorted_domains}
+        raise ResourceInsufficiencyError(
+            f"Cannot form {num_segments_needed} complete segments of "
+            f"{segment_size} nodes. Nodes per domain: {domain_summary}. "
+            f"Need {num_nodes} nodes total."
+        )
+
+    selected_set = set(selected_node_ids)
+    remaining_node_ids = [nid for nid in topology if nid not in selected_set]
+    domains_used = {topology[nid][0] for nid in selected_node_ids}
+    logger.info(
+        "[TOPOLOGY] Segment selection: %d segments of %d nodes from %d NVLink "
+        "domains -> %d selected, %d remaining",
+        segments_taken,
+        segment_size,
+        len(domains_used),
+        len(selected_node_ids),
+        len(remaining_node_ids),
+    )
+    return selected_node_ids, remaining_node_ids
+
+
+def prepare_segment_topology(
+    segment_size: int | None,
+    num_nodes: int,
+    *,
+    topology: dict[str, tuple[str, int]] | None = None,
+    role: str = "training",
+) -> tuple[list[dict[str, float]] | None, list[str], dict[str, tuple[str, int]]]:
+    """Compute per-node domain constraints for topology-aware placement.
+
+    Selects segment-aligned nodes and returns the per-node domain-pinning dicts
+    :class:`RayVirtualCluster` consumes. ``segment_size=None`` disables the
+    topology logic (returns ``(None, [], {})``); when no NVLink-domain info is
+    present it falls back to unordered allocation.
+
+    Returns:
+        ``(node_resource_constraints, remaining_node_ids, topology)``.
+    """
+    if segment_size is None:
+        return None, [], {}
+
+    if topology is None:
+        topology = get_ray_cluster_topology()
+
+    has_topology = any(
+        domain != NVLINK_DOMAIN_UNKNOWN for domain, _ in topology.values()
+    )
+    if not has_topology:
+        logger.warning(
+            "segment_size=%s is set but no NVLink domain info found; falling back "
+            "to unordered allocation",
+            segment_size,
+        )
+        return None, list(topology.keys()), topology
+
+    selected_node_ids, remaining_node_ids = select_segment_nodes(
+        topology, segment_size, num_nodes
+    )
+    node_resource_constraints = [
+        {topology[nid][0]: 0.001} for nid in selected_node_ids
+    ]
+    logger.info(
+        "[TOPOLOGY] %s allocation: %d nodes in %d NVLink domains (segment_size=%d)",
+        role,
+        num_nodes,
+        len({topology[nid][0] for nid in selected_node_ids}),
+        segment_size,
+    )
+    return node_resource_constraints, remaining_node_ids, topology
+
+
+def _sort_bundle_indices_by_topology(
+    bundle_data: list[tuple[int, str, int, str]],
+    segment_size: int | None = None,
+    gpus_per_node: int | None = None,
+) -> list[int]:
+    """Topology-aware sort order for bundle indices.
+
+    With topology info: sort by ``(domain_min_topo_rank, topo_rank, gpu_id)``.
+    With ``segment_size`` set: additionally drop bundles from domains that can't
+    contribute a complete segment (``segment_size`` nodes). Else: sort by
+    ``(node_id, gpu_id)``.
+
+    Args:
+        bundle_data: per bundle ``(gpu_id, nvlink_domain, topo_rank, node_id)``.
+        segment_size: nodes per NVLink-domain segment; bundles from
+            under-filled domains are excluded.
+        gpus_per_node: required when ``segment_size`` is set.
+
+    Raises:
+        ValueError: ``segment_size`` set without ``gpus_per_node``.
+    """
+    if segment_size is not None and gpus_per_node is None:
+        raise ValueError("gpus_per_node is required when segment_size is set")
+    if not bundle_data:
+        return []
+
+    has_topology = any(
+        b[1] != NVLINK_DOMAIN_UNKNOWN or b[2] != TOPO_RANK_UNKNOWN for b in bundle_data
+    )
+    if not has_topology:
+        basic = [
+            (i, node_id, gpu_id)
+            for i, (gpu_id, _, _, node_id) in enumerate(bundle_data)
+        ]
+        return [idx for idx, _, _ in sorted(basic, key=lambda x: (x[1], x[2]))]
+
+    class BundleInfo(NamedTuple):
+        idx: int
+        node_id: str
+        gpu_id: int
+        domain: str
+        topo_rank: int
+
+    bundle_infos = [
+        BundleInfo(i, node_id, gpu_id, nvlink_domain, topo_rank)
+        for i, (gpu_id, nvlink_domain, topo_rank, node_id) in enumerate(bundle_data)
+    ]
+
+    if segment_size is not None:
+        assert gpus_per_node is not None
+        domain_bundles: dict[str, list[BundleInfo]] = {}
+        for info in bundle_infos:
+            domain_bundles.setdefault(info.domain, []).append(info)
+        filtered: list[BundleInfo] = []
+        for domain, bundles in domain_bundles.items():
+            domain_node_count = len({b.node_id for b in bundles})
+            usable_nodes = (domain_node_count // segment_size) * segment_size
+            usable_gpus = usable_nodes * gpus_per_node
+            bundles.sort(key=lambda x: (x.topo_rank, x.gpu_id))
+            kept = bundles[:usable_gpus]
+            if bundles[usable_gpus:]:
+                logger.info(
+                    "[TOPOLOGY] Domain %s: keeping %d bundles (%d nodes), "
+                    "discarding %d incomplete-segment bundles",
+                    domain,
+                    len(kept),
+                    usable_nodes,
+                    len(bundles) - len(kept),
+                )
+            filtered.extend(kept)
+        bundle_infos = filtered
+
+    domain_to_min_topo_rank: dict[str, int] = {}
+    for info in bundle_infos:
+        cur = domain_to_min_topo_rank.get(info.domain)
+        if cur is None or info.topo_rank < cur:
+            domain_to_min_topo_rank[info.domain] = info.topo_rank
+
+    return [
+        info.idx
+        for info in sorted(
+            bundle_infos,
+            key=lambda x: (domain_to_min_topo_rank[x.domain], x.topo_rank, x.gpu_id),
+        )
+    ]
+
+
 # RayVirtualCluster
 class RayVirtualCluster:
     """A logical distributed cluster backed by Ray placement groups.
@@ -144,6 +412,8 @@ class RayVirtualCluster:
         num_gpus_per_node: int = 8,
         name: str = "",
         placement_group_strategy: str = "SPREAD",
+        segment_size: int | None = None,
+        node_resource_constraints: list[dict[str, float]] | None = None,
     ) -> None:
         """Initialise a virtual cluster.
 
@@ -165,12 +435,22 @@ class RayVirtualCluster:
                 Ray placement group strategy for the top-level group
                 (SPREAD | PACK | STRICT_PACK).  Per-node sub-groups
                 always use STRICT_PACK regardless of this setting.
+            segment_size:
+                NVLink-domain segment size for topology-aware bundle
+                ordering in the unified-PG path. ``None`` keeps the legacy
+                ``(node_id, gpu_id)`` ordering. See
+                :func:`prepare_segment_topology` for producing the matching
+                ``node_resource_constraints``.
+            node_resource_constraints:
+                Per-logical-node domain-pinning dicts (e.g.
+                ``{"nvlink_domain_X": 0.001}``) from
+                :func:`prepare_segment_topology`; merged into each node's
+                bundle specs so Ray schedules them on the selected NVLink
+                domains. ``None`` (default) reserves no domain resource.
+                When set, length must equal ``len(bundle_ct_per_node_list)``.
         """
-        if use_gpus:
-            assert num_gpus_per_node > 0, (
-                "num_gpus_per_node must be > 0 when use_gpus=True"
-            )
-
+        # Set instance state before validating so a failed assert still leaves a
+        # GC-safe object (shutdown reads _node_placement_groups at __del__ time).
         self._bundle_ct_per_node_list    = bundle_ct_per_node_list
         self._world_size                 = sum(bundle_ct_per_node_list)
         self._node_placement_groups: Optional[list[PlacementGroup]] = None
@@ -181,6 +461,37 @@ class RayVirtualCluster:
         self.max_colocated_worker_groups   = max_colocated_worker_groups
         self.name                          = name
         self.placement_group_strategy      = placement_group_strategy
+        self._segment_size                 = segment_size
+        self._node_resource_constraints    = node_resource_constraints
+
+        if use_gpus:
+            assert num_gpus_per_node > 0, (
+                "num_gpus_per_node must be > 0 when use_gpus=True"
+            )
+        if node_resource_constraints is not None:
+            assert len(node_resource_constraints) == len(bundle_ct_per_node_list), (
+                "node_resource_constraints must have one entry per logical node "
+                f"({len(node_resource_constraints)} != "
+                f"{len(bundle_ct_per_node_list)})."
+            )
+
+    def _node_bundle_specs(
+        self,
+        node_idx: int,
+        count: int,
+        cpus_per_bundle: float,
+        gpus_per_bundle: float,
+    ) -> list[dict[str, float]]:
+        """Bundle specs for one logical node, with the NVLink-domain pin merged in.
+
+        Each bundle reserves ``{CPU, GPU}``; when ``node_resource_constraints`` is
+        set, this node's domain constraint (e.g. ``{nvlink_domain_X: 0.001}``) is
+        merged into every bundle so Ray pins the node to that NVLink domain.
+        """
+        base: dict[str, float] = {"CPU": cpus_per_bundle, "GPU": gpus_per_bundle}
+        if self._node_resource_constraints is not None:
+            base = {**base, **self._node_resource_constraints[node_idx]}
+        return [dict(base) for _ in range(count)]
 
     # Public placement group API
     def _init_placement_groups(
@@ -397,11 +708,14 @@ class RayVirtualCluster:
 
         if use_unified_pg:
             # Single group spanning all nodes — required for cross-node TP.
-            all_bundles: list[dict[str, float]] = [
-                {"CPU": cpus_per_bundle, "GPU": gpus_per_bundle}
-                for count in self._bundle_ct_per_node_list
-                for _ in range(count)
-            ]
+            # Each node's bundles carry that node's NVLink-domain pin (if any).
+            all_bundles: list[dict[str, float]] = []
+            for node_idx, count in enumerate(self._bundle_ct_per_node_list):
+                all_bundles.extend(
+                    self._node_bundle_specs(
+                        node_idx, count, cpus_per_bundle, gpus_per_bundle
+                    )
+                )
             pgs = [
                 placement_group(
                     bundles=all_bundles,
@@ -418,10 +732,9 @@ class RayVirtualCluster:
             for node_idx, count in enumerate(self._bundle_ct_per_node_list):
                 if count <= 0:
                     continue
-                node_bundles: list[dict[str, float]] = [
-                    {"CPU": cpus_per_bundle, "GPU": gpus_per_bundle}
-                    for _ in range(count)
-                ]
+                node_bundles = self._node_bundle_specs(
+                    node_idx, count, cpus_per_bundle, gpus_per_bundle
+                )
                 pgs.append(
                     placement_group(
                         bundles=node_bundles,
@@ -454,10 +767,14 @@ class RayVirtualCluster:
         return pgs
 
     def _get_sorted_bundle_indices(self) -> Optional[list[int]]:
-        """Return bundle indices sorted by (node_id, gpu_id).
+        """Return bundle indices in topology-aware order.
 
-        Only valid after a unified placement group has been created.
-        Returns None for CPU-only or per-node cluster types.
+        Reads each bundle's ``(gpu_id, nvlink_domain, topo_rank, node_id)`` and
+        delegates to :func:`_sort_bundle_indices_by_topology`: with NVLink-domain
+        info present, ranks follow the physical topology (and ``segment_size``, if
+        set, discards incomplete-segment domains); otherwise it falls back to the
+        legacy ``(node_id, gpu_id)`` order. Only valid after a unified placement
+        group; returns ``None`` for CPU-only or per-node cluster types.
         """
         if self._node_placement_groups is None:
             raise ValueError(
@@ -491,9 +808,18 @@ class RayVirtualCluster:
         for a in info_actors:
             ray.kill(a)  # type: ignore[arg-type]
 
-        # Sort: primary key = node_id, secondary = gpu_id.
-        bundle_infos = [(i, node_ids[i], gpu_ids[i]) for i in range(n)]
-        return [
-            b[0]
-            for b in sorted(bundle_infos, key=lambda x: (x[1], x[2]))
+        # Look up each bundle's NVLink domain / topo_rank from the registered Ray
+        # resources, then delegate to the (unit-tested) topology sort. With no
+        # domain info this reproduces the legacy (node_id, gpu_id) order.
+        topology = get_ray_cluster_topology()
+        bundle_data = [
+            (gpu_ids[i], *topology.get(
+                node_ids[i], (NVLINK_DOMAIN_UNKNOWN, TOPO_RANK_UNKNOWN)
+            ), node_ids[i])
+            for i in range(n)
         ]
+        return _sort_bundle_indices_by_topology(
+            bundle_data,
+            segment_size=self._segment_size,
+            gpus_per_node=self.num_gpus_per_node,
+        )

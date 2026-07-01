@@ -7,10 +7,17 @@ Currently supports:
     invalid-action / malformed-thinking verdict counts, #2656)
 """
 
-from typing import NotRequired, TypedDict
+from typing import NotRequired, Optional, TypedDict
 import torch
 from dockyard_rl.distributed.batched_data_dict import BatchedDataDict
-from dockyard_rl.rewards.invalid_action import InvalidActionPenaltyConfig
+from dockyard_rl.rewards.invalid_action import (
+    InvalidActionPenaltyConfig,
+    LOCUS_ADVANTAGE,
+    LOCUS_REWARD,
+    sample_locus_penalty,
+    violation_penalty,
+    violations_at_locus,
+)
 
 class RewardShapingConfig(TypedDict):
     """Configuration for reward function processing.
@@ -176,24 +183,40 @@ def apply_reward_shaping(
 def apply_invalid_action_penalty(
     batch: BatchedDataDict,
     cfg:   "InvalidActionPenaltyConfig | None",
+    step:  Optional[int] = None,
 ) -> BatchedDataDict:
     """Subtract the per-sample invalid-action / malformed-thinking penalty.
 
-    Operates on the per-sample verdict counts produced at rollout time
-    (``invalid_action_count`` / ``malformed_thinking_count``); pure arithmetic,
-    so it runs identically on the driver batch and on the data-plane
-    ``driver_carry``. Disabled config is a strict no-op.
+    Two paths:
+
+    - **Graded / routed** (when ``batch`` carries ``message_log`` — the colocated
+      sync / async paths): subtract only the **reward-locus** penalties resolved
+      from the per-message ``invalid_action_violations`` stamped at rollout time,
+      under ``penalty_mode`` and the per-type severities / step scale. The
+      advantage-locus violations are applied to the advantage tensor in grpo
+      (see ``apply_message_span_advantage_penalties``), so the two never stack
+      under ``"auto"``.
+    - **Legacy counts** (when ``message_log`` is absent — the data-plane
+      ``driver_carry``): subtract from the per-sample
+      ``invalid_action_count`` / ``malformed_thinking_count``. The data-plane
+      path therefore applies all penalties at the reward level (no span info).
+
+    Disabled config is a strict no-op.
 
     Args:
-        batch: BatchedDataDict containing "total_reward" and, when enabled,
-               the two count fields.
+        batch: BatchedDataDict with "total_reward" and either "message_log"
+               (graded) or the two count fields (legacy).
         cfg:   InvalidActionPenaltyConfig or None.
+        step:  Optional training step for the penalty step-scale (graded path).
 
     Returns:
         The same BatchedDataDict with "total_reward" updated in-place.
     """
     if cfg is None or not cfg.get("enabled", False):
         return batch
+
+    if "message_log" in batch:
+        return _apply_invalid_action_reward_locus(batch, cfg, step)
 
     missing = [
         k for k in ("invalid_action_count", "malformed_thinking_count")
@@ -244,3 +267,83 @@ def apply_invalid_action_penalty(
 
     batch["total_reward"] = penalized
     return batch
+
+
+def _apply_invalid_action_reward_locus(
+    batch: BatchedDataDict,
+    cfg: "InvalidActionPenaltyConfig",
+    step: Optional[int],
+) -> BatchedDataDict:
+    """Subtract per-sample reward-locus violation penalties from total_reward.
+
+    Reads the per-message ``invalid_action_violations`` stamped at rollout time
+    and routes them under ``cfg["penalty_mode"]``; only reward-locus violations
+    are subtracted here (advantage-locus ones are applied on the advantage tensor
+    in grpo, so they never stack under ``"auto"``).
+    """
+    message_logs = batch["message_log"]
+    rewards = batch["total_reward"]
+    if "unshaped_total_reward" not in batch:
+        batch["unshaped_total_reward"] = rewards.clone()
+
+    penalties = torch.tensor(
+        [sample_locus_penalty(ml, cfg, LOCUS_REWARD, step) for ml in message_logs],
+        dtype=rewards.dtype,
+        device=rewards.device,
+    )
+    penalized = rewards - penalties
+
+    floor = cfg.get("reward_floor")
+    if floor is not None:
+        penalized = torch.maximum(penalized, torch.full_like(penalized, float(floor)))
+
+    n_flagged = int((penalties > 0).sum().item())
+    if n_flagged > 0:
+        print(
+            f"[INFO] invalid action penalty (reward locus): "
+            f"{n_flagged}/{len(penalized)} samples penalized, reward_mean "
+            f"{rewards.mean().item():.4f} -> {penalized.mean().item():.4f}",
+            flush=True,
+        )
+
+    batch["total_reward"] = penalized
+    return batch
+
+
+def apply_message_span_advantage_penalties(
+    advantages: torch.Tensor,
+    message_logs: list,
+    cfg: "InvalidActionPenaltyConfig | None",
+    step: Optional[int] = None,
+) -> tuple[torch.Tensor, dict]:
+    """Overwrite the advantage of flagged assistant-message token spans (N2, #2800).
+
+    For each sample's message log, a token offset is accumulated over the messages'
+    ``token_ids``; for every message carrying advantage-locus violations (under
+    ``cfg["penalty_mode"]``), ``advantages[i, offset:offset+msg_len]`` is overwritten
+    with the negative summed penalty for those violations (severity * base * step
+    scale). Mirrors the per-message-span credit assignment of NeMo-RL #2800 on
+    dockyard's typed violations. A disabled config or no flagged span is a no-op.
+
+    Returns the (in-place modified) advantages and a metrics dict.
+    """
+    if cfg is None or not cfg.get("enabled", False):
+        return advantages, {}
+    mode = cfg.get("penalty_mode")
+    num_spans = 0
+    for i, message_log in enumerate(message_logs):
+        token_offset = 0
+        for message in message_log:
+            token_ids = message.get("token_ids")
+            msg_len = 0 if token_ids is None else int(len(token_ids))
+            violations = message.get("invalid_action_violations")
+            if violations and msg_len > 0:
+                adv_violations = violations_at_locus(violations, mode, LOCUS_ADVANTAGE)
+                if adv_violations:
+                    pen = sum(violation_penalty(cfg, v, step) for v in adv_violations)
+                    if pen > 0:
+                        advantages[i, token_offset : token_offset + msg_len] = -pen
+                        num_spans += 1
+            token_offset += msg_len
+    metrics = {"advantage_penalty_spans": float(num_spans)} if num_spans else {}
+    return advantages, metrics

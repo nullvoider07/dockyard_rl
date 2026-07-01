@@ -44,6 +44,9 @@ from dockyard_rl.models.generation.interfaces import (
     GenerationOutputSpec,
 )
 from dockyard_rl.models.generation.vllm.config import VllmConfig
+from dockyard_rl.models.generation.vllm.router_capture import (
+    MISSING_ROUTE_SENTINEL,
+)
 from dockyard_rl.models.generation.vllm.utils import (
     aggregate_spec_decode_counters,
     compute_spec_decode_metrics,
@@ -278,8 +281,13 @@ class VllmGeneration(GenerationInterface):
         merged = BatchedDataDict.from_batches(
             shard_results,
             pad_value_dict={
-                "output_ids": self.cfg.get("_pad_token_id", 0),
-                "logprobs":   0.0,
+                "output_ids":     self.cfg.get("_pad_token_id", 0),
+                "logprobs":       0.0,
+                # Cross-shard sequence padding for the MoE router-replay column
+                # (#2908): pad positions get the missing-route sentinel so the
+                # trainer replays its own routing there. Inert when the column is
+                # absent (router_replay disabled / non-MoE).
+                "routed_experts": MISSING_ROUTE_SENTINEL,
             },
         )
 

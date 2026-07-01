@@ -17,6 +17,7 @@ class LossInputType(enum.Enum):
     LOGIT       = "logit"
     LOGPROB     = "logprob"
     DISTILLATION = "distillation"
+    DISTILLATION_CROSS_TOKENIZER = "distillation_cross_tokenizer"
     DRAFT       = "draft"
 
 class LossFunction(Protocol):

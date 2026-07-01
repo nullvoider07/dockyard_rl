@@ -2118,3 +2118,231 @@ def all_to_all_sq2vp(
     output_tensor = output_flat.reshape(world_size * BS_local, V_local)
 
     return output_tensor
+
+
+# ---------------------------------------------------------------------------
+# Cross-tokenizer distillation CP/TP primitives.
+#
+# Each collapses to the plain single-rank torch op when the relevant process
+# group has world size <= 1, so the cross-tokenizer loss body and the
+# teacher-logit transport keystone stay free of any rank/offset branching and
+# run unchanged on a single process / CPU. Multi-rank behavior is GPU-deferred.
+# ---------------------------------------------------------------------------
+def _compute_distributed_log_softmax_with_grad(
+    vocab_parallel_logits: torch.Tensor, group: torch.distributed.ProcessGroup
+) -> torch.Tensor:
+    """Differentiable stable distributed log_softmax across tensor-parallel workers.
+
+    Companion to the non-grad ``_compute_distributed_log_softmax`` above: same
+    math and ``[B, T, V//TP]`` shape contract, but the sum-of-exp reduction uses
+    the autograd-aware ``torch.distributed.nn.functional.all_reduce`` so gradients
+    flow back through the TP reduction (the cross-tokenizer student projection's
+    log-probs feed the loss). The MAX reduction is detached — argmax has no
+    gradient.
+    """
+    from torch.distributed.nn.functional import all_reduce as _autograd_all_reduce
+
+    logits_max = torch.amax(vocab_parallel_logits, dim=-1, keepdim=True).detach()
+    torch.distributed.all_reduce(
+        logits_max, op=torch.distributed.ReduceOp.MAX, group=group
+    )
+    vocab_parallel_logits = vocab_parallel_logits - logits_max
+    sum_exp_logits = vocab_parallel_logits.exp().sum(-1, keepdim=True).float()
+    sum_exp_logits = _autograd_all_reduce(
+        sum_exp_logits, op=torch.distributed.ReduceOp.SUM, group=group
+    )
+    return vocab_parallel_logits - sum_exp_logits.log().to(vocab_parallel_logits.dtype)
+
+
+class _AllReduceSum(torch.autograd.Function):
+    """Autograd-aware SUM all-reduce primitive; forward reduces, backward is identity.
+
+    Math: ``y = Σ_r x_r`` so ``dy/dx_r = 1``. Every rank holds the same ``y``
+    after forward, so the upstream grad is identical across ranks — passing it
+    back as ``grad_x_r`` routes gradients to each rank's own input shard with no
+    cross-rank coupling. A ``group`` of ``None`` (or world size <= 1, or an
+    uninitialized process group) is a no-op so single-process / CPU paths work
+    unchanged. Use the functional wrappers below, not ``.apply`` directly.
+    """
+
+    @staticmethod
+    def forward(  # type: ignore[override]
+        ctx: Any,
+        x: torch.Tensor,
+        group: Optional[torch.distributed.ProcessGroup],
+    ) -> torch.Tensor:
+        ctx.group = group
+        if (
+            group is None
+            or not torch.distributed.is_initialized()
+            or torch.distributed.get_world_size(group) <= 1
+        ):
+            return x
+        out = x.clone()
+        torch.distributed.all_reduce(out, op=torch.distributed.ReduceOp.SUM, group=group)
+        return out
+
+    @staticmethod
+    def backward(  # type: ignore[override]
+        ctx: Any, grad_out: torch.Tensor
+    ) -> tuple[torch.Tensor, None]:
+        return grad_out, None
+
+
+def group_all_reduce_sum_with_grad(
+    x: torch.Tensor,
+    group: Optional[torch.distributed.ProcessGroup],
+) -> torch.Tensor:
+    """Differentiable SUM all-reduce of ``x`` over ``group``.
+
+    Gradients flow back through the reduce (backward is identity), so this is the
+    variant for forward-path reductions whose result feeds the loss — CP chunk-sum
+    aggregation and TP projection-partial combination. ``group`` of ``None`` (or
+    world size <= 1, or dist uninitialized) is a no-op.
+    """
+    return _AllReduceSum.apply(x, group)
+
+
+def group_all_reduce_sum(
+    x: torch.Tensor,
+    group: Optional[torch.distributed.ProcessGroup],
+) -> torch.Tensor:
+    """Non-differentiable variant of :func:`group_all_reduce_sum_with_grad`.
+
+    Same reduction, no gradient — use for normalizers / denominators that must be
+    treated as constants (e.g. the global valid-token or valid-chunk counts). Pass
+    an explicit ``group`` (e.g. ``torch.distributed.group.WORLD`` for the full
+    DP×CP×TP mesh, or a narrower group); ``None`` (or world size <= 1, or dist
+    uninitialized) is a no-op returning the local value.
+    """
+    with torch.no_grad():
+        return _AllReduceSum.apply(x, group)
+
+
+def cp_load_balanced_to_contiguous(
+    x: torch.Tensor,
+    *,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    seq_dim: int = 1,
+) -> torch.Tensor:
+    """Re-layout a tensor from load-balanced CP order to this rank's contiguous window.
+
+    PyTorch ``context_parallel`` shards the sequence in a load-balanced
+    (``2*cp`` interleaved) order. :func:`allgather_cp_sharded_tensor` undoes the
+    chunking to the full contiguous sequence; this re-slices to this CP rank's
+    contiguous ``[cp_rank*L, (cp_rank+1)*L)`` window. No-op when CP world <= 1.
+    Uses the grad-preserving ``DTensor.to_local()`` so the gradient is kept.
+    """
+    if cp_group is None or torch.distributed.get_world_size(cp_group) <= 1:
+        return x
+    local = x.to_local() if isinstance(x, DTensor) else x
+    full = allgather_cp_sharded_tensor(local, cp_group, seq_dim=seq_dim)
+    cp_size = torch.distributed.get_world_size(cp_group)
+    cp_rank = torch.distributed.get_rank(cp_group)
+    local_len = full.shape[seq_dim] // cp_size
+    return full.narrow(seq_dim, cp_rank * local_len, local_len).contiguous()
+
+
+def cp_shift_next(
+    x: torch.Tensor,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    *,
+    fill: float,
+) -> torch.Tensor:
+    """Next-token (left-by-1) shift along seq dim 1, CP-aware for contiguous sharding.
+
+    Returns ``out[:, t] = x[:, t + 1]`` over the *global* sequence: interior
+    positions roll locally, each rank's last position takes the next CP rank's
+    first row (contiguous CP sharding), and the global-last position is set to
+    ``fill`` (no next token). With no / size-1 ``cp_group`` this is a plain local
+    left-roll with the last position set to ``fill``.
+    """
+    out = torch.roll(x, shifts=-1, dims=1)
+    cp_size = torch.distributed.get_world_size(cp_group) if cp_group is not None else 1
+    if cp_size <= 1:
+        out[:, -1] = fill
+        return out
+    cp_rank = torch.distributed.get_rank(cp_group)
+    first = x[:, 0].contiguous()
+    gathered = [torch.empty_like(first) for _ in range(cp_size)]
+    torch.distributed.all_gather(gathered, first, group=cp_group)
+    out[:, -1] = gathered[cp_rank + 1] if cp_rank < cp_size - 1 else fill
+    return out
+
+
+def vocab_parallel_log_softmax(
+    logits: torch.Tensor,
+    temperature: float,
+    *,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> torch.Tensor:
+    """TP-aware ``log_softmax(logits / temperature)`` keeping the vocab shard.
+
+    With ``tp_group`` world > 1 the logits are vocab-sharded, so the softmax
+    normalization is reduced across the TP group (kept differentiable) while the
+    result stays sharded on the same vocab axis. Otherwise this is a plain local
+    ``log_softmax``. DTensor inputs are unwrapped to their local shard.
+    """
+    if isinstance(logits, DTensor):
+        logits = logits.to_local()
+    scaled = logits.float() / temperature
+    if tp_group is not None and torch.distributed.get_world_size(tp_group) > 1:
+        return _compute_distributed_log_softmax_with_grad(scaled, group=tp_group)
+    return torch.log_softmax(scaled, dim=-1)
+
+
+def vocab_parallel_full_log_softmax(
+    logits: torch.Tensor,
+    temperature: float,
+    *,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> torch.Tensor:
+    """TP-aware ``log_softmax`` gathered to the full vocab ``[B, T, V]``.
+
+    Unlike :func:`vocab_parallel_log_softmax` (which keeps the result
+    vocab-sharded), callers that slice arbitrary vocab indices need the full
+    vocab axis. With ``tp_group`` world > 1 the sharded log-probs are gathered
+    with the autograd-aware ``torch.distributed.nn.functional.all_gather`` (so the
+    gradient routes back to each rank's shard) and concatenated in rank order — a
+    framework-free tensor-model-parallel vocab gather. Otherwise a plain local
+    ``log_softmax``. DTensor inputs are unwrapped to their local shard.
+    """
+    if isinstance(logits, DTensor):
+        logits = logits.to_local()
+    scaled = logits.float() / temperature
+    if tp_group is not None and torch.distributed.get_world_size(tp_group) > 1:
+        from torch.distributed.nn.functional import all_gather as _autograd_all_gather
+
+        sharded_log_probs = _compute_distributed_log_softmax_with_grad(
+            scaled, group=tp_group
+        )
+        gathered = _autograd_all_gather(sharded_log_probs, group=tp_group)
+        return torch.cat(list(gathered), dim=-1)
+    return torch.log_softmax(scaled, dim=-1)
+
+
+def vocab_parallel_argmax(
+    logits: torch.Tensor,
+    *,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> torch.Tensor:
+    """Per-position global argmax token id over the (possibly TP-sharded) vocab.
+
+    Returns ``[B, T]`` global token ids. With ``tp_group`` world > 1 the vocab is
+    sharded, so a distributed top-1 recovers the global argmax; otherwise a plain
+    local ``argmax``. No gradient.
+    """
+    local_logits = logits.to_local() if isinstance(logits, DTensor) else logits
+    tp_world = torch.distributed.get_world_size(tp_group) if tp_group is not None else 1
+    if tp_world > 1:
+        tp_rank = torch.distributed.get_rank(tp_group)
+        local_vocab_size = int(local_logits.shape[-1])
+        _, topk_global_idx = distributed_vocab_topk(
+            local_logits,
+            k=1,
+            tp_group=tp_group,
+            vocab_start_index=tp_rank * local_vocab_size,
+            vocab_end_index=(tp_rank + 1) * local_vocab_size,
+        )
+        return topk_global_idx.squeeze(-1)
+    return local_logits.argmax(dim=-1)

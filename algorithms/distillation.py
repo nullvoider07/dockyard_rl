@@ -6,6 +6,11 @@ import torch
 from pydantic import BaseModel
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoTokenizer
+from dockyard_rl.algorithms.distillation_memory import (
+    ColocationSchedule,
+    build_memory_report,
+    select_colocation_schedule,
+)
 from dockyard_rl.algorithms.loss.loss_functions import DistillationLossFn
 from dockyard_rl.algorithms.utils import set_seed
 from dockyard_rl.data import DataConfig
@@ -88,6 +93,30 @@ class DistillationConfig(TypedDict):
     # zero_outside_topk: account for the teacher mass outside the transferred
     #   top-k. Requires per-token full entropy (H_all) at loss time when True.
     zero_outside_topk: bool
+    # ----------------------------------------------------------------------
+    # Colocated distillation (optional). When True the student and the frozen
+    # teacher share one GPU mesh instead of separate clusters. Anti-phase
+    # residency (teacher resident only while scoring, student optimizer only
+    # while training) plus a preflight memory estimator keep it OOM-safe.
+    # Default False preserves the separate-cluster path.
+    # ----------------------------------------------------------------------
+    colocated: NotRequired[bool]
+    # Residency schedule: "auto" (fastest that fits), "fast" (both resident, no
+    # per-step transfer), or "tight" (anti-phase eviction). Colocated only.
+    colocation_schedule: NotRequired[str]
+    # Fraction of device capacity withheld from the preflight budget.
+    colocation_safety_margin: NotRequired[float]
+    # Per-GPU fixed overhead (GiB) reserved for CUDA context / fragmentation /
+    # transient buffers in the preflight estimate.
+    colocation_overhead_gb: NotRequired[float]
+    # Per-GPU activation reserve (GiB) added to the preflight estimate. The
+    # teacher (no backward) is charged half this. Operator-tunable; calibrate
+    # from observed memory on the first real run.
+    colocation_activation_reserve_gb: NotRequired[float]
+    # Teacher top-k scoring micro-batch. The teacher carries no optimizer/grad
+    # memory, so it can score with a larger micro-batch than the student's
+    # train_micro_batch_size. None falls back to train_micro_batch_size.
+    teacher_inference_micro_batch_size: NotRequired[Optional[int]]
 
 class TeacherConfig(TypedDict):
     """Config for the frozen teacher policy."""
@@ -107,6 +136,135 @@ class MasterConfig(BaseModel, extra="allow"):
     logger: LoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
+
+# ==============================================================================
+# Colocated distillation residency management
+#
+# When student and teacher share one GPU mesh, the teacher is needed only while
+# it produces top-k logits and the student optimizer only while the student
+# trains. The two heavyweights occupy the same memory window in anti-phase, so
+# the per-step peak is max(scoring, training) rather than their sum. The
+# preflight picks the fastest schedule that fits (FAST = both resident, no
+# transfer; TIGHT = anti-phase eviction) or refuses at startup.
+# ==============================================================================
+_COLOCATION_SCHEDULE_KEY = "_resolved_colocation_schedule"
+
+
+def _run_colocation_preflight(
+    student_policy: Policy,
+    teacher_policy: Policy,
+    num_shards: int,
+    distillation_config: "DistillationConfig",
+    teacher_dtype: str,
+) -> ColocationSchedule:
+    """Estimate per-phase per-GPU memory and select a residency schedule.
+
+    Raises RuntimeError (INFEASIBLE) when a single phase exceeds the device
+    budget even with anti-phase eviction, converting a would-be mid-training OOM
+    into a startup failure with an actionable shortfall.
+    """
+    gib = 1024**3
+    student_params = student_policy.get_model_parameter_count()
+    teacher_params = teacher_policy.get_model_parameter_count()
+    total_bytes = min(
+        student_policy.get_total_memory_bytes(),
+        teacher_policy.get_total_memory_bytes(),
+    )
+
+    reserve_gb = float(distillation_config.get("colocation_activation_reserve_gb", 8.0))
+    overhead_gb = float(distillation_config.get("colocation_overhead_gb", 2.0))
+
+    report = build_memory_report(
+        student_num_params=student_params,
+        teacher_num_params=teacher_params,
+        num_shards=num_shards,
+        free_bytes=total_bytes,
+        student_weight_dtype="bfloat16",
+        teacher_weight_dtype=teacher_dtype,
+        # Student trains (full activations + backward); the teacher scores under
+        # no_grad, so it is charged half the reserve.
+        student_activation_bytes=int(reserve_gb * gib),
+        teacher_activation_bytes=int(0.5 * reserve_gb * gib),
+        fixed_overhead_bytes=int(overhead_gb * gib),
+    )
+
+    requested = str(distillation_config.get("colocation_schedule", "auto"))
+    margin = float(distillation_config.get("colocation_safety_margin", 0.05))
+    schedule, message = select_colocation_schedule(
+        report, requested=requested, safety_margin=margin
+    )
+    print(f"  ▶ {message}")
+    if schedule is ColocationSchedule.INFEASIBLE:
+        raise RuntimeError(message)
+    print(
+        f"  ✓ Colocated distillation schedule: {schedule.value} "
+        f"(student={student_params / 1e9:.2f}B, teacher={teacher_params / 1e9:.2f}B, "
+        f"shards={num_shards})"
+    )
+    return schedule
+
+
+def _get_colocation_schedule(
+    master_config: "MasterConfig",
+) -> Optional[ColocationSchedule]:
+    """Return the resolved schedule for colocated mode, or None if separate-cluster."""
+    if not master_config.distillation.get("colocated", False):
+        return None
+    resolved = master_config.distillation.get(_COLOCATION_SCHEDULE_KEY)
+    if resolved is None:
+        return None
+    return ColocationSchedule(resolved)
+
+
+def _enter_scoring_phase(
+    student_policy: Policy,
+    teacher_policy: Policy,
+    schedule: Optional[ColocationSchedule],
+) -> None:
+    """Make the teacher resident for top-k scoring.
+
+    Only TIGHT moves memory per step: offload the student optimizer (anti-phase,
+    async/pinned) and bring the teacher to GPU. FAST keeps both resident and None
+    is the separate-cluster path — both no-ops, so the per-step behavior of the
+    default path is unchanged.
+    """
+    if schedule is ColocationSchedule.TIGHT:
+        student_policy.offload_before_refit()
+        teacher_policy.prepare_for_lp_inference()
+
+
+def _enter_training_phase(
+    student_policy: Policy,
+    teacher_policy: Policy,
+    schedule: Optional[ColocationSchedule],
+) -> None:
+    """Prepare the student to train.
+
+    Only TIGHT acts per step: evict the teacher to CPU, then restore the student
+    optimizer. FAST keeps the teacher resident and the student train-ready from
+    the loop's initial prepare_for_training; None (separate-cluster) is a no-op.
+    Both leave the default path's per-step behavior unchanged.
+    """
+    if schedule is ColocationSchedule.TIGHT:
+        teacher_policy.offload_after_refit()
+        student_policy.prepare_for_training()
+
+
+def _set_colocation_resting_state(
+    student_policy: Policy,
+    teacher_policy: Policy,
+    schedule: Optional[ColocationSchedule],
+) -> None:
+    """Set the residency the training loop assumes at the top of each step.
+
+    TIGHT: teacher offloaded (loaded on demand for scoring). FAST: teacher
+    resident and in eval mode.
+    """
+    if schedule is ColocationSchedule.TIGHT:
+        teacher_policy.offload_after_refit()
+    elif schedule is ColocationSchedule.FAST:
+        teacher_policy.prepare_for_lp_inference()
+
 
 # ==============================================================================
 # Setup & Initialization
@@ -201,39 +359,62 @@ def setup(
         )
 
     # ==================================
-    # Clusters — student and teacher are on separate virtual clusters
-    # so they can be placed on different node groups.
+    # Clusters
     # ==================================
     print("\n▶ Setting up compute clusters...")
 
-    student_cluster = RayVirtualCluster(
-        name="distillation_student_cluster",
-        bundle_ct_per_node_list=[cluster_config["gpus_per_node"]]
-        * cluster_config["num_nodes"],
-        use_gpus=True,
-        num_gpus_per_node=cluster_config["gpus_per_node"],
-        max_colocated_worker_groups=1,
-    )
+    colocated = bool(distillation_config.get("colocated", False))
 
-    teacher_cluster_config = (master_config.model_extra or {}).get(
-        "teacher_cluster", cluster_config
-    )
-    teacher_cluster = RayVirtualCluster(
-        name="distillation_teacher_cluster",
-        bundle_ct_per_node_list=[teacher_cluster_config["gpus_per_node"]]
-        * teacher_cluster_config["num_nodes"],
-        use_gpus=True,
-        num_gpus_per_node=teacher_cluster_config["gpus_per_node"],
-        max_colocated_worker_groups=1,
-    )
-    print(
-        f"  ✓ Student cluster: {cluster_config['num_nodes']} nodes × "
-        f"{cluster_config['gpus_per_node']} GPUs"
-    )
-    print(
-        f"  ✓ Teacher cluster: {teacher_cluster_config['num_nodes']} nodes × "
-        f"{teacher_cluster_config['gpus_per_node']} GPUs"
-    )
+    if colocated:
+        # Student and teacher share one mesh. max_colocated_worker_groups=2
+        # places both policy worker groups on the same bundles (the same pattern
+        # GRPO uses for colocated policy+generation). Anti-phase residency keeps
+        # them from co-resident OOM; the preflight below verifies the budget.
+        shared_cluster = RayVirtualCluster(
+            name="distillation_colocated_cluster",
+            bundle_ct_per_node_list=[cluster_config["gpus_per_node"]]
+            * cluster_config["num_nodes"],
+            use_gpus=True,
+            num_gpus_per_node=cluster_config["gpus_per_node"],
+            max_colocated_worker_groups=2,
+        )
+        student_cluster = shared_cluster
+        teacher_cluster = shared_cluster
+        print(
+            f"  ✓ Colocated cluster: {cluster_config['num_nodes']} nodes × "
+            f"{cluster_config['gpus_per_node']} GPUs (student + teacher shared)"
+        )
+    else:
+        # Separate virtual clusters so student and teacher can be placed on
+        # different node groups.
+        student_cluster = RayVirtualCluster(
+            name="distillation_student_cluster",
+            bundle_ct_per_node_list=[cluster_config["gpus_per_node"]]
+            * cluster_config["num_nodes"],
+            use_gpus=True,
+            num_gpus_per_node=cluster_config["gpus_per_node"],
+            max_colocated_worker_groups=1,
+        )
+
+        teacher_cluster_config = (master_config.model_extra or {}).get(
+            "teacher_cluster", cluster_config
+        )
+        teacher_cluster = RayVirtualCluster(
+            name="distillation_teacher_cluster",
+            bundle_ct_per_node_list=[teacher_cluster_config["gpus_per_node"]]
+            * teacher_cluster_config["num_nodes"],
+            use_gpus=True,
+            num_gpus_per_node=teacher_cluster_config["gpus_per_node"],
+            max_colocated_worker_groups=1,
+        )
+        print(
+            f"  ✓ Student cluster: {cluster_config['num_nodes']} nodes × "
+            f"{cluster_config['gpus_per_node']} GPUs"
+        )
+        print(
+            f"  ✓ Teacher cluster: {teacher_cluster_config['num_nodes']} nodes × "
+            f"{teacher_cluster_config['gpus_per_node']} GPUs"
+        )
 
     # ==================================
     # Policies
@@ -257,6 +438,12 @@ def setup(
     student_policy.print_node_ip_and_gpu_id()
     print("  ✓ Student policy initialized")
 
+    if colocated:
+        # Free the student optimizer before the teacher loads so the peak during
+        # teacher init is weights-only (the scoring-phase footprint), never
+        # student(weights+optimizer) + teacher(weights) co-resident.
+        student_policy.offload_before_refit()
+
     print("\n▶ Setting up teacher policy (frozen)...")
     teacher_policy = Policy(
         cluster=teacher_cluster,
@@ -269,6 +456,19 @@ def setup(
     )
     teacher_policy.print_node_ip_and_gpu_id()
     print("  ✓ Teacher policy initialized (no optimizer — frozen)")
+
+    if colocated:
+        print("\n▶ Running colocation memory preflight...")
+        schedule = _run_colocation_preflight(
+            student_policy,
+            teacher_policy,
+            num_shards=student_cluster.world_size(),
+            distillation_config=distillation_config,
+            teacher_dtype=str(teacher_policy_config.get("dtype", "bfloat16")),
+        )
+        # Persist the resolved schedule for the train/validate loops.
+        distillation_config[_COLOCATION_SCHEDULE_KEY] = schedule.value  # type: ignore[typeddict-unknown-key]
+        _set_colocation_resting_state(student_policy, teacher_policy, schedule)
 
     loss_fn = DistillationLossFn({
         "kl_type":           distillation_config["kl_type"],
@@ -319,6 +519,10 @@ def validate(
         return {}, {}
 
     timer = Timer()
+    colocation_schedule = _get_colocation_schedule(master_config)
+    teacher_val_mbs = master_config.distillation.get(
+        "teacher_inference_micro_batch_size"
+    ) or val_mbs
 
     with timer.time("total_validation_time"):
         print(f"▶ Starting validation at step {step}...")
@@ -335,13 +539,15 @@ def validate(
             )
 
             # Get teacher top-k logits for the student's context
+            _enter_scoring_phase(student_policy, teacher_policy, colocation_schedule)
             teacher_topk = teacher_policy.get_topk_logits(
                 val_batch,
-                micro_batch_size=val_mbs,
+                micro_batch_size=teacher_val_mbs,
                 num_topk_logits=master_config.distillation["num_topk_logits"],  # type: ignore[call-arg]
             )
             val_batch["teacher_topk_logits"] = teacher_topk["topk_logits"]
             val_batch["teacher_topk_indices"] = teacher_topk["topk_indices"]
+            _enter_training_phase(student_policy, teacher_policy, colocation_schedule)
 
             val_data = BatchedDataDict(val_batch)
 
@@ -468,6 +674,7 @@ def distillation_train(
     val_at_end = distillation_config["val_at_end"]
     max_num_epochs = distillation_config["max_num_epochs"]
     num_topk_logits = distillation_config["num_topk_logits"]
+    colocation_schedule = _get_colocation_schedule(master_config)
 
     if val_at_start and total_steps == 0:
         print("\n📍 Running initial validation...")
@@ -553,9 +760,20 @@ def distillation_train(
                 with timer.time("teacher_logits"):
                     train_mbs = master_config.policy.get("train_micro_batch_size")
                     assert train_mbs is not None, "PolicyConfig.train_micro_batch_size is required for training"
+                    # The teacher carries no optimizer/grad memory, so it can
+                    # score with a larger micro-batch than the student trains on.
+                    teacher_mbs = (
+                        distillation_config.get("teacher_inference_micro_batch_size")
+                        or train_mbs
+                    )
+                    # Colocated TIGHT: offload the student optimizer and bring
+                    # the teacher resident; no-op for FAST / separate-cluster.
+                    _enter_scoring_phase(
+                        student_policy, teacher_policy, colocation_schedule
+                    )
                     teacher_topk = teacher_policy.get_topk_logits(
                         rollout_batch,
-                        micro_batch_size=train_mbs,
+                        micro_batch_size=teacher_mbs,
                         num_topk_logits=num_topk_logits,  # type: ignore[call-arg]
                     )
                     rollout_batch["teacher_topk_logits"] = teacher_topk["topk_logits"]
@@ -566,6 +784,11 @@ def distillation_train(
                 # ----------------------------------------
                 print("▶ Taking student training step...")
                 with timer.time("policy_training"):
+                    # Colocated TIGHT: evict the teacher and restore the student
+                    # optimizer before training; FAST keeps the teacher resident.
+                    _enter_training_phase(
+                        student_policy, teacher_policy, colocation_schedule
+                    )
                     train_results = student_policy.train(
                         BatchedDataDict(rollout_batch),
                         loss_fn,

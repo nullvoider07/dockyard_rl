@@ -31,6 +31,10 @@ from dockyard_rl.models.generation.vllm.vllm_worker import (
     BaseVllmGenerationWorker,
     wrap_with_nvtx_name,
 )
+from dockyard_rl.models.generation.vllm.router_capture import (
+    routed_experts_from_vllm_output,
+    stack_routed_experts,
+)
 
 # Async-engine worker implementation
 class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
@@ -315,8 +319,10 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         generation_lengths:        list[int]          = []
         unpadded_sequence_lengths: list[int]          = []
         truncated_list:            list[bool]         = []
+        routed_experts_list:       list[Optional[torch.Tensor]] = []
 
         max_gen = max(len(o.outputs[0].token_ids) for o in outputs)
+        total_len = padded_input_length + max_gen
 
         for i, output in enumerate(outputs):
             seq_len = int(input_lengths[i])
@@ -324,7 +330,6 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             gen_ids = list(gen.token_ids)
             n_gen   = len(gen_ids)
 
-            total_len = padded_input_length + max_gen
             full_output = torch.full(
                 (total_len,), self.cfg.get("_pad_token_id", 0),
                 dtype=input_ids.dtype,
@@ -351,7 +356,17 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             unpadded_sequence_lengths.append(seq_len + n_gen)
             truncated_list.append(gen.finish_reason == "length")
 
-        return BatchedDataDict[GenerationOutputSpec](
+            if self.router_replay_capture:
+                routed_experts_list.append(
+                    routed_experts_from_vllm_output(
+                        output,
+                        gen,
+                        valid_length=seq_len + n_gen,
+                        padded_length=total_len,
+                    )
+                )
+
+        result = BatchedDataDict[GenerationOutputSpec](
             {
                 "output_ids":  torch.stack(output_ids_list),
                 "logprobs":    torch.stack(logprobs_list),
@@ -364,6 +379,13 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 "truncated": torch.tensor(truncated_list, dtype=torch.bool),
             }
         )
+        if self.router_replay_capture:
+            routed_experts = stack_routed_experts(
+                routed_experts_list, padded_length=total_len
+            )
+            if routed_experts is not None:
+                result["routed_experts"] = routed_experts
+        return result
 
     async def generate_async(
         self,
@@ -509,7 +531,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                             if pos < total_len:
                                 logprobs[0, pos] = lp_dict[token_id].logprob
 
-            return sample_idx, BatchedDataDict[GenerationOutputSpec](
+            sample_output = BatchedDataDict[GenerationOutputSpec](
                 {
                     "output_ids": output_ids.unsqueeze(0),
                     "logprobs": logprobs,
@@ -526,6 +548,22 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                     ),
                 }
             )
+            if self.router_replay_capture:
+                aligned = routed_experts_from_vllm_output(
+                    final_request_output,
+                    gen,
+                    valid_length=total_len,
+                    padded_length=total_len,
+                    device=original_input_ids_row.device,
+                )
+                routed_experts = stack_routed_experts(
+                    [aligned],
+                    padded_length=total_len,
+                    device=original_input_ids_row.device,
+                )
+                if routed_experts is not None:
+                    sample_output["routed_experts"] = routed_experts
+            return sample_idx, sample_output
 
         sample_tasks = [
             asyncio.create_task(process_single_sample(i)) for i in range(batch_size)

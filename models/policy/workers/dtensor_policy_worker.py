@@ -35,6 +35,11 @@ from transformers.models.gemma3.modeling_gemma3 import (
 
 from dockyard_rl.data_plane.worker_mixin import TQWorkerMixin
 from dockyard_rl.distributed.batched_data_dict import BatchedDataDict
+from dockyard_rl.models.dtensor.moe.router_replay import (
+    resolve_router_replay_enabled,
+    router_replay_context,
+    validate_router_replay_config,
+)
 from dockyard_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
@@ -497,6 +502,7 @@ class DTensorPolicyWorkerImpl(
             )
 
         self._setup_moe_load_balancing()
+        self._setup_router_replay()
 
         # Restore from checkpoint
         if weights_path:
@@ -514,6 +520,42 @@ class DTensorPolicyWorkerImpl(
         load-balanced ``MoEBlock`` modules.
         """
         return
+
+    def _setup_router_replay(self) -> None:
+        """Resolve and validate MoE router-replay (#2908).
+
+        Reads ``policy.router_replay.enabled`` and fails fast if it is set on a
+        model without ``MoEBlock`` modules. The forward sites consume the flag
+        via ``router_replay_context``; the default (disabled) path is inert.
+
+        Replay binds the recorded routing to the right-padded ``[B, T, L, K]``
+        token layout, so it is incompatible with the layouts that re-arrange the
+        token/sequence axis: sequence packing (packed rows), dynamic batching
+        (variable shapes), and context parallelism (seq-sharded buffers). The
+        recorded routing would have to be transformed identically to stay
+        aligned (HV-47). Fail fast at setup with a clear message rather than
+        crash deep in the pack/shard machinery (the forward sites also refuse
+        these combinations as defense in depth).
+        """
+        self._router_replay_enabled = resolve_router_replay_enabled(self.cfg)
+        validate_router_replay_config(self._router_replay_enabled, self.model)
+        if self._router_replay_enabled:
+            cp_size = self.cfg["dtensor_cfg"]["context_parallel_size"]
+            incompatible = []
+            if self.cfg["sequence_packing"]["enabled"]:
+                incompatible.append("policy.sequence_packing.enabled")
+            if self.cfg["dynamic_batching"]["enabled"]:
+                incompatible.append("policy.dynamic_batching.enabled")
+            if cp_size > 1:
+                incompatible.append("policy.dtensor_cfg.context_parallel_size>1")
+            if incompatible:
+                raise ValueError(
+                    "policy.router_replay.enabled=true is not compatible with "
+                    f"{', '.join(incompatible)}: router replay binds the recorded "
+                    "routing to the unpacked right-padded token layout, which "
+                    "those features re-arrange (HV-47). Disable router replay or "
+                    "the listed feature(s)."
+                )
 
     def _apply_moe_surgery(self, model: nn.Module) -> None:
         """Seam: swap HF routed-expert MLPs for native MoEBlocks (MoE only).
@@ -856,7 +898,17 @@ class DTensorPolicyWorkerImpl(
                             if len(vlm_kwargs) > 0:
                                 del model_args["flash_attn_kwargs"]
 
-                            outputs = self.model(**model_args)
+                            # MoE router-replay: force the recorded generation
+                            # routing for this microbatch (inert when disabled or
+                            # no routed_experts column).
+                            with router_replay_context(
+                                self.model,
+                                mb.get("routed_experts", None),
+                                enabled=self._router_replay_enabled,
+                                seq_packing=self.enable_seq_packing,
+                                context_parallel=self.cp_size > 1,
+                            ):
+                                outputs = self.model(**model_args)
 
                         if not hasattr(outputs, "logits"):
                             logits = cast(Any, self.model).lm_head(outputs.last_hidden_state)
@@ -1157,7 +1209,18 @@ class DTensorPolicyWorkerImpl(
                         if len(vlm_kwargs) > 0:
                             del model_args["flash_attn_kwargs"]
 
-                        outputs = self.model(**model_args)
+                        # MoE router-replay: the prev-logprob recompute is the
+                        # primary consumer — re-routing tokens differently here
+                        # than at generation is what inflates the train/gen
+                        # logprob error. Inert when disabled / no routing column.
+                        with router_replay_context(
+                            self.model,
+                            lp_batch.get("routed_experts", None),
+                            enabled=self._router_replay_enabled,
+                            seq_packing=self.enable_seq_packing,
+                            context_parallel=self.cp_size > 1,
+                        ):
+                            outputs = self.model(**model_args)
 
                     logits = outputs.logits
                     logits = self._apply_temperature_scaling(logits)
@@ -1877,10 +1940,18 @@ class DTensorPolicyWorkerImpl(
     @torch.no_grad()
     @wrap_with_nvtx_name("dtensor_policy_worker/offload_before_refit")
     def offload_before_refit(self) -> None:
-        """Offload the optimizer to the CPU."""
+        """Offload the optimizer to the CPU.
+
+        Uses the non-blocking / pinned-buffer transfer: plain optimizer states
+        stage through reusable pinned host memory for full-bandwidth copies,
+        DTensor states keep their sharding via .to(), and a synchronize before
+        the freed GPU memory is reused keeps it correct. This is the anti-phase
+        release valve in colocated distillation (the teacher's resident weights
+        reuse the window the optimizer just vacated) and the refit offload in GRPO.
+        """
         torch.randn(1).cuda()  # wake up torch allocator
         if self.optimizer is not None:
-            self.move_optimizer_to_device("cpu")
+            self.move_optimizer_to_device("cpu", non_blocking=True)
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -1900,13 +1971,55 @@ class DTensorPolicyWorkerImpl(
             f"GPU Memory after optimizer offload: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
         )
 
-    def move_optimizer_to_device(self, device: str | torch.device) -> None:
+    def move_optimizer_to_device(
+        self, device: str | torch.device, non_blocking: bool = False
+    ) -> None:
+        """Move optimizer state to ``device``.
+
+        When ``non_blocking`` is set and the target is CPU, plain (non-DTensor)
+        optimizer states are staged through reusable pinned host buffers for
+        full-bandwidth, asynchronous transfer; DTensor states keep their
+        sharding via ``.to()`` and use the standard path. A synchronize at the
+        end guarantees the copies complete before the freed GPU memory is reused.
+        """
         if self.optimizer is None:
             return
-        for state in self.optimizer.state.values():
+        target = torch.device(device) if isinstance(device, str) else device
+        stage_pinned = non_blocking and target.type == "cpu"
+        cache: Optional[dict[tuple[int, str], torch.Tensor]] = getattr(
+            self, "_opt_pinned_cache", None
+        )
+        if stage_pinned and cache is None:
+            cache = {}
+            self._opt_pinned_cache = cache
+        for param, state in self.optimizer.state.items():
             for k, v in state.items():
-                if isinstance(v, (DTensor, torch.Tensor)):
-                    state[k] = v.to(device)
+                if not isinstance(v, (DTensor, torch.Tensor)):
+                    continue
+                if stage_pinned and not isinstance(v, DTensor) and cache is not None:
+                    key = (id(param), k)
+                    buf = cache.get(key)
+                    if buf is None or buf.shape != v.shape or buf.dtype != v.dtype:
+                        buf = torch.empty(
+                            *v.shape, device="cpu", pin_memory=True, dtype=v.dtype
+                        )
+                        cache[key] = buf
+                    buf.copy_(v, non_blocking=True)
+                    state[k] = buf
+                else:
+                    state[k] = v.to(target, non_blocking=non_blocking)
+        if non_blocking:
+            torch.cuda.synchronize()
+
+    def get_model_parameter_count(self) -> int:
+        """Return the global (unsharded) parameter count of the model.
+
+        ``numel()`` on a DTensor reflects the logical global shape, so this is
+        the full model parameter count regardless of FSDP/TP sharding — the
+        figure the colocated-distillation memory estimator divides by the shard
+        count to get a per-GPU footprint.
+        """
+        return int(sum(p.numel() for p in self.model.parameters()))
 
     def move_to_device(self, model: nn.Module, device: str | torch.device) -> nn.Module:
         model = self.move_buffer_to_device(model, device)

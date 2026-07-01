@@ -23,6 +23,10 @@ from dockyard_rl.models.generation.interfaces import (
     verify_right_padding,
 )
 from dockyard_rl.models.generation.vllm.config import VllmConfig
+from dockyard_rl.models.generation.vllm.router_capture import (
+    routed_experts_from_vllm_output,
+    stack_routed_experts,
+)
 from .utils import (
     format_prompt_for_vllm_generation,
 )
@@ -166,6 +170,16 @@ class BaseVllmGenerationWorker:
         self.fraction_of_gpus       = fraction_of_gpus
         self.is_model_owner         = bundle_indices is not None
         self.py_executable          = sys.executable
+        # MoE router-replay capture (#2908): when enabled the engine is built
+        # with enable_return_routed_experts and generate() aligns each sample's
+        # per-token routing into a routed_experts column. Plain {"enabled": bool}
+        # dict propagated by the GRPO setup; absent → disabled, path unchanged.
+        _router_replay = self.cfg.get("router_replay") or {}
+        self.router_replay_capture  = bool(
+            _router_replay.get("enabled", False)
+            if isinstance(_router_replay, dict)
+            else getattr(_router_replay, "enabled", False)
+        )
 
         # Non-model-owner workers don't load the model.
         if not self.is_model_owner:
@@ -394,6 +408,14 @@ class BaseVllmGenerationWorker:
             **vllm_kwargs,
         )
 
+        # MoE router-replay (#2908): enable the vLLM routed-expert capture
+        # subsystem so CompletionOutput.routed_experts / prompt_routed_experts are
+        # populated. vLLM rejects this under async_scheduling / PP>1 / PCP>1 /
+        # DCP>1 (I4 pre-validates and fails fast with a dockyard-native message
+        # before engine construction); only set it when replay is on.
+        if self.router_replay_capture:
+            llm_kwargs["enable_return_routed_experts"] = True
+
         # MLA KV-cache compression.
         #
         # The turboquant-plus-vllm third-party plugin is no longer used.  TurboQuant
@@ -580,8 +602,10 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
         generation_lengths:           list[int]          = []
         unpadded_sequence_lengths:    list[int]          = []
         truncated_list:               list[bool]         = []
+        routed_experts_list:          list[Optional[torch.Tensor]] = []
 
         max_gen = max(len(o.outputs[0].token_ids) for o in outputs)
+        total_len = padded_input_length + max_gen
 
         for i, output in enumerate(outputs):
             seq_len = int(input_lengths[i])
@@ -589,7 +613,6 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
             gen_ids = list(gen.token_ids)
             n_gen   = len(gen_ids)
 
-            total_len = padded_input_length + max_gen
             full_output = torch.full(
                 (total_len,), cast(int, self.cfg.get("_pad_token_id")),
                 dtype=input_ids.dtype,
@@ -616,7 +639,17 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
             unpadded_sequence_lengths.append(seq_len + n_gen)
             truncated_list.append(gen.finish_reason == "length")
 
-        return BatchedDataDict[GenerationOutputSpec](
+            if self.router_replay_capture:
+                routed_experts_list.append(
+                    routed_experts_from_vllm_output(
+                        output,
+                        gen,
+                        valid_length=seq_len + n_gen,
+                        padded_length=total_len,
+                    )
+                )
+
+        result = BatchedDataDict[GenerationOutputSpec](
             {
                 "output_ids":  torch.stack(output_ids_list),
                 "logprobs":    torch.stack(logprobs_list),
@@ -629,6 +662,13 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
                 "truncated": torch.tensor(truncated_list, dtype=torch.bool),
             }
         )
+        if self.router_replay_capture:
+            routed_experts = stack_routed_experts(
+                routed_experts_list, padded_length=total_len
+            )
+            if routed_experts is not None:
+                result["routed_experts"] = routed_experts
+        return result
 
     @wrap_with_nvtx_name("vllm_generation_worker/generate_text")
     def generate_text(

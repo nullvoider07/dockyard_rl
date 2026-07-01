@@ -23,6 +23,33 @@ from dockyard_rl.distributed.worker_groups_utils import (
 
 logger = logging.getLogger(__name__)
 
+# Cap on the per-worker Ray GPU reservation in colocated mode. The reservation is
+# a scheduling fraction, not a compute/memory limit, so a small value lets the
+# trainer + inference worker groups (and any extra colocated reservations)
+# co-schedule on the same bundle while GPU memory is partitioned by each engine's
+# mem_fraction_static / gpu_memory_utilization.
+_COLOCATION_GPU_RESERVATION_CAP = 0.2
+
+
+def colocation_reserved_num_gpus(
+    use_gpus: bool, max_colocated_worker_groups: int
+) -> float:
+    """Per-worker Ray GPU reservation for a worker group.
+
+    - CPU-only clusters reserve 0.
+    - Dedicated fleets (max_colocated_worker_groups == 1) reserve the full GPU.
+    - Colocated clusters (> 1) reserve min(0.2, 1/max) so multiple worker groups
+      co-schedule on one bundle (memory is partitioned by the engine, not by this
+      fraction).
+    """
+    if not use_gpus:
+        return 0.0
+    share = 1 / max_colocated_worker_groups
+    if max_colocated_worker_groups > 1:
+        return min(_COLOCATION_GPU_RESERVATION_CAP, share)
+    return share
+
+
 # MultiWorkerFuture
 @dataclass
 class MultiWorkerFuture:
@@ -836,10 +863,9 @@ class RayWorkerGroup:
                     else f"{self.name_prefix}-{pg_idx}-{bundle_idx}"
                 )
 
-                num_gpus = (
-                    1 / self.cluster.max_colocated_worker_groups
-                    if self.cluster.use_gpus
-                    else 0
+                num_gpus = colocation_reserved_num_gpus(
+                    self.cluster.use_gpus,
+                    self.cluster.max_colocated_worker_groups,
                 )
 
                 runtime_env: dict[str, Any] = {

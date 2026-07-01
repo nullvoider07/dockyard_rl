@@ -97,6 +97,13 @@ class AbstractPolicyWorker:
         device_idx = torch.cuda.current_device()
         return get_free_memory_bytes(device_idx)
 
+    def get_total_memory_bytes(self) -> int:
+        """Get the total GPU memory capacity of this worker's device."""
+        from dockyard_rl.utils.nvml import get_total_memory_bytes
+
+        device_idx = torch.cuda.current_device()
+        return get_total_memory_bytes(device_idx)
+
     def shutdown(self) -> bool:
         """Shutdown the policy."""
         try:

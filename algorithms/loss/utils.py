@@ -1,11 +1,22 @@
 """Loss utility functions for Project Dockyard.
 
-Provides masked_mean and calculate_kl, used by every loss function
-and by the advantage estimator.
+Provides masked_mean and calculate_kl, used by every loss function and by the
+advantage estimator, plus prepare_loss_input — the per-input-type dispatcher the
+DTensor policy worker uses to turn raw student logits into the kwargs each loss
+function consumes.
 """
 
-from typing import Optional
+from __future__ import annotations
+
+from typing import Any, Optional, TYPE_CHECKING
 import torch
+
+from dockyard_rl.algorithms.loss.interfaces import LossInputType
+
+if TYPE_CHECKING:
+    from dockyard_rl.algorithms.loss.interfaces import LossFunction
+    from dockyard_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
+    from dockyard_rl.distributed.batched_data_dict import BatchedDataDict
 
 def masked_mean(
     tensor:                     torch.Tensor,
@@ -103,3 +114,159 @@ def calculate_kl(
         kl = kl.clamp(-output_clamp_value, output_clamp_value)
 
     return kl
+
+
+def prepare_loss_input(
+    logits:                 torch.Tensor,
+    data:                   "BatchedDataDict[Any]",
+    loss_fn:                "LossFunction",
+    vocab_parallel_rank:    Optional[int] = None,
+    vocab_parallel_group:   Optional[torch.distributed.ProcessGroup] = None,
+    context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    sampling_params:        Optional["TrainingSamplingParams"] = None,
+) -> tuple[dict[str, Any], "BatchedDataDict[Any]"]:
+    """Turn raw student logits into the per-input-type kwargs a loss fn consumes.
+
+    Dispatches on ``loss_fn.input_type``. The heavy logprob / distillation
+    helpers and the cross-tokenizer keystone are imported inside their branches:
+    ``mask_out_neg_inf_logprobs`` lives in ``dockyard_rl.algorithms.utils``,
+    which imports this module (``calculate_kl``), so a module-level import would
+    be circular; and the cross-tokenizer teacher-logit rebuild lives in the
+    transport layer (``x_token.loss_utils``).
+
+    Args:
+        logits: Student logits ``[B, T, V]`` from the worker forward (or, on the
+            linear-CE-fusion path, precomputed next-token logprobs ``[B, T-1]``).
+        data: Microbatch data. Mutated in place when the LOGPROB branch writes
+            ``curr_logprobs_unfiltered`` for the reference-policy KL penalty.
+        loss_fn: The loss function; only ``input_type`` (and a few optional
+            attributes read via ``hasattr``) are consulted here.
+        vocab_parallel_rank / vocab_parallel_group / context_parallel_group:
+            Parallelism groups forwarded to the logprob / distillation helpers.
+        sampling_params: Only used by the LOGPROB branch (top-k/top-p filtering,
+            currently ClippedPGLossFn).
+
+    Returns:
+        ``(loss_input, data)`` — the kwargs dict for ``loss_fn`` and the
+        (possibly updated) data dict.
+
+    Raises:
+        NotImplementedError: ``DRAFT`` input prep is not ported (the upstream
+            draft branch depends on the model-parallel framework dockyard
+            excludes; the draft path is outside the cross-tokenizer scope).
+        ValueError: unknown ``input_type``.
+    """
+    if loss_fn.input_type == LossInputType.LOGIT:
+        loss_input: dict[str, Any] = {"logits": logits}
+
+    elif loss_fn.input_type == LossInputType.LOGPROB:
+        from dockyard_rl.distributed.model_utils import (
+            get_next_token_logprobs_from_logits,
+        )
+        from dockyard_rl.algorithms.logits_sampling_utils import (
+            need_top_k_or_top_p_filtering,
+        )
+        from dockyard_rl.algorithms.utils import mask_out_neg_inf_logprobs
+
+        # Linear CE fusion returns precomputed next-token logprobs (2D tensor);
+        # the standard path computes them from 3D logits.
+        if hasattr(loss_fn, "use_linear_ce_fusion") and loss_fn.use_linear_ce_fusion:
+            logprobs = logits.to(torch.float32)
+            logprobs = logprobs[:, : data["input_ids"].shape[1] - 1]
+        else:
+            logprobs = get_next_token_logprobs_from_logits(
+                input_ids=data["input_ids"],
+                next_token_logits=logits,
+                seq_index=data.get("seq_index", None),
+                vocab_parallel_rank=vocab_parallel_rank,
+                vocab_parallel_group=vocab_parallel_group,
+                context_parallel_group=context_parallel_group,
+                sampling_params=sampling_params,
+            )
+
+        # top-k/top-p filtering for logprobs (currently ClippedPGLossFn only).
+        if need_top_k_or_top_p_filtering(sampling_params):
+            mask = data["token_mask"] * data["sample_mask"].unsqueeze(-1)
+            logprobs = mask_out_neg_inf_logprobs(logprobs, mask[:, 1:], "curr_logprobs")
+            # Unfiltered logprobs for the reference-policy KL penalty.
+            if (
+                hasattr(loss_fn, "reference_policy_kl_penalty")
+                and loss_fn.reference_policy_kl_penalty != 0
+            ):
+                data["curr_logprobs_unfiltered"] = get_next_token_logprobs_from_logits(
+                    input_ids=data["input_ids"],
+                    next_token_logits=logits,
+                    seq_index=data.get("seq_index", None),
+                    vocab_parallel_rank=vocab_parallel_rank,
+                    vocab_parallel_group=vocab_parallel_group,
+                    context_parallel_group=context_parallel_group,
+                    sampling_params=None,  # no filtering
+                )
+
+        loss_input = {"next_token_logprobs": logprobs}
+
+    elif loss_fn.input_type == LossInputType.DISTILLATION:
+        from dockyard_rl.distributed.model_utils import (
+            get_distillation_topk_logprobs_from_logits,
+        )
+
+        calculate_entropy = loss_fn.zero_outside_topk and loss_fn.kl_type != "forward"
+        student_topk_logprobs, teacher_topk_logprobs, H_all = (
+            get_distillation_topk_logprobs_from_logits(
+                student_logits=logits,
+                teacher_topk_logits=data["teacher_topk_logits"],
+                teacher_topk_indices=data["teacher_topk_indices"],
+                zero_outside_topk=loss_fn.zero_outside_topk,
+                calculate_entropy=calculate_entropy,
+                vocab_parallel_rank=vocab_parallel_rank,
+                vocab_parallel_group=vocab_parallel_group,
+                context_parallel_group=context_parallel_group,
+            )
+        )
+        loss_input = {
+            "student_topk_logprobs": student_topk_logprobs,
+            "teacher_topk_logprobs": teacher_topk_logprobs,
+            "H_all": H_all,
+        }
+
+    elif loss_fn.input_type == LossInputType.DISTILLATION_CROSS_TOKENIZER:
+        # Rebuild full-vocab teacher logits from the per-rank CUDA IPC handles
+        # and do the shared CP-resolution both loss paths need; the loss fn does
+        # the projection / chunk-average / KL reductions. The TP/CP groups are
+        # derived from the student logits' device mesh. The keystone
+        # prepare_xtoken_cross_tokenizer_loss_input lives in the transport layer
+        # and is imported lazily to keep this dispatcher import-clean.
+        from dockyard_rl.algorithms.x_token.loss_utils import (
+            prepare_xtoken_cross_tokenizer_loss_input,
+        )
+
+        teacher_full_logits, student_logits_contig, align, tp_group, cp_group = (
+            prepare_xtoken_cross_tokenizer_loss_input(
+                logits,
+                data,
+                vocab_parallel_group=vocab_parallel_group,
+                context_parallel_group=context_parallel_group,
+            )
+        )
+        loss_input = {
+            "logits": logits,
+            "teacher_full_logits": teacher_full_logits,
+            "student_logits_contig": student_logits_contig,
+            "align": align,
+            "tp_group": tp_group,
+            "cp_group": cp_group,
+        }
+
+    elif loss_fn.input_type == LossInputType.DRAFT:
+        raise NotImplementedError(
+            "DRAFT loss-input preparation is not ported: the upstream DRAFT "
+            "branch depends on the model-parallel framework dockyard excludes "
+            "(its next-token tensor roll + vocab-parallel gather), and the "
+            "speculative-decode draft path is outside the cross-tokenizer scope. "
+            "Build a DTensor-native DRAFT branch when that path is taken up."
+        )
+
+    else:
+        raise ValueError(f"Unknown loss function input type: {loss_fn.input_type}")
+
+    return loss_input, data
