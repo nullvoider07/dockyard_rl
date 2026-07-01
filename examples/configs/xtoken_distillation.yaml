@@ -14,7 +14,7 @@
 # Usage:
 #   python3 examples/run_xtoken_distillation.py \
 #     --config examples/configs/xtoken_distillation.yaml \
-#     loss_fn.projection_matrix_path=/path/to/student_to_teacher_projection.pt \
+#     teachers.0.projection_matrix_path=/path/to/student_to_teacher_projection.pt \
 #     cluster.gpus_per_node=8 cluster.num_nodes=2
 
 distillation:
