@@ -27,9 +27,11 @@ avoid wasting the step on such groups.
 `GDPOAdvantageEstimator` (selected by `grpo.adv_estimator.name='gdpo'`)
 generalizes GRPO to **multiple reward components**. Some environments score a
 rollout on more than one axis — e.g. tests passing *and* the patch staying
-lint-clean *and* a runtime budget, or several independent graders — exposed in
-the batch as `reward1`, `reward2`, … Rather than collapse them to a single
-scalar up front, GDPO:
+lint-clean *and* a runtime budget, or several independent graders. A multi-reward
+environment returns `EnvironmentReturn.rewards` as a `dict[str, Tensor]`, and the
+rollout exposes each component in the batch under a namespaced `reward/<name>`
+key (e.g. `reward/correctness`, `reward/format`); `get_gdpo_reward_component_keys`
+collects them. Rather than collapse them to a single scalar up front, GDPO:
 
 - computes a GRPO-style per-prompt leave-one-out baseline for **each** component
   independently (optionally per-component std-normalized),

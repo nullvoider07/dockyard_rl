@@ -30,7 +30,8 @@ class EnvironmentReturn(NamedTuple, Generic[MetadataT]):
                        that are valid actions for the next turn or
                        similar. This field lets you control this per turn.
     rewards: the rewards for this turn.
-             Shape [B] for single-reward, [B, num_reward_components] for multi-reward (e.g. GDPO).
+             Tensor[B] for single-reward, or a dict of {name: Tensor[B]} for
+             multi-reward environments (e.g. GDPO), where name is a "reward/<name>" key.
     terminateds: whether the episode ended this turn.
     answers: the answers for this turn.
     """
@@ -38,7 +39,7 @@ class EnvironmentReturn(NamedTuple, Generic[MetadataT]):
     observations: list[dict[str, str]]
     metadata: list[MetadataT]
     next_stop_strings: list[list[str] | None] | list[None]
-    rewards: Tensor
+    rewards: Tensor | dict[str, Tensor]
     terminateds: Tensor
     answers: list[str | None] | None
 
