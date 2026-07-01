@@ -38,14 +38,17 @@ from torch.distributed.tensor import DTensor
 from dockyard_rl.algorithms.x_token.token_aligner import AlignmentBatch
 
 
-def alignment_from_flat_batch(data: Mapping[str, Any]) -> AlignmentBatch:
-    """Rebuild :class:`AlignmentBatch` from the flat ``alignment_*`` keys.
+def alignment_from_flat_batch(
+    data: Mapping[str, Any], *, alignment_prefix: str = "alignment_"
+) -> AlignmentBatch:
+    """Rebuild :class:`AlignmentBatch` from the flat ``{alignment_prefix}*`` keys.
 
-    The field set is driven off :class:`AlignmentBatch` so the helper
-    can't drift from the schema.
+    The field set is driven off :class:`AlignmentBatch` so the helper can't drift
+    from the schema. ``alignment_prefix`` selects the single-teacher
+    (``"alignment_"``) or per-teacher (``"alignment_{i}_"``) key namespace.
     """
     return AlignmentBatch(
-        **{f.name: data[f"alignment_{f.name}"] for f in fields(AlignmentBatch)}
+        **{f.name: data[f"{alignment_prefix}{f.name}"] for f in fields(AlignmentBatch)}
     )
 
 
@@ -621,16 +624,23 @@ def build_exact_token_map(
 # ---------------------------------------------------------------------------
 @dataclass
 class LocalizedAlignment:
-    """CP-localized chunk-alignment tensors consumed by the loss reductions."""
+    """CP-localized alignment tensors consumed by the loss reductions.
 
-    student_chunk_id: torch.Tensor
-    teacher_chunk_id: torch.Tensor
-    pair_valid: torch.Tensor
-    pair_is_correct: torch.Tensor
+    For a cross-tokenizer teacher every field is populated (chunk-averaged
+    projection KL / gold path). For a same-tokenizer teacher (no projection,
+    identity 1:1 token alignment) the chunk/pair fields stay ``None``: its KD term
+    reads only the shared student fields (``student_input_ids`` /
+    ``student_token_mask`` / ``sample_mask``).
+    """
+
     sample_mask: torch.Tensor
+    student_chunk_id: Optional[torch.Tensor] = None
+    teacher_chunk_id: Optional[torch.Tensor] = None
+    pair_valid: Optional[torch.Tensor] = None
+    pair_is_correct: Optional[torch.Tensor] = None
     # Filled post-construction by the loss-input keystone (None when built via
-    # localize_alignment); read only by the next-token-accuracy metric -- the
-    # gold path leaves them unset.
+    # localize_alignment); read by the next-token-accuracy metric and the
+    # same-tokenizer KD path -- the gold path leaves them unset.
     student_input_ids: Optional[torch.Tensor] = None
     student_token_mask: Optional[torch.Tensor] = None
 
@@ -639,12 +649,14 @@ def localize_alignment(
     data: Mapping[str, Any],
     *,
     teacher_seq_len: int,
+    alignment_prefix: str = "alignment_",
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> LocalizedAlignment:
     """Localize the chunk-alignment data-dict fields for the local CP shard.
 
-    Unwraps the ``alignment_*`` / ``sample_mask`` entries from DTensor to their
-    local tensors. The teacher-seq ``teacher_chunk_id`` is full, so it is sliced
+    Unwraps the ``{alignment_prefix}*`` / ``sample_mask`` entries from DTensor to
+    their local tensors (``"alignment_"`` single-teacher, ``"alignment_{i}_"``
+    per-teacher). The teacher-seq ``teacher_chunk_id`` is full, so it is sliced
     contiguously to this CP rank's ``teacher_seq_len`` window to match the
     transport consumer's contiguous teacher-logit slice. Student-seq fields stay
     as handed in; the caller (the loss-input keystone) relayouts them from the CP
@@ -652,7 +664,9 @@ def localize_alignment(
     """
     from dockyard_rl.models.dtensor.parallelize import to_local_if_dtensor
 
-    teacher_chunk_id_full = to_local_if_dtensor(data["alignment_teacher_chunk_id"])
+    teacher_chunk_id_full = to_local_if_dtensor(
+        data[f"{alignment_prefix}teacher_chunk_id"]
+    )
     cp_rank = (
         torch.distributed.get_rank(cp_group)
         if cp_group is not None and torch.distributed.get_world_size(cp_group) > 1
@@ -663,10 +677,14 @@ def localize_alignment(
         :, teacher_seq_start : teacher_seq_start + teacher_seq_len
     ]
     return LocalizedAlignment(
-        student_chunk_id=to_local_if_dtensor(data["alignment_student_chunk_id"]),
+        student_chunk_id=to_local_if_dtensor(
+            data[f"{alignment_prefix}student_chunk_id"]
+        ),
         teacher_chunk_id=teacher_chunk_id,
-        pair_valid=to_local_if_dtensor(data["alignment_pair_valid"]),
-        pair_is_correct=to_local_if_dtensor(data["alignment_pair_is_correct"]),
+        pair_valid=to_local_if_dtensor(data[f"{alignment_prefix}pair_valid"]),
+        pair_is_correct=to_local_if_dtensor(
+            data[f"{alignment_prefix}pair_is_correct"]
+        ),
         sample_mask=to_local_if_dtensor(data["sample_mask"]),
     )
 
@@ -1029,42 +1047,84 @@ def rebuild_teacher_full_logits_cross_cluster(
     return full[:, seq_start : seq_start + local_seq_len].contiguous()
 
 
+def _rebuild_teacher_i_full_logits(
+    data: Mapping[str, Any],
+    i: int,
+    *,
+    cp_group: Optional[torch.distributed.ProcessGroup],
+) -> torch.Tensor:
+    """Rebuild teacher ``i``'s full-vocab logits over whichever transport shipped them.
+
+    Transport switch (loss stays transport-blind): the producer/driver writes
+    exactly one of ``teacher_{i}_full_logits_ipc`` (node-local CUDA IPC) or
+    ``teacher_{i}_full_logits_cross_cluster`` (bf16 + seq-chunked over the
+    data_plane) per the configured ``xtoken.transport``. Both reassemble to the
+    same ``[B, T_t/CP_s, V_t]`` contract.
+    """
+    ipc_key = f"teacher_{i}_full_logits_ipc"
+    cc_key = f"teacher_{i}_full_logits_cross_cluster"
+    if ipc_key in data:
+        return rebuild_teacher_full_logits_from_ipc(
+            data[ipc_key],
+            cp_group=cp_group,
+            device=torch.cuda.current_device(),
+        )
+    if cc_key in data:
+        return rebuild_teacher_full_logits_cross_cluster(
+            data[cc_key],
+            cp_group=cp_group,
+        )
+    raise KeyError(
+        f"cross-tokenizer loss input is missing teacher {i} logits: expected "
+        f"'{ipc_key}' (IPC transport) or '{cc_key}' (data_plane transport) in data."
+    )
+
+
 def prepare_xtoken_cross_tokenizer_loss_input(
     logits: torch.Tensor,
     data: Mapping[str, Any],
     *,
+    projection_matrix_paths: list[Optional[str]],
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> tuple[
     torch.Tensor,
-    torch.Tensor,
-    LocalizedAlignment,
+    dict[int, torch.Tensor],
+    dict[int, LocalizedAlignment],
     Optional[torch.distributed.ProcessGroup],
     Optional[torch.distributed.ProcessGroup],
 ]:
-    """Assemble the cross-tokenizer loss inputs from student logits + teacher transport.
+    """Build the per-teacher cross-tokenizer loss pieces from student logits + teacher transport.
 
     The keystone the ``DISTILLATION_CROSS_TOKENIZER`` branch of
     :func:`dockyard_rl.algorithms.loss.utils.prepare_loss_input` calls. Rebuilds
-    the teacher full-vocab logits from the per-rank CUDA IPC handles and does the
-    shared CP-resolution both loss paths need (contiguous student logits +
-    localized, next-token-shifted alignment), plus the contiguous student
-    ``input_ids`` / ``token_mask`` the P-KL ``next_token_accuracy`` metric reads
-    (it requires them set here — ``localize_alignment`` leaves them ``None``).
-    TP/CP groups come from the student ``logits``' device mesh, falling back to
-    the passed groups for non-DTensor logits. The teacher rebuild +
-    ``cuda.current_device`` are GPU-only; the CP-relayout / localize / shift glue
-    collapses to the local op at world=1. The cross-cluster transport reassembles
-    teacher logits to the same ``[B, T_t/CP_s, V_t]`` contract and plugs in at the
-    rebuild step.
+    each teacher's full-vocab logits from its per-rank transport
+    (``teacher_{i}_full_logits_ipc`` / ``teacher_{i}_full_logits_cross_cluster``)
+    and does the shared CP-resolution the loss needs. The contiguous student
+    logits / input_ids / token_mask are relaid once and shared across teachers.
+    Per teacher a localized alignment is built: a cross-tokenizer teacher
+    (``projection_matrix_paths[i]`` set) gets the localized, next-token-shifted
+    chunk alignment from its ``alignment_{i}_*`` keys; a same-tokenizer teacher
+    (``None`` path) gets a thin alignment carrying only the shared student fields
+    (identity 1:1 token alignment, no chunks). TP/CP groups come from the student
+    ``logits``' device mesh, falling back to the passed groups for non-DTensor
+    logits. The teacher rebuild + ``cuda.current_device`` are GPU-only; the
+    CP-relayout / localize / shift glue collapses to the local op at world=1.
+
+    Args:
+        projection_matrix_paths: Per-teacher projection paths. Its length is the
+            teacher count and drives the ``teacher_{i}_*`` / ``alignment_{i}_*``
+            keys read here; a ``None`` entry marks a same-tokenizer teacher.
 
     Returns:
-        ``(teacher_full_logits, student_logits_contig, align, tp_group, cp_group)``.
+        ``(student_logits_contig, teacher_full_logits_by_idx, aligns_by_idx,
+        tp_group, cp_group)``.
     """
     from dockyard_rl.distributed.model_utils import (
         cp_load_balanced_to_contiguous,
         cp_shift_next,
     )
+    from dockyard_rl.models.dtensor.parallelize import to_local_if_dtensor
 
     if isinstance(logits, DTensor):
         mesh = logits.device_mesh
@@ -1075,46 +1135,61 @@ def prepare_xtoken_cross_tokenizer_loss_input(
         cp_group = context_parallel_group
         tp_group = vocab_parallel_group
 
-    # Transport switch (loss stays transport-blind): the producer/driver writes
-    # exactly one of these keys per the configured ``xtoken.transport``. IPC ships
-    # full-vocab logits node-locally via CUDA IPC handles; cross-cluster ships
-    # them bf16 + seq-chunked over the data_plane. Both reassemble to the same
-    # ``[B, T_t/CP_s, V_t]`` contract.
-    if "teacher_full_logits_ipc" in data:
-        teacher_full_logits = rebuild_teacher_full_logits_from_ipc(
-            data["teacher_full_logits_ipc"],
-            cp_group=cp_group,
-            device=torch.cuda.current_device(),
-        )
-    elif "teacher_full_logits_cross_cluster" in data:
-        teacher_full_logits = rebuild_teacher_full_logits_cross_cluster(
-            data["teacher_full_logits_cross_cluster"],
-            cp_group=cp_group,
-        )
-    else:
-        raise KeyError(
-            "cross-tokenizer loss input is missing the teacher logits: expected "
-            "'teacher_full_logits_ipc' (IPC transport) or "
-            "'teacher_full_logits_cross_cluster' (data_plane transport) in data."
-        )
+    # Student CP-relay computed once and shared by every teacher's KD term and the
+    # next-token-accuracy metric. Relaid from CP load-balanced to this rank's
+    # contiguous window; input_ids / token_mask stay unshifted (the accuracy
+    # metric and the same-vocab KD apply their own CP-aware next-token shift).
     student_logits = cp_load_balanced_to_contiguous(logits, cp_group=cp_group)
-    align = localize_alignment(
-        data, teacher_seq_len=teacher_full_logits.shape[1], cp_group=cp_group
-    )
-    align.student_chunk_id = cp_shift_next(
-        cp_load_balanced_to_contiguous(align.student_chunk_id, cp_group=cp_group),
-        cp_group,
-        fill=-1,
-    )
-    align.teacher_chunk_id = cp_shift_next(align.teacher_chunk_id, cp_group, fill=-1)
-    # Relay the student input_ids / token_mask from CP load-balanced to this
-    # rank's contiguous window so the next-token accuracy metric (which applies
-    # its own contiguous next-token shift) stays consistent with the contiguous
-    # student logits. Unshifted here: the metric does the shift itself.
-    align.student_input_ids = cp_load_balanced_to_contiguous(
+    student_input_ids = cp_load_balanced_to_contiguous(
         data["input_ids"], cp_group=cp_group
     )
-    align.student_token_mask = cp_load_balanced_to_contiguous(
+    student_token_mask = cp_load_balanced_to_contiguous(
         data["token_mask"], cp_group=cp_group
     )
-    return teacher_full_logits, student_logits, align, tp_group, cp_group
+    sample_mask = to_local_if_dtensor(data["sample_mask"])
+
+    teacher_full_logits_by_idx: dict[int, torch.Tensor] = {}
+    aligns_by_idx: dict[int, LocalizedAlignment] = {}
+    for i, proj_path in enumerate(projection_matrix_paths):
+        teacher_full_logits = _rebuild_teacher_i_full_logits(data, i, cp_group=cp_group)
+        teacher_full_logits_by_idx[i] = teacher_full_logits
+        if proj_path is None:
+            # Same-tokenizer teacher: identity token alignment, no chunk
+            # localization. Carry only the shared student fields.
+            aligns_by_idx[i] = LocalizedAlignment(
+                sample_mask=sample_mask,
+                student_input_ids=student_input_ids,
+                student_token_mask=student_token_mask,
+            )
+            continue
+        align = localize_alignment(
+            data,
+            teacher_seq_len=teacher_full_logits.shape[1],
+            alignment_prefix=f"alignment_{i}_",
+            cp_group=cp_group,
+        )
+        # localize_alignment populates the chunk fields for a cross-tokenizer
+        # teacher; assert before the CP shift so the Optional narrows.
+        assert (
+            align.student_chunk_id is not None and align.teacher_chunk_id is not None
+        )
+        align.student_chunk_id = cp_shift_next(
+            cp_load_balanced_to_contiguous(align.student_chunk_id, cp_group=cp_group),
+            cp_group,
+            fill=-1,
+        )
+        align.teacher_chunk_id = cp_shift_next(
+            align.teacher_chunk_id, cp_group, fill=-1
+        )
+        # Share the CP-relaid student fields (unshifted; the accuracy metric does
+        # its own contiguous next-token shift).
+        align.student_input_ids = student_input_ids
+        align.student_token_mask = student_token_mask
+        aligns_by_idx[i] = align
+    return (
+        student_logits,
+        teacher_full_logits_by_idx,
+        aligns_by_idx,
+        tp_group,
+        cp_group,
+    )

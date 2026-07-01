@@ -186,19 +186,22 @@ def test_unknown_input_type_raises_value_error():
 # -- DISTILLATION_CROSS_TOKENIZER (routes to the keystone) --------------------
 
 def test_cross_tokenizer_branch_routes_to_keystone(monkeypatch):
-    # The branch lazy-imports prepare_xtoken_cross_tokenizer_loss_input and packs
-    # its 5-tuple into the loss_input dict. Monkeypatch the keystone (the
-    # function-local import resolves the name at call time) and assert routing +
-    # the forwarded args + the packed result.
+    # The branch lazy-imports prepare_xtoken_cross_tokenizer_loss_input (forwarding
+    # the loss_fn's projection_matrix_paths) and packs its 5-tuple into the
+    # loss_input dict. Monkeypatch the keystone (the function-local import resolves
+    # the name at call time) and assert routing + the forwarded args + the packed
+    # result.
     import dockyard_rl.algorithms.x_token.loss_utils as xlu
 
     captured = {}
-    out = (object(), object(), object(), object(), object())  # tfl, sc, align, tp, cp
+    # (student_contig, teacher_full_logits_by_idx, aligns_by_idx, tp, cp)
+    out = (object(), object(), object(), object(), object())
 
-    def fake_keystone(logits, data, *, vocab_parallel_group=None,
-                      context_parallel_group=None):
+    def fake_keystone(logits, data, *, projection_matrix_paths,
+                      vocab_parallel_group=None, context_parallel_group=None):
         captured["logits"] = logits
         captured["data"] = data
+        captured["projection_matrix_paths"] = projection_matrix_paths
         return out
 
     monkeypatch.setattr(
@@ -207,12 +210,17 @@ def test_cross_tokenizer_branch_routes_to_keystone(monkeypatch):
     logits = torch.randn(1, 3, 4)
     data = _data(input_ids=torch.zeros(1, 3, dtype=torch.long))
     loss_input, _ = prepare_loss_input(
-        logits, data, _loss_fn(LossInputType.DISTILLATION_CROSS_TOKENIZER),
+        logits, data,
+        _loss_fn(
+            LossInputType.DISTILLATION_CROSS_TOKENIZER,
+            projection_matrix_paths=[None],
+        ),
     )
     assert captured["logits"] is logits and captured["data"] is data
+    assert captured["projection_matrix_paths"] == [None]
     assert loss_input["logits"] is logits
-    assert loss_input["teacher_full_logits"] is out[0]
-    assert loss_input["student_logits_contig"] is out[1]
-    assert loss_input["align"] is out[2]
+    assert loss_input["student_logits_contig"] is out[0]
+    assert loss_input["teacher_full_logits_by_idx"] is out[1]
+    assert loss_input["aligns_by_idx"] is out[2]
     assert loss_input["tp_group"] is out[3]
     assert loss_input["cp_group"] is out[4]

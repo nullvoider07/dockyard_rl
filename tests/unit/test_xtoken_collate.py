@@ -1,10 +1,11 @@
-"""CPU tests for the CrossTokenizerCollator.
+"""CPU tests for the multi-teacher CrossTokenizerCollator.
 
 Exercised with a char-level fake tokenizer (the collator + TokenAligner only use
 a small tokenizer surface: __call__ -> input_ids/attention_mask,
-convert_ids_to_tokens, padding_side, pad_token_id). Validates the key mapping,
-the seq-divisibility padding, the sample_mask from loss_multiplier, and that the
-flat alignment_* payload is carried through.
+convert_ids_to_tokens, padding_side, pad_token_id). Validates the per-teacher key
+mapping (teacher_{i}_* / alignment_{i}_*), the seq-divisibility padding, the
+sample_mask from loss_multiplier, that a same-tokenizer teacher (aligner None)
+emits nothing extra, and that two teachers each get their own indexed keys.
 """
 
 import torch
@@ -50,14 +51,15 @@ def _datum(text, loss_multiplier, idx):
 
 
 def _collator(ctx_s=8, ctx_t=8, div_s=1, div_t=1):
+    """Single cross-tokenizer teacher (a length-1 teachers list)."""
     vocab = list("abcde")
     tok = _FakeTokenizer(vocab)
     tok2 = _FakeTokenizer(vocab)
     aligner = TokenAligner(tok, tok2, projection_matrix_path="")
     return CrossTokenizerCollator(
-        student_tokenizer=tok, teacher_tokenizer=tok2, aligner=aligner,
-        ctx_length_student=ctx_s, ctx_length_teacher=ctx_t,
-        make_seq_div_by_student=div_s, make_seq_div_by_teacher=div_t,
+        student_tokenizer=tok, teacher_tokenizers=[tok2], aligners=[aligner],
+        ctx_length_student=ctx_s, ctx_length_teachers=[ctx_t],
+        make_seq_div_by_student=div_s, make_seq_div_by_teachers=[div_t],
     )
 
 
@@ -67,12 +69,12 @@ def test_collate_produces_expected_keys_and_shapes():
     out = col(batch)
     expected = {
         "input_ids", "input_lengths", "token_mask", "sample_mask",
-        "teacher_input_ids", "teacher_input_lengths", "teacher_token_mask",
-        "alignment_pair_valid", "alignment_pair_is_correct",
-        "alignment_student_exact_partition_mask",
-        "alignment_teacher_exact_partition_mask",
-        "alignment_student_chunk_id", "alignment_teacher_chunk_id",
-        "alignment_num_chunks", "idx",
+        "teacher_0_input_ids", "teacher_0_input_lengths", "teacher_0_token_mask",
+        "alignment_0_pair_valid", "alignment_0_pair_is_correct",
+        "alignment_0_student_exact_partition_mask",
+        "alignment_0_teacher_exact_partition_mask",
+        "alignment_0_student_chunk_id", "alignment_0_teacher_chunk_id",
+        "alignment_0_num_chunks", "idx",
     }
     assert expected <= set(out.keys())
     assert out["input_ids"].shape == (2, 8)
@@ -94,18 +96,18 @@ def test_collate_pads_student_seq_to_div_multiple():
     col = _collator(ctx_s=6, ctx_t=6, div_s=8, div_t=4)
     out = col([_datum("abc", 1.0, 0)])
     assert out["input_ids"].shape[1] == 8  # 6 rounded up to mult of 8
-    assert out["teacher_input_ids"].shape[1] == 8  # 6 rounded up to mult of 4
+    assert out["teacher_0_input_ids"].shape[1] == 8  # 6 rounded up to mult of 4
 
 
 def test_collate_alignment_matches_direct_align():
     col = _collator()
     out = col([_datum("abc", 1.0, 0)])
     # identical tokenizers + text => 1:1 chunks over the 3 real tokens, pad -1.
-    assert out["alignment_student_chunk_id"][0, :3].tolist() == [0, 1, 2]
-    assert (out["alignment_student_chunk_id"][0, 3:] == -1).all()
+    assert out["alignment_0_student_chunk_id"][0, :3].tolist() == [0, 1, 2]
+    assert (out["alignment_0_student_chunk_id"][0, 3:] == -1).all()
     # num_chunks counts ALL aligned pairs (3 real + 5 pad pairs); the pad chunks
     # are neutralized via chunk_id=-1 (valid_chunk_mask drops zero-size chunks).
-    assert out["alignment_num_chunks"].tolist() == [8]
+    assert out["alignment_0_num_chunks"].tolist() == [8]
 
 
 def test_collate_padding_positions_masked_to_no_chunk():
@@ -113,5 +115,34 @@ def test_collate_padding_positions_masked_to_no_chunk():
     out = col([_datum("ab", 1.0, 0)])  # 2 real tokens, 6 pad
     # pad positions (attention 0) forced to chunk_id -1 by align's _drop_padding.
     tok_mask = out["token_mask"][0]
-    chunk = out["alignment_student_chunk_id"][0]
+    chunk = out["alignment_0_student_chunk_id"][0]
     assert (chunk[tok_mask == 0] == -1).all()
+
+
+def test_collate_same_tokenizer_teacher_emits_nothing_extra():
+    # aligner None => same-tokenizer teacher: no teacher_0_* / alignment_0_* keys.
+    tok = _FakeTokenizer(list("abcde"))
+    col = CrossTokenizerCollator(
+        student_tokenizer=tok, teacher_tokenizers=[None], aligners=[None],
+        ctx_length_student=8, ctx_length_teachers=[8],
+    )
+    out = col([_datum("abc", 1.0, 0)])
+    assert {"input_ids", "token_mask", "sample_mask"} <= set(out.keys())
+    assert not any(k.startswith("teacher_0_") for k in out.keys())
+    assert not any(k.startswith("alignment_0_") for k in out.keys())
+
+
+def test_collate_two_teachers_indexed_keys():
+    vocab = list("abcde")
+    tok = _FakeTokenizer(vocab)
+    tok0, tok1 = _FakeTokenizer(vocab), _FakeTokenizer(vocab)
+    al0 = TokenAligner(tok, tok0, projection_matrix_path="")
+    al1 = TokenAligner(tok, tok1, projection_matrix_path="")
+    col = CrossTokenizerCollator(
+        student_tokenizer=tok, teacher_tokenizers=[tok0, tok1], aligners=[al0, al1],
+        ctx_length_student=8, ctx_length_teachers=[8, 8],
+    )
+    out = col([_datum("abc", 1.0, 0)])
+    for i in (0, 1):
+        assert f"teacher_{i}_input_ids" in out
+        assert f"alignment_{i}_student_chunk_id" in out

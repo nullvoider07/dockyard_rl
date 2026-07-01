@@ -122,6 +122,9 @@ The trainer backend is selected from the YAML config; both implement the same
   packing, dynamic batching, activation checkpointing, LoRA (Low-Rank Adaptation).
 - ✅ **FP8 inference serving** — block-wise FP8 vLLM generation quantized on refit
   (training stays bf16), including the per-expert MoE path.
+- ✅ **NVFP4 inference serving** — real-quant (W4A16) NVFP4 rollout via ModelOpt
+  (`modelopt/`), weights reconverted across refit cycles; default path stays
+  fakequant.
 - ✅ **Structured tool use** — native Hermes `<tool_call>` protocol with RL-safe
   grammar constraining and schema-validated invalid-action penalties.
 - ✅ **Weight-sync transports** — NCCL (NVIDIA Collective Communications Library)
@@ -322,8 +325,10 @@ python3 examples/run_rlaif.py        --config examples/configs/rlaif.yaml
 - **On-policy distillation** (`algorithms/distillation.py`) — the student
   generates against an environment; a frozen teacher supplies top-k logits
   (top-k KL). The advantage-distillation variant (`algorithms/opd.py`,
-  `adv_estimator='opd'`, multi-teacher) and cross-tokenizer distillation
-  (`algorithms/x_token/`) extend it; see
+  `adv_estimator='opd'`, multi-teacher) and **multi-teacher** cross-tokenizer
+  distillation (`algorithms/x_token/` — several teachers, each with its own
+  tokenizer/projection, combined by weighted sum / averaged-logits /
+  select-teacher) extend it; see
   [the distillation design doc](https://nullvoider07.github.io/dockyard_rl/design-docs/distillation.html).
 - **Online DPO** (`algorithms/online_dpo.py`) — on-policy: generate K candidates,
   judge them, train on best-vs-worst pairs.

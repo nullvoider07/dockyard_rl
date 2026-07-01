@@ -8,7 +8,7 @@ function consumes.
 
 from __future__ import annotations
 
-from typing import Any, Optional, TYPE_CHECKING
+from typing import Any, Optional, TYPE_CHECKING, cast
 import torch
 
 from dockyard_rl.algorithms.loss.interfaces import LossInputType
@@ -240,19 +240,24 @@ def prepare_loss_input(
             prepare_xtoken_cross_tokenizer_loss_input,
         )
 
-        teacher_full_logits, student_logits_contig, align, tp_group, cp_group = (
-            prepare_xtoken_cross_tokenizer_loss_input(
-                logits,
-                data,
-                vocab_parallel_group=vocab_parallel_group,
-                context_parallel_group=context_parallel_group,
-            )
+        (
+            student_logits_contig,
+            teacher_full_logits_by_idx,
+            aligns_by_idx,
+            tp_group,
+            cp_group,
+        ) = prepare_xtoken_cross_tokenizer_loss_input(
+            logits,
+            data,
+            projection_matrix_paths=cast(Any, loss_fn).projection_matrix_paths,
+            vocab_parallel_group=vocab_parallel_group,
+            context_parallel_group=context_parallel_group,
         )
         loss_input = {
             "logits": logits,
-            "teacher_full_logits": teacher_full_logits,
             "student_logits_contig": student_logits_contig,
-            "align": align,
+            "teacher_full_logits_by_idx": teacher_full_logits_by_idx,
+            "aligns_by_idx": aligns_by_idx,
             "tp_group": tp_group,
             "cp_group": cp_group,
         }

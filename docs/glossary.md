@@ -46,7 +46,9 @@ xtoken
   Cross-tokenizer distillation — distillation from a teacher whose tokenizer
   differs from the student's: a token aligner maps teacher to student tokens and
   the teacher's logits are projected onto the student vocabulary for a
-  chunk-averaged KL. See [Distillation](design-docs/distillation.md).
+  chunk-averaged KL. Generalizes to several teachers, each with its own
+  projection (a null projection marks a same-tokenizer teacher), combined per
+  `kd_loss_mode`. See [Distillation](design-docs/distillation.md).
 
 RLOO
   REINFORCE Leave-One-Out — the leave-one-out baseline (each sample's baseline
