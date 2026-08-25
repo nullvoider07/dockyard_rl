@@ -39,6 +39,34 @@ def _mute_output():
     ):
         yield
 
+def _select_extracted_answer(
+    extracted_answer: Any, math_verify_impl: str
+) -> str | None:
+    """Pick the answer to record for one sample, or None if none is usable.
+
+    Total by construction — it returns None rather than raising for every
+    malformed shape, including a grader that throws. The caller records one
+    score and one answer per sample in lockstep, and an exception escaping here
+    would break that pairing for the whole batch, not just this sample.
+    """
+    if math_verify_impl == "dapo_math_verify":
+        # This branch hands back a normalized string, not a (gold, pred) pair.
+        return extracted_answer if isinstance(extracted_answer, str) else None
+
+    if not isinstance(extracted_answer, tuple) or len(extracted_answer) != 2:
+        return None
+    extracted_gold, extracted_prediction = extracted_answer
+    try:
+        for pred in extracted_prediction:
+            if any(grader.verify(gold, pred) for gold in extracted_gold):
+                return pred
+    except Exception:
+        return None
+    # Nothing matched, so every prediction is wrong; record the first.
+    # extracted_prediction is a flat list[str] — indexing it twice would take
+    # the first *character*, and it is empty when nothing parsed at all.
+    return extracted_prediction[0] if extracted_prediction else None
+
 @ray.remote  # pragma: no cover
 class HFVerifyWorker:
     def __init__(self) -> None:
@@ -76,15 +104,29 @@ class HFVerifyWorker:
         extracted_answers: list[str | None] = []
 
         for response, ground_truth in zip(pred_responses, ground_truths):
+            # Score and answer are committed once, after the try, so no path
+            # through this body can append twice. Appending the score mid-try
+            # and letting a later line raise into the except used to add a
+            # second score for the same sample, leaving `results` longer than
+            # the batch and misaligning rewards across every sample after it.
+            score: float = 0.0
+            extracted: str | None = None
             try:
                 with _mute_output():
-                    math_verify_impl = kwargs.get("math_verify_impl", "hf_math_verify")
-                    if kwargs.get("math_verify_impl") == "dapo_math_verify":
+                    # Branch on the resolved local, not on kwargs.get() again:
+                    # re-reading kwargs without the default left the declared
+                    # default dead, so an absent key fell through to the else
+                    # and scored the whole batch 0.0. `or` rather than a get()
+                    # default because math_verify_impl is NotRequired[str|None]
+                    # -- an explicit null in config is a present key, and would
+                    # otherwise take the same silent all-zero path.
+                    math_verify_impl = kwargs.get("math_verify_impl") or "hf_math_verify"
+                    if math_verify_impl == "dapo_math_verify":
                         # This compute_score is from the DAPO Math Verifier from Verl
                         reward_dict = dapo_math_verify(response, ground_truth)
                         ret_score = reward_dict["score"]
                         extracted_answer = reward_dict["pred"]
-                    elif kwargs.get("math_verify_impl") == "hf_math_verify":
+                    elif math_verify_impl == "hf_math_verify":
                         ground_truth_parsable = "\\boxed{" + ground_truth + "}"
                         ret_score, extracted_answer = self.verify_func(
                             [ground_truth_parsable], [response]
@@ -94,31 +136,25 @@ class HFVerifyWorker:
                             f"Unknown math_verify_impl: {math_verify_impl}. Expected 'hf_math_verify' or 'dapo_math_verify'."
                         )
 
-                results.append(float(ret_score) if ret_score is not None else 0.0)
+                score = float(ret_score) if ret_score is not None else 0.0
 
                 if return_extracted_answer:
-                    # Make sure the extracted answer is not None and is a list of two elements
-                    assert extracted_answer is not None
-                    assert isinstance(extracted_answer, tuple), (
-                        f"extracted_answer must be a tuple, got {type(extracted_answer)}"
+                    # Extraction feeds cons@k reporting, not the reward, so a
+                    # failure here leaves the score standing rather than zeroing
+                    # a sample that verified correctly.
+                    extracted = _select_extracted_answer(
+                        extracted_answer, math_verify_impl
                     )
-                    assert len(extracted_answer) == 2
-                    extracted_gold, extracted_prediction = extracted_answer
-                    # Get the extracted answer with the same logic as in the HFVerifyWorker
-                    for pred in extracted_prediction:
-                        if any(grader.verify(gold, pred) for gold in extracted_gold):
-                            extracted_answers.append(pred)
-                            break
-                    else:
-                        # If no match is found, means all answers are incorrect, just use the first prediction
-                        extracted_answers.append(extracted_prediction[0][0])
 
             # It's possible to emit a TimeoutException and that wouldn't be caught since
             # it actually subclasses from BaseException and math-verify itself does not
             # to catch it.
             except (Exception, TimeoutException):
-                results.append(0.0)
-                extracted_answers.append(None)
+                score = 0.0
+                extracted = None
+
+            results.append(score)
+            extracted_answers.append(extracted)
 
         if return_extracted_answer:
             return results, extracted_answers
