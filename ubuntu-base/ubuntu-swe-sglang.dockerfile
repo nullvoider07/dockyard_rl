@@ -178,14 +178,39 @@ ENV RAY_USAGE_STATS_ENABLED=0 \
     RAY_memory_monitor_refresh_ms=0
 
 # CUDA 13.2 performance
-# Targets H100 (sm_90) + B200 (sm_100) + GB300/Blackwell-Ultra (sm_103).
+# Default spans A100 (sm_80), L40S/L4/A10 Ada (sm_89), H100/H200 (sm_90),
+# B200 (sm_100) and GB300/Blackwell-Ultra (sm_103) — matching
+# ubuntu-swe-v2.dockerfile so the two images target the same hardware range.
+#
+# What each arch can run here differs from the v2 image, because this one is
+# pinned to torch 2.11.0 by SGLang 0.5.12.post1:
+#   sm_80  A100        bf16 only
+#   sm_89  L40S/L4/A10 adds FP8 (e4m3)
+#   sm_90  H100/H200   FP8 + Hopper attention kernels
+#   sm_100 B200        adds MXFP8 / NVFP4
+#   sm_103 GB300       as sm_100
+# Nothing gates precision by capability yet (Track C1), so an unsupported
+# precision still fails inside SGLang rather than at config validation.
+#
 # NOTE: with the PyPI SGLang install below, native SASS coverage in the
 # prebuilt sgl-kernel / flashinfer wheels is fixed at their build time — this
 # list governs torch-side/Inductor JIT and any from-source extension, and
 # documents the intended hardware. Native GB300 kernels in sgl-kernel require
 # the from-git build path, not the PyPI wheels.
-ENV TORCH_CUDA_ARCH_LIST="9.0 10.0 10.3" \
-    FLASHINFER_CUDA_ARCH_LIST="9.0a 10.0a 10.3a"
+#
+# The two lists use different notation. FlashInfer suffixes arch-accelerated
+# targets ('a' for SM 9.x and 10.x, 'f' for SM 12.x) and takes SM < 9 plain,
+# per flashinfer.compilation_context._normalize_cuda_arch — so 8.0 and 8.9
+# carry no suffix while 9.0a/10.0a/10.3a keep theirs.
+#
+# Build args so a homogeneous fleet can narrow the range back, or widen it:
+# Turing (sm_75) is not in the default but torch 2.11.0+cu130 does ship sm_75,
+# so --build-arg TORCH_CUDA_ARCH_LIST="7.5" builds for a T4 without editing
+# this file. CUDA 13 has dropped Maxwell/Pascal/Volta, so sm_70 is unreachable.
+ARG TORCH_CUDA_ARCH_LIST="8.0 8.9 9.0 10.0 10.3"
+ARG FLASHINFER_CUDA_ARCH_LIST="8.0 8.9 9.0a 10.0a 10.3a"
+ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} \
+    FLASHINFER_CUDA_ARCH_LIST=${FLASHINFER_CUDA_ARCH_LIST}
 
 # CUDA 13 standard headers (required when building any CUDA extensions)
 ENV CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl
