@@ -77,8 +77,6 @@ _MATRIX = list(
 
 @pytest.mark.parametrize("token_level,use_is,clip_c,kl_pen,kl_type,tis,force_op", _MATRIX)
 def test_loss_and_grad_parity(token_level, use_is, clip_c, kl_pen, kl_type, tis, force_op):
-    if tis is not None and not use_is:
-        pytest.skip("truncated IS requires use_importance_sampling_correction=True")
     curr, prev, gen, ref, adv, token_mask, sample_mask = _fixtures()
 
     cfg = ClippedPGLossConfig(
@@ -97,6 +95,36 @@ def test_loss_and_grad_parity(token_level, use_is, clip_c, kl_pen, kl_type, tis,
     mask = token_mask * sample_mask[:, None]
     gvt = torch.tensor(float(mask.sum()))
     gvs = torch.tensor(float(sample_mask.sum()))
+
+    if tis is not None and not use_is:
+        # Truncated IS without the correction enabled is rejected by both
+        # backends. This used to pytest.skip, which reported 48 of the 192
+        # combinations as uncovered while the guard itself had no test at all —
+        # deleting either backend's check would have gone unnoticed. Assert the
+        # rejection instead, and assert both backends agree on it, which is the
+        # parity claim this file exists to make.
+        #
+        # Note the exception types differ: torch validates with `assert`
+        # (AssertionError), JAX with `raise ValueError`. Matched on message
+        # rather than type so this test pins the contract without asserting a
+        # divergence it does not endorse.
+        with pytest.raises(
+            (AssertionError, ValueError), match="truncated IS requires"
+        ):
+            ClippedPGLossFn(cfg)
+
+        curr_j = jnp.asarray(curr)
+        with pytest.raises(
+            (AssertionError, ValueError), match="truncated IS requires"
+        ):
+            jax_loss.clipped_pg_loss(
+                curr_j,
+                _jax_data(prev, gen, ref, adv, token_mask, sample_mask),
+                jnp.asarray(float(sample_mask.sum())),
+                jnp.asarray(float(mask.sum())),
+                cfg,
+            )
+        return
 
     # torch loss + grad
     curr_t = torch.from_numpy(curr).clone().requires_grad_(True)
