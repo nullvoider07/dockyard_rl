@@ -23,6 +23,38 @@ I publish this rather than imply full validation. If you have GPU/cluster resour
 run any of these pending checks, results (pass or fail) are very welcome — open an issue
 or PR referencing the `HV-` id.
 
+## Planned validation pass — Kaggle 2×T4
+
+**The intent is to close as much of this ledger as a T4 allows.** Once the upstream-sync
+work is complete (including whatever lands upstream in the meantime), a validation pass
+runs privately on Kaggle, which offers **~30 GPU-hours/week on 2× NVIDIA T4**. That is
+the first real hardware this project will have touched, and the goal is to carry
+dockyard_rl to completion against it rather than leaving the ledger open indefinitely.
+
+**What a T4 can and cannot close, established before committing to the plan:**
+
+| | |
+|---|---|
+| T4 compute capability | **sm_75** (Turing) |
+| Supported by the shipped torch? | **Yes** — `torch 2.13.0+cu130` ships `sm_75` in `get_arch_list()`, so CUDA 13 has not dropped Turing |
+| In dockyard's image arch list? | **No** — `TORCH_CUDA_ARCH_LIST="8.0 8.9 9.0 10.0 10.3"`. Since A2 made it an `ARG`, add 7.5 at build time with `--build-arg`; no source change |
+| bf16 | **Not native on Turing.** Every shipped config sets `precision: "bfloat16"`; a T4 run needs `float16`. This is the single largest gap between the T4 and the plan's sm_80 floor |
+| FP8 / MXFP8 / NVFP4 | Unreachable (need sm_89 / sm_100+). Every FP8 row in this ledger stays open |
+| Memory | 16 GB per card, 32 GB total — model size is the binding constraint, not FLOPs |
+| Hard blocks | **None found.** The tree's only capability gate (`vllm_worker.py:391`, `get_device_capability()[0] >= 8`) merely defaults `enable_prefix_caching` off below sm_80; it does not refuse to start |
+
+**So the T4 pass can plausibly close:** multi-GPU sharding and device-mesh composition (2
+ranks), weight refit into a running inference engine end to end — including **HV-48**, the
+colocated IPC/ZMQ path, which is the factory default and has never run — collective/NCCL
+numerics across two devices, checkpoint save/restore round-trips, and end-to-end training
+on a small model. **It cannot close:** anything FP8 or Blackwell-class, bf16 numerics
+specifically, multi-node behaviour, or `ray.sub` topology assignment.
+
+Track C1's capability-dispatch layer is what makes this pass tractable rather than a
+sequence of manual overrides, and the T4 is now its concrete driver: sm_75 sits *below*
+the plan's sm_80 floor, so the fp16 fallback has to be a real, tested path rather than an
+assumption.
+
 **How to read a row.** Each row records the area + source file, the unverified
 assumption, a severity, and the bring-up check that closes it. Severity:
 **High** = silent wrong training / crash if the assumption is wrong;
