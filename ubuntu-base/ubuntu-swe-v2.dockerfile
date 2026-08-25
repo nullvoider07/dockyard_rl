@@ -56,7 +56,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libx11-6 libxext6 libxrender1 libxrandr2 \
     libxtst6 libxcb1 libxcomposite1 libxdamage1 \
     vim \
-    # Media utilities (potential task requirements)
+    # Media utilities. Required, not optional: vLLM 0.27.1 depends on
+    # torchcodec>=0.14, which ships one loader per FFmpeg major
+    # (libtorchcodec_core{4..8}.so) and dlopens the system libav* at runtime.
+    # Removing ffmpeg breaks vLLM's own dependency, not just task tooling.
     ffmpeg \
     && locale-gen en_US.UTF-8 \
     && update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 \
@@ -76,7 +79,7 @@ RUN apt-get update && \
         apt-get update && \
         apt-get install -y --no-install-recommends nsight-systems-cli; \
     } && \
-    apt-get install -y --only-upgrade gnupg && \
+    apt-get install -y --only-upgrade gnupg rsync && \
     rm -rf /var/lib/apt/lists/*
 
 # ============================================================
@@ -176,11 +179,27 @@ ENV RAY_USAGE_STATS_ENABLED=0 \
     RAY_memory_monitor_refresh_ms=0
 
 # CUDA 13.2 performance
-# Targets H100 (sm_90) + B200 (sm_100) + GB300/Blackwell-Ultra (sm_103).
-# Requires the CUDA-13 torch build in §5c — cu12.4 predates Blackwell and
-# cannot emit native sm_100/sm_103 SASS, so this list only takes full effect
-# with the cu130 torch below.
-ENV TORCH_CUDA_ARCH_LIST="9.0 10.0 10.3"
+# Default spans A100 (sm_80), L40S/L4/A10 Ada (sm_89), H100/H200 (sm_90),
+# B200 (sm_100) and GB300/Blackwell-Ultra (sm_103). Requires the CUDA-13 torch
+# build in §5c — cu12.4 predates Blackwell and cannot emit native
+# sm_100/sm_103 SASS, so this list only takes full effect with the cu130 torch
+# below.
+#
+# What each arch can actually run, since the list does not imply parity:
+#   sm_80  A100        bf16 only; no FP8, no MXFP8/NVFP4
+#   sm_89  L40S/L4/A10 adds FP8 (e4m3); no MXFP8/NVFP4
+#   sm_90  H100/H200   FP8 + Hopper attention kernels
+#   sm_100 B200        adds MXFP8 / NVFP4
+#   sm_103 GB300       as sm_100
+# Nothing gates precision by capability yet, so an fp8 config on sm_80 still
+# fails inside vLLM rather than at config validation. That gate is Track C1.
+#
+# Widening from 3 to 5 architectures costs build time and image size. Narrow it
+# per deployment with --build-arg TORCH_CUDA_ARCH_LIST="9.0" when the fleet is
+# homogeneous. CUDA 13 has dropped Maxwell/Pascal/Volta, so sm_70 is
+# unreachable regardless; sm_75 (T4) is untested and deliberately not listed.
+ARG TORCH_CUDA_ARCH_LIST="8.0 8.9 9.0 10.0 10.3"
+ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
 
 # CUDA 13 standard headers (required when building any CUDA extensions)
 ENV CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl
@@ -338,20 +357,22 @@ EOF
 # 5c. PyTorch + vLLM (rollout inference backend)
 # ============================================================
 # Installed into the ML default python 3.13 (uv --system, UV_PYTHON; see §4).
-# vLLM 0.22.0 (latest stable) pins torch==2.11.0 / torchvision==0.26.0 /
-# torchaudio==2.11.0. Install them first from the cu130 index so the CUDA-13
+# vLLM 0.27.1 pins torch==2.13.0 / torchvision==0.28.0 / torchaudio==2.11.0
+# (read from the wheel metadata, not inferred — torchaudio does NOT track
+# torch's minor, and 2.13.0 does not exist on the cu130 index; 2.11.0 is the
+# newest there). Install them first from the cu130 index so the CUDA-13
 # build is used — this matches the cuda13.2 base AND gives native Blackwell
 # (B200 sm_100 / GB300 sm_103) kernels, which the previous cu124 torch could
 # not. NOTE: vLLM's own prebuilt-wheel SASS coverage is fixed at its build
 # time; TORCH_CUDA_ARCH_LIST governs torch-side/Inductor JIT.
 RUN --mount=type=cache,target=/root/.cache/uv uv pip install --reinstall --system \
-    torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 \
+    torch==2.13.0 torchvision==0.28.0 torchaudio==2.11.0 \
     --index-url https://download.pytorch.org/whl/cu130
 
-# No --reinstall: torch==2.11.0 is already satisfied by the cu130 build above
-# (2.11.0+cu130 matches the ==2.11.0 pin); --reinstall would cascade to a
+# No --reinstall: torch==2.13.0 is already satisfied by the cu130 build above
+# (2.13.0+cu130 matches the ==2.13.0 pin); --reinstall would cascade to a
 # default-index torch and clobber it. vLLM resolves against the installed torch.
-RUN --mount=type=cache,target=/root/.cache/uv uv pip install "vllm==0.22.0"
+RUN --mount=type=cache,target=/root/.cache/uv uv pip install "vllm==0.27.1"
 
 # CPU-only import check — confirms the build succeeded and vLLM's
 # CUDA extension modules are present. Actual GPU visibility is

@@ -34,11 +34,13 @@ dependencies = [
     "einops",
     # PyTorch & Inference
     # Pinned to match the ubuntu-swe image build (ubuntu-swe-v2.dockerfile §5c):
-    # the cuda13.2 base installs the cu130 torch build and vLLM 0.22.0 on top.
-    "torch==2.11.0",
-    "torchvision==0.26.0",
+    # the cuda13.2 base installs the cu130 torch build and vLLM 0.27.1 on top.
+    # These are vLLM 0.27.1's own pins, read from its wheel metadata. torchaudio
+    # does not track torch's minor version — 2.13.0 does not exist.
+    "torch==2.13.0",
+    "torchvision==0.28.0",
     "torchaudio==2.11.0",
-    "vllm==0.22.0"
+    "vllm==0.27.1"
 ]
 
 # Fetch PyTorch from the cu130 wheel index — matches the cuda13.2 image base and
