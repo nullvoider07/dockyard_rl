@@ -1,13 +1,13 @@
 """Factory for WeightSynchronizer instances.
 
 Selects the transport from the deployment topology (colocated vs.
-non-colocated) and the generation backend: SGLang uses HTTP when colocated,
-and any non-colocated deployment uses NCCL collectives.
+non-colocated) and the generation backend: vLLM uses IPC/ZMQ when colocated,
+SGLang uses HTTP when colocated, and any non-colocated deployment uses NCCL
+collectives.
 
-Colocated vLLM would use IPC/ZMQ, but that transport is not wired end to end
-and this factory refuses the combination rather than handing back a
-synchronizer that raises at first use. See the NotImplementedError below for
-what is missing.
+The IPC/ZMQ path is wired but has never run on hardware (HV ledger); CUDA-IPC
+handle exchange and the REQ/REP handshake are not reachable by the CPU test
+suite.
 """
 
 from typing import Any, Optional
@@ -46,9 +46,8 @@ def create_weight_synchronizer(
 
     Raises:
         ValueError: For an unknown backend or missing non-colocated arguments.
-        NotImplementedError: For an unsupported backend/topology combination —
-            non-colocated SGLang, and colocated vLLM (the IPC/ZMQ transport is
-            unimplemented; the message names the three missing pieces).
+        NotImplementedError: For an unsupported backend/topology combination
+            (non-colocated SGLang).
     """
     supported_backends = {VLLM_BACKEND, SGLANG_BACKEND}
     if generation_backend not in supported_backends:
@@ -89,28 +88,12 @@ def create_weight_synchronizer(
     if refit_buffer_size_gb is not None and refit_buffer_size_gb <= 0:
         raise ValueError("refit_buffer_size_gb must be > 0")
 
-    # Colocated vLLM selects the IPC/ZMQ transport, which is not wired end to
-    # end. Refuse here rather than return a synchronizer that raises on first use:
-    # the failure would otherwise surface at the first sync_weights() call, one
-    # full rollout after cluster bring-up, model load and engine init, as an
-    # AttributeError naming none of the actual causes.
-    raise NotImplementedError(
-        "Colocated vLLM weight sync (IPC/ZMQ) is not implemented. The receiver "
-        "is complete: models/generation/vllm/vllm_backend.py unpacks the "
-        "payload that models/policy/utils.py:stream_weights_via_ipc_zmq_impl "
-        "already emits, over the same IPCProtocol. Two sender-side pieces are "
-        "missing:\n"
-        "  1. The policy worker has no ZMQ plumbing. The receiver connects a "
-        "REP socket to ipc:///tmp/{device_uuid}.sock (VllmBackend."
-        "get_zmq_address), so the sender must bind REQ to the socket for the "
-        "device it is colocated with -- which needs colocation discovery. "
-        "models/policy/utils.py:_setup_ipc_gather_group does that shape of "
-        "UUID matching for the SGLang HTTP path and is the reference, not a "
-        "drop-in.\n"
-        "  2. DTensorPolicyWorkerImpl.stream_weights_via_ipc_zmq raises "
-        "NotImplementedError instead of calling the impl above, and Policy "
-        "exposes no dispatch for it; Policy.broadcast_weights_for_collective "
-        "is the pattern to copy.\n"
-        "Set policy.generation.colocated.enabled=false to use the NCCL "
-        "collective transport, which is implemented and tested."
+    from dockyard_rl.weight_sync.ipc_weight_synchronizer import (
+        IPCWeightSynchronizer,
+    )
+
+    return IPCWeightSynchronizer(
+        policy=policy,
+        generation=generation,
+        refit_buffer_size_gb=refit_buffer_size_gb,
     )

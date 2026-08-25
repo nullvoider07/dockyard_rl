@@ -1818,11 +1818,78 @@ class DTensorPolicyWorkerImpl(
         buffer_size_bytes: int = 0,
         kv_scales: Optional[dict[str, float]] = None,
     ) -> None:
-        """Stream model weights to peer process via ZMQ IPC socket."""
-        raise NotImplementedError(
-            "stream_weights_via_ipc_zmq requires ipc_utils which is not yet implemented. "
-            "Use broadcast_weights_for_collective for NCCL-based weight sync instead."
+        """Stream model weights to the colocated vLLM worker over ZMQ IPC.
+
+        The trainer-side counterpart to VllmInternalWorkerExtension's receive
+        loop, and the colocated sibling of broadcast_weights_for_collective.
+
+        Addressing needs no discovery: colocated means this worker and the vLLM
+        worker hold the same physical GPU, so both derive the same socket path
+        from their own device UUID. The receiver *connects* a REP socket
+        (VllmInternalWorkerExtension.get_zmq_address), so this side binds REQ.
+        """
+        from dockyard_rl.models.policy.utils import (
+            stream_weights_via_ipc_zmq_impl,
         )
+
+        if kv_scales is not None:
+            # Mirrors broadcast_weights_for_collective: FP8 KV cache is not
+            # supported on the DTensor path at all, so accepting the argument
+            # here and ignoring it would be the silent-drop this path was
+            # previously reported as having.
+            raise NotImplementedError(
+                "FP8 kvcache is not currently supported for DTensor path."
+            )
+
+        if self.cpu_offload:
+            self.model = self.move_to_cuda(self.model)
+
+        def _params() -> Generator[tuple[str, torch.Tensor], None, None]:
+            for name, tensor in self._iter_refit_state_dict():
+                if isinstance(tensor, DTensor):
+                    tensor = tensor.full_tensor()
+                yield name, tensor.to(self.dtype, non_blocking=True)
+
+        try:
+            stream_weights_via_ipc_zmq_impl(
+                params_generator=_params(),
+                buffer_size_bytes=buffer_size_bytes,
+                zmq_socket=self._get_ipc_zmq_socket(),
+                rank=self.rank,
+                worker_name=type(self).__name__,
+            )
+        finally:
+            if self.cpu_offload:
+                self.model = self.move_to_cpu(self.model)
+
+    def get_ipc_zmq_address(self) -> str:
+        """Socket path for the colocated vLLM worker on this same GPU.
+
+        Must stay identical to VllmBackend.get_zmq_address — both sides compute
+        it independently from the device UUID they each observe.
+        """
+        return f"ipc:///tmp/{self.report_device_id()}.sock"
+
+    def _get_ipc_zmq_socket(self):
+        """Lazily bind the REQ socket used for IPC weight streaming.
+
+        Bound once per worker and reused across refits: rebinding an ipc://
+        endpoint each step would race the peer's connect. Timeouts mirror the
+        receiver's so neither side outlives the other by default.
+        """
+        import zmq
+
+        if getattr(self, "_ipc_zmq_socket", None) is not None:
+            return self._ipc_zmq_socket
+
+        self._ipc_zmq_context = zmq.Context()
+        socket = self._ipc_zmq_context.socket(zmq.REQ)
+        socket.setsockopt(zmq.SNDTIMEO, 120_000)
+        socket.setsockopt(zmq.RCVTIMEO, 120_000)
+        socket.setsockopt(zmq.LINGER, 0)
+        socket.bind(self.get_ipc_zmq_address())
+        self._ipc_zmq_socket = socket
+        return socket
 
     @torch.no_grad()
     def broadcast_weights_for_collective(  # type: ignore[override]

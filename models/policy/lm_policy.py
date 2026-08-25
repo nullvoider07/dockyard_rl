@@ -800,6 +800,24 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         )
         return futures
 
+    def stream_weights_via_ipc_zmq(
+        self,
+        buffer_size_bytes: int = 0,
+        kv_scales: Optional[dict[str, float]] = None,
+    ) -> list[ray.ObjectRef]:
+        """Stream weights to the colocated vLLM workers over ZMQ IPC.
+
+        The colocated counterpart to broadcast_weights_for_collective. Each
+        worker addresses the vLLM worker sharing its GPU, so no fan-out
+        coordination happens here.
+        """
+        futures = self.worker_group.run_all_workers_single_data(
+            "stream_weights_via_ipc_zmq",
+            buffer_size_bytes=buffer_size_bytes,
+            kv_scales=kv_scales,
+        )
+        return futures
+
     def stream_weights_via_http(
         self, sglang_url_to_gpu_uuids: dict[str, list[str]]
     ) -> list[ray.ObjectRef]:

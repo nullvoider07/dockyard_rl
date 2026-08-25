@@ -38,44 +38,72 @@ def _make(**kw):
     return create_weight_synchronizer(**args)
 
 
-class TestColocatedVllmIsRefused:
-    def test_raises_at_construction_not_at_first_sync(self):
-        with pytest.raises(NotImplementedError) as exc:
-            _make(generation_backend=VLLM_BACKEND, colocated=True)
-        assert "not implemented" in str(exc.value).lower()
+class TestColocatedVllmSelectsIPC:
+    """The guard that used to live here is gone: the transport is now wired.
 
-    def test_message_names_the_remaining_sender_side_gaps(self):
-        """A caller must be able to act on this without reading the source."""
-        with pytest.raises(NotImplementedError) as exc:
-            _make()
-        msg = str(exc.value)
-        for piece in (
-            "ZMQ",
-            "get_zmq_address",
-            "stream_weights_via_ipc_zmq",
-            "Policy",
-        ):
-            assert piece in msg, f"message does not name {piece!r}"
+    It is NOT hardware-validated -- CUDA-IPC handle exchange and the REQ/REP
+    handshake are unreachable from a CPU suite -- so these assert selection and
+    the sender/receiver contract, not that a refit succeeds.
+    """
 
-    def test_message_does_not_claim_the_receiver_is_missing(self):
-        """The receiver was fixed; the guard must not keep blaming it.
-
-        models/policy/ipc_utils never existed and vllm_backend now imports the
-        three symbols from models/policy/utils, where they actually live.
-        """
-        with pytest.raises(NotImplementedError) as exc:
-            _make()
-        assert "ipc_utils" not in str(exc.value)
-
-    def test_message_names_the_working_alternative(self):
-        with pytest.raises(NotImplementedError) as exc:
-            _make()
-        assert "colocated.enabled=false" in str(exc.value)
+    def test_selects_the_ipc_synchronizer(self):
+        sync = _make(generation_backend=VLLM_BACKEND, colocated=True)
+        assert type(sync).__name__ == "IPCWeightSynchronizer"
 
     def test_refit_buffer_validation_still_runs_first(self):
         """A bad buffer size is a config error and keeps its own message."""
         with pytest.raises(ValueError, match="refit_buffer_size_gb must be > 0"):
             _make(refit_buffer_size_gb=0)
+
+
+class TestIPCSenderContract:
+    """Both ends must derive the same socket path and reject the same inputs."""
+
+    def test_sender_and_receiver_addresses_are_derived_identically(self):
+        """Colocated means one GPU, so each side computes it from its own UUID.
+
+        Pinned as a string comparison because a divergence here would surface
+        only as a refit that hangs until the 120s ZMQ timeout.
+        """
+        from dockyard_rl.models.generation.vllm.vllm_backend import (
+            VllmInternalWorkerExtension,
+        )
+        from dockyard_rl.models.policy.workers.dtensor_policy_worker import (
+            DTensorPolicyWorkerImpl,
+        )
+
+        uuid = "GPU-deadbeef-0000-0000-0000-000000000000"
+
+        sender = object.__new__(DTensorPolicyWorkerImpl)
+        sender.report_device_id = lambda: uuid  # type: ignore[method-assign]
+        receiver = object.__new__(VllmInternalWorkerExtension)
+        receiver.report_device_id = lambda: uuid  # type: ignore[method-assign]
+
+        assert sender.get_ipc_zmq_address() == receiver.get_zmq_address()
+        assert sender.get_ipc_zmq_address() == f"ipc:///tmp/{uuid}.sock"
+
+    def test_kv_scales_is_rejected_not_silently_dropped(self):
+        """#3226 as originally reported: accepted and never referenced.
+
+        The DTensor path does not support FP8 KV cache at all, which
+        broadcast_weights_for_collective already says out loud. The IPC sender
+        now says the same rather than accepting the argument and ignoring it.
+        """
+        from dockyard_rl.models.policy.workers.dtensor_policy_worker import (
+            DTensorPolicyWorkerImpl,
+        )
+
+        worker = object.__new__(DTensorPolicyWorkerImpl)
+        with pytest.raises(NotImplementedError, match="FP8 kvcache"):
+            DTensorPolicyWorkerImpl.stream_weights_via_ipc_zmq(
+                worker, buffer_size_bytes=0, kv_scales={"k": 1.0}
+            )
+
+    def test_policy_exposes_the_dispatch_the_synchronizer_calls(self):
+        """IPCWeightSynchronizer:69 calls this; its absence was the real defect."""
+        from dockyard_rl.models.policy.lm_policy import Policy
+
+        assert hasattr(Policy, "stream_weights_via_ipc_zmq")
 
 
 class TestOtherTransportsUnaffected:
