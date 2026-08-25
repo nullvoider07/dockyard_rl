@@ -278,7 +278,14 @@ class VllmInternalWorkerExtension:
         Returns:
             True on success, False on any exception.
         """
-        from dockyard_rl.models.policy.ipc_utils import (  # type: ignore[import]
+        # models.policy.utils, not models.policy.ipc_utils: the latter has never
+        # existed. All three symbols live in utils (IPCProtocol, and the two
+        # helpers the sender at utils.stream_weights_via_ipc_zmq_impl uses to
+        # build the payload this loop unpacks), so the deferred import silently
+        # named a module that could never resolve. Deferred imports are the
+        # convention for modules not yet written, which is exactly why this went
+        # unnoticed: it only fails at call time, on the refit path.
+        from dockyard_rl.models.policy.utils import (
             IPCProtocol,
             calculate_aligned_size,
             rebuild_cuda_tensor_from_ipc,
