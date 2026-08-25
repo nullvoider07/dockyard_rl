@@ -24,7 +24,9 @@ from dockyard_rl.environments.math_environment import (
     _select_extracted_answer,
 )
 
-_WorkerClass = HFVerifyWorker.__ray_metadata__.modified_class
+# ray decorates the class into an ActorClass; the original is reachable via
+# __ray_metadata__, which ray does not declare on its public type.
+_WorkerClass = HFVerifyWorker.__ray_metadata__.modified_class  # type: ignore[attr-defined]
 
 
 def _worker(verify_func):
