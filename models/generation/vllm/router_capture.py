@@ -1,11 +1,20 @@
 """Routed-expert capture alignment for MoE router-replay.
 
-During generation an MoE router selects top-K experts per token. vLLM 0.21
-surfaces this selection on ``CompletionOutput.routed_experts`` (an
-``np.ndarray`` of shape ``[tokens, num_moe_layers, topk]``, int16) when the
-engine is built with ``enable_return_routed_experts=True``, plus an optional
-``RequestOutput.prompt_routed_experts`` for the prompt positions. This module
-aligns that per-token routing onto the trainer's right-padded sequence layout
+During generation an MoE router selects top-K experts per token. vLLM surfaces
+this selection on ``CompletionOutput.routed_experts`` (an ``np.ndarray`` of
+shape ``[tokens, num_moe_layers, topk]``, int16) when the engine is built with
+``enable_return_routed_experts=True``.
+
+``RequestOutput.prompt_routed_experts`` — the prompt-position counterpart — does
+**not** exist in vLLM 0.27.x; a tree-wide search of 0.27.1 finds no such
+attribute. Prompt-side routing is therefore unavailable and every sequence is
+aligned from generated-token routes alone. That is the correct scope for
+router replay regardless (the prompt is not sampled, so its routes never
+contributed to a sampling decision), but the reduction is real and is reported
+once per process by :func:`routed_experts_from_vllm_output` rather than being
+hidden behind a ``getattr`` default.
+
+This module aligns that per-token routing onto the trainer's right-padded layout
 ``[padded_length, L, topk]`` so it can ride the rollout data dict and be
 replayed in the trainer's MoE forward, removing the router-nondeterminism
 component of the train/generation logprob mismatch.
@@ -24,14 +33,21 @@ and is unit-tested on CPU.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Optional, Union
 
 import numpy as np
 import torch
 
+logger = logging.getLogger(__name__)
+
 # Interior route positions vLLM failed to return are filled with this so the
 # trainer-side replay can detect incompleteness instead of replaying a default.
 MISSING_ROUTE_SENTINEL = -1
+
+# One report per process that the installed vLLM exposes no prompt-side routing.
+# This adapter runs once per completion, so an unguarded log would flood.
+_PROMPT_ROUTING_ABSENCE_REPORTED = False
 
 ArrayLike = Union[torch.Tensor, np.ndarray, list]
 
@@ -227,13 +243,31 @@ def routed_experts_from_vllm_output(
 ]:
     """Adapter: align routing straight off vLLM's request/completion objects.
 
-    Reads ``completion_output.routed_experts`` and
-    ``request_output.prompt_routed_experts`` (both optional) and delegates to
+    Reads ``completion_output.routed_experts`` and delegates to
     :func:`align_routed_expert_indices`. Keeping the core on raw arrays leaves
     the alignment math unit-testable without constructing vLLM objects.
+
+    ``request_output.prompt_routed_experts`` is read when the installed vLLM
+    provides it and reported once when it does not. vLLM 0.27.x has no such
+    attribute, so on the version dockyard ships against this is always the
+    absent case and ``prompt_routed`` is always ``None``; the report exists so
+    that shows up in a log rather than being inferred from a silent default.
     """
     routed = getattr(completion_output, "routed_experts", None)
-    prompt_routed = getattr(request_output, "prompt_routed_experts", None)
+
+    global _PROMPT_ROUTING_ABSENCE_REPORTED
+    if hasattr(request_output, "prompt_routed_experts"):
+        prompt_routed = request_output.prompt_routed_experts
+    else:
+        prompt_routed = None
+        if not _PROMPT_ROUTING_ABSENCE_REPORTED:
+            _PROMPT_ROUTING_ABSENCE_REPORTED = True
+            logger.info(
+                "This vLLM build exposes no RequestOutput.prompt_routed_experts "
+                "(absent in 0.27.x); router replay is aligned from "
+                "generated-token routes only. Prompt positions carry the "
+                "identity default route.",
+            )
     return align_routed_expert_indices(
         routed,
         prompt_routed,

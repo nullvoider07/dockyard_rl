@@ -11,3 +11,6 @@ __pycache__/
 .claude/
 handoff/
 session-history/
+
+# Local-only audit reports (not published)
+vllm-027-monkeypatch-audit.md

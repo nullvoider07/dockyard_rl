@@ -152,3 +152,45 @@ class TestFp8MoeNameRouting:
         )
         routed = f"{self.BASE}.w13_weight_scale_inv"
         assert not routed.endswith(ignore_suffixes)
+
+
+class TestFusedMoeDiscriminator:
+    """The fused-MoE test that replaced `isinstance(module, FusedMoE)`.
+
+    vLLM has never exposed a `FusedMoE` class in the supported range: it is a
+    factory function from 0.24 (isinstance raises TypeError) and is renamed
+    `FusedMoEFactory` in 0.27, returning a `MoERunner` that holds the expert
+    weights on a `RoutedExperts` submodule. The discriminator therefore keys on
+    the two parameters the caller goes on to read.
+    """
+
+    def test_module_with_expert_weights_matches(self):
+        fp8 = _load_fp8_module()
+        module = torch.nn.Module()
+        module.w13_weight = torch.zeros(2, 2)
+        module.w2_weight = torch.zeros(2, 2)
+
+        assert fp8.is_fused_moe_module(module)
+
+    def test_plain_and_partial_modules_do_not_match(self):
+        fp8 = _load_fp8_module()
+
+        assert not fp8.is_fused_moe_module(torch.nn.Linear(2, 2))
+        assert not fp8.is_fused_moe_module(None)
+
+        # A wrapper exposing only one of the two is not the weight owner; the
+        # traversal must keep descending to the module that holds both.
+        partial = torch.nn.Module()
+        partial.w13_weight = torch.zeros(2, 2)
+        assert not fp8.is_fused_moe_module(partial)
+
+    def test_no_fused_moe_class_exists_upstream(self):
+        """Pins the premise: if upstream reintroduces the class, revisit this."""
+        layer = pytest.importorskip(
+            "vllm.model_executor.layers.fused_moe.layer"
+        )
+        symbol = getattr(layer, "FusedMoE", None)
+        assert not isinstance(symbol, type), (
+            "vLLM now exports a FusedMoE class; the duck-type discriminator "
+            "can be reconsidered."
+        )

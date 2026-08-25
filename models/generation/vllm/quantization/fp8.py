@@ -6,7 +6,6 @@ import ray
 import torch
 from accelerate import init_empty_weights
 from transformers import AutoConfig, AutoModel
-from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.triton_utils import tl, triton
 from vllm.v1.engine.core import EngineCoreProc
@@ -18,6 +17,18 @@ FP8_BLOCK_QUANT_KWARGS = {
     "quant_method": "fp8",
     "weight_block_size": [128, 128],
 }
+
+def is_fused_moe_module(module: Any) -> bool:
+    """Whether a module holds fused-MoE expert weights.
+
+    vLLM exposes no stable class to isinstance against. `FusedMoE` has been a
+    factory function since 0.24 (so isinstance raises TypeError there), and 0.27
+    renames it `FusedMoEFactory`, returning a `MoERunner` whose expert weights
+    are registered on a `RoutedExperts` submodule. Identifying the module by the
+    two parameters this code goes on to read is exact and survives that churn.
+    """
+    return hasattr(module, "w13_weight") and hasattr(module, "w2_weight")
+
 
 @dataclass(frozen=True)
 class FP8Config:
@@ -298,7 +309,7 @@ def _get_module_from_param_name(model, name: str):
     try:
         # Traverse the model hierarchy
         for part in module_path:
-            if isinstance(current_module, FusedMoE):
+            if is_fused_moe_module(current_module):
                 return current_module
             if isinstance(current_module, torch.nn.ModuleList):
                 current_module = current_module[int(part)]
@@ -319,7 +330,7 @@ def _is_fp8_weight(name, model):
                 isinstance(module, LinearBase)
                 and module.weight.dtype == torch.float8_e4m3fn
                 or (
-                    isinstance(module, FusedMoE)
+                    is_fused_moe_module(module)
                     and module.w13_weight.dtype == torch.float8_e4m3fn
                     and module.w2_weight.dtype == torch.float8_e4m3fn
                 )

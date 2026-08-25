@@ -134,7 +134,8 @@ ollama and other native GGUF runtimes:
   tensor presence plus float-tensor finiteness.
 
 Security: the GGUF dequant advisory (GHSA-5jv2-g5wq-cmr4) lives in vLLM's dequant
-kernel. This export+validation path never invokes vLLM, so producing and checking a
-GGUF does not exercise the vulnerable kernel. Serving a GGUF in vLLM is a separate,
-explicitly hardened path; keeping export off the vLLM-GGUF runtime leaves the advisory
-unexercised in dockyard.
+kernel, and is patched upstream in vLLM 0.24.0. This export+validation path never
+invokes vLLM, so producing and checking a GGUF does not exercise that kernel at all.
+dockyard has no GGUF-in-vLLM serve mode, so the advisory is unreachable here on either
+path. If such a serve mode is added, re-check the advisory against the pinned vLLM
+version at that point rather than assuming this note still applies.

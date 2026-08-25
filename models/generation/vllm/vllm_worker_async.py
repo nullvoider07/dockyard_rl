@@ -5,6 +5,7 @@ The async engine is used when expose_http_server=True in VllmConfig
 is explicitly set to True.
 """
 
+import argparse
 import asyncio
 import gc
 import logging
@@ -36,6 +37,13 @@ from dockyard_rl.models.generation.vllm.router_capture import (
     stack_routed_experts,
 )
 
+def _vllm_version() -> str:
+    """Installed vLLM version, for diagnostics on API-drift paths."""
+    import vllm
+
+    return getattr(vllm, "__version__", "unknown")
+
+
 # Async-engine worker implementation
 class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
     """vLLM async-engine generation worker.
@@ -54,21 +62,30 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
     def _create_engine(self, llm_kwargs: dict[str, Any]) -> None:
         """Construct an AsyncLLMEngine.
 
-        AsyncLLMEngine does not accept all the same kwargs as vllm.LLM;
-        unsupported keys are stripped before forwarding.
+        Kwargs are filtered against the live AsyncEngineArgs field set rather
+        than a hardcoded exclusion list, so a key that upstream adds or removes
+        does not silently change which settings reach the async engine. A key
+        accepted by vllm.LLM but absent from AsyncEngineArgs is dropped with a
+        warning: dropping it silently makes sync and async runs diverge on
+        settings such as logprobs_mode, which feeds the train/generation
+        logprob comparison.
         """
+        import dataclasses
+
         from vllm import AsyncEngineArgs, AsyncLLMEngine
 
-        # Keys accepted by LLM but not AsyncEngineArgs.
-        _async_unsupported = {
-            "disable_log_stats",
-            "logprobs_mode",
-            "served_model_name",
-        }
+        _async_supported = {f.name for f in dataclasses.fields(AsyncEngineArgs)}
         async_kwargs = {
-            k: v for k, v in llm_kwargs.items()
-            if k not in _async_unsupported
+            k: v for k, v in llm_kwargs.items() if k in _async_supported
         }
+        dropped = sorted(set(llm_kwargs) - _async_supported)
+        if dropped:
+            logger.warning(
+                "Dropping %d kwarg(s) not accepted by AsyncEngineArgs in vLLM "
+                "%s: %s. The sync (vllm.LLM) path applies these; the async "
+                "path does not.",
+                len(dropped), _vllm_version(), ", ".join(dropped),
+            )
 
         engine_args = AsyncEngineArgs(**async_kwargs)
         self.llm = AsyncLLMEngine.from_engine_args(engine_args)
@@ -112,28 +129,26 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         )
 
         async def _serve():
-            app = build_app(serving_kwargs)  # type: ignore[arg-type]
-            # Sanitize leaked PIL repr addresses in the Anthropic router's error
-            # bodies before the server starts serving (GHSA-hgg8-fqqc-vfmw).
-            from dockyard_rl.models.generation.vllm.serving_hardening import (
-                install_anthropic_repr_sanitizer,
-            )
+            # build_app and init_app_state both do attribute access across the
+            # full serve-CLI surface, so args must be a real Namespace carrying
+            # every frontend default -- not a dict or an ad-hoc object. Build it
+            # from vLLM's own parser so defaults track the installed version,
+            # then apply the configured overrides.
+            args = self._build_serving_args(serving_kwargs, port)
 
-            install_anthropic_repr_sanitizer(app)
-            await init_app_state(
-                engine=self.llm,  # type: ignore[call-arg]
-                engine_config=self.llm.engine_config,  # type: ignore[call-arg]
-                state=app.state,
-                args=type("_Args", (), {
-                    "model":               self.model_name,
-                    "served_model_name":  [self.model_name],
-                    **serving_kwargs,
-                })(),
-            )
+            supported_tasks = await self.llm.get_supported_tasks()
+            app = build_app(args, supported_tasks, self.llm.model_config)
+            # No repr sanitizer is installed here. vLLM >= 0.24 fixes
+            # GHSA-hgg8-fqqc-vfmw upstream: the Anthropic router wraps both of
+            # its error bodies in entrypoints.serve.utils.api_utils
+            # .sanitize_message, which strips the heap address the advisory
+            # discloses. dockyard's own wrapper was removed rather than left to
+            # double-sanitize a body upstream already handles.
+            await init_app_state(self.llm, app.state, args, supported_tasks)
             config = uvicorn.Config(
                 app,
-                host="0.0.0.0",
-                port=port,
+                host=args.host,
+                port=args.port,
                 log_level="warning",
             )
             server = uvicorn.Server(config)
@@ -153,6 +168,48 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
 
         t = threading.Thread(target=_run, daemon=True, name="vllm-http-server")
         t.start()
+
+    def _build_serving_args(
+        self, serving_kwargs: dict[str, Any], port: int
+    ) -> argparse.Namespace:
+        """Build the serve-CLI Namespace that build_app/init_app_state expect.
+
+        Defaults come from vLLM's own arg parser, so the surface tracks the
+        installed version instead of a hand-maintained list. Model identity and
+        port are then pinned to this worker, and http_server_serving_chat_kwargs
+        applied on top.
+
+        An unknown key in serving_kwargs raises rather than being silently
+        attached to the Namespace: vLLM would ignore it, and a typo'd serving
+        option that is quietly dropped is the failure mode this whole path has
+        already had once.
+        """
+        from vllm.entrypoints.openai.cli_args import make_arg_parser
+        from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+        # FlexibleArgumentParser.parse_args carries no return annotation, so it
+        # infers as Namespace | None; its single return delegates to
+        # argparse.ArgumentParser.parse_args, which always yields a Namespace.
+        args = cast(
+            argparse.Namespace,
+            make_arg_parser(FlexibleArgumentParser()).parse_args([]),
+        )
+
+        args.model = self.model_name
+        args.served_model_name = [self.model_name]
+        args.port = port
+        args.host = "0.0.0.0"
+
+        unknown = sorted(k for k in serving_kwargs if not hasattr(args, k))
+        if unknown:
+            raise ValueError(
+                f"http_server_serving_chat_kwargs contains key(s) not accepted "
+                f"by the vLLM {_vllm_version()} serve CLI: {', '.join(unknown)}"
+            )
+        for key, value in serving_kwargs.items():
+            setattr(args, key, value)
+
+        return args
 
     def _register_parser_plugins(self) -> None:
         """Register custom tool / reasoning parser plugin files with vLLM.

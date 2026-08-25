@@ -243,6 +243,19 @@ def get_tokenizer(
                                           any other str → used as Jinja2 template.
             chat_template_kwargs (opt):   Dict of kwargs partially applied to
                                           tokenizer.apply_chat_template().
+            tokenizer_kwargs (opt):       Dict forwarded to the loader for
+                                          model-specific options that have no
+                                          dedicated config key (e.g.
+                                          {"fix_mistral_regex": False}). Under
+                                          get_processor=True these go to
+                                          AutoProcessor.from_pretrained, which
+                                          forwards what it recognises to the
+                                          tokenizer it builds — they do not
+                                          reach the inner tokenizer directly.
+                                          trust_remote_code (default True) and
+                                          use_fast may be overridden here; both
+                                          are otherwise pinned by the loader
+                                          calls below.
         get_processor:    If True, return an AutoProcessor instead.
 
     Returns:
@@ -254,15 +267,35 @@ def get_tokenizer(
     except ImportError:
         COMMON_CHAT_TEMPLATES = None  # type: ignore[assignment]
 
+    # Copied so the pops below cannot mutate the caller's config dict.
+    tokenizer_kwargs = dict(tokenizer_config.get("tokenizer_kwargs") or {})
+
+    # Both loaders are called with trust_remote_code pinned, so a caller-supplied
+    # value must be popped rather than splatted: passing it twice raises
+    # "got multiple values for keyword argument", which says nothing about which
+    # config key caused it. Popping also lets a deployment harden the default to
+    # False. Upstream leaves this collision unhandled; the divergence is
+    # deliberate.
+    trust_remote_code = tokenizer_kwargs.pop("trust_remote_code", True)
+
     processor = None
     if get_processor:
+        # use_fast is pinned on this branch only, so it is popped here and not
+        # on the tokenizer branch below.
         processor  = AutoProcessor.from_pretrained(
-            tokenizer_config["name"], trust_remote_code=True, use_fast=True
+            tokenizer_config["name"],
+            trust_remote_code=trust_remote_code,
+            use_fast=tokenizer_kwargs.pop("use_fast", True),
+            **tokenizer_kwargs,
         )
         tokenizer  = processor.tokenizer
     else:
+        # No pinned use_fast on this branch, so the caller's value reaches
+        # from_pretrained directly.
         tokenizer  = AutoTokenizer.from_pretrained(
-            tokenizer_config["name"], trust_remote_code=True
+            tokenizer_config["name"],
+            trust_remote_code=trust_remote_code,
+            **tokenizer_kwargs,
         )
 
     if tokenizer.pad_token is None:
