@@ -169,58 +169,68 @@ class ClippedPGLossFn(LossFunction):
 
         self.use_cispo = cfg.use_cispo
         if self.use_cispo:
-            assert not self.disable_ppo_ratio, (
-                "use_cispo is incompatible with disable_ppo_ratio; CISPO needs the "
-                "pi_theta/pi_theta_old ratio that disable_ppo_ratio removes"
-            )
-            assert not self.force_on_policy_ratio, (
-                "use_cispo is incompatible with force_on_policy_ratio; forcing ratio=1 "
-                "removes the clipped IS-weight CISPO optimizes"
-            )
-            assert not self.sequence_level_importance_ratios, (
-                "use_cispo is incompatible with sequence_level_importance_ratios; "
-                "CISPO uses token-level importance weights"
-            )
-            assert self.ratio_clip_c is None, (
-                "use_cispo is incompatible with dual clipping (ratio_clip_c); the "
-                "dual-clip block runs after CISPO loss assembly and would overwrite it"
-            )
-            assert self.loss_type == LossType.TOKEN_LEVEL, (
-                "use_cispo requires token_level_loss=True (LossType.TOKEN_LEVEL)"
-            )
+            if self.disable_ppo_ratio:
+                raise ValueError(
+                    "use_cispo is incompatible with disable_ppo_ratio; CISPO needs the "
+                    "pi_theta/pi_theta_old ratio that disable_ppo_ratio removes"
+                )
+            if self.force_on_policy_ratio:
+                raise ValueError(
+                    "use_cispo is incompatible with force_on_policy_ratio; forcing ratio=1 "
+                    "removes the clipped IS-weight CISPO optimizes"
+                )
+            if self.sequence_level_importance_ratios:
+                raise ValueError(
+                    "use_cispo is incompatible with sequence_level_importance_ratios; "
+                    "CISPO uses token-level importance weights"
+                )
+            if self.ratio_clip_c is not None:
+                raise ValueError(
+                    "use_cispo is incompatible with dual clipping (ratio_clip_c); the "
+                    "dual-clip block runs after CISPO loss assembly and would overwrite it"
+                )
+            if self.loss_type != LossType.TOKEN_LEVEL:
+                raise ValueError(
+                    "use_cispo requires token_level_loss=True (LossType.TOKEN_LEVEL)"
+                )
 
         if self.sequence_level_importance_ratios:
-            assert self.loss_type == LossType.SEQUENCE_LEVEL, (
-                "sequence_level_importance_ratios is mutually exclusive with token_level_loss"
-            )
+            if self.loss_type != LossType.SEQUENCE_LEVEL:
+                raise ValueError(
+                    "sequence_level_importance_ratios is mutually exclusive with token_level_loss"
+                )
 
         if self.truncated_importance_sampling_type is not None:
-            assert self.use_importance_sampling_correction, (
-                "truncated IS requires use_importance_sampling_correction=True"
-            )
-            assert self.truncated_importance_sampling_type in ("tis", "icepop", "seq-mask-tis"), (
-                f"Invalid truncated IS type: {self.truncated_importance_sampling_type!r}"
-            )
-            assert (
-                self.truncated_importance_sampling_ratio is not None
-                and self.truncated_importance_sampling_ratio > 0
-            ), "truncated_importance_sampling_ratio must be positive"
+            if not self.use_importance_sampling_correction:
+                raise ValueError("truncated IS requires use_importance_sampling_correction=True")
+            if self.truncated_importance_sampling_type not in ("tis", "icepop", "seq-mask-tis"):
+                raise ValueError(
+                    f"Invalid truncated IS type: {self.truncated_importance_sampling_type!r}"
+                )
+            if (
+                self.truncated_importance_sampling_ratio is None
+                or self.truncated_importance_sampling_ratio <= 0
+            ):
+                raise ValueError("truncated_importance_sampling_ratio must be positive")
             if self.truncated_importance_sampling_ratio_min is not None:
-                assert (
+                if (
                     self.truncated_importance_sampling_ratio_min
-                    <= self.truncated_importance_sampling_ratio
-                ), (
-                    "truncated_importance_sampling_ratio_min must be <= "
-                    "truncated_importance_sampling_ratio"
-                )
+                    > self.truncated_importance_sampling_ratio
+                ):
+                    raise ValueError(
+                        "truncated_importance_sampling_ratio_min must be <= "
+                        "truncated_importance_sampling_ratio"
+                    )
             if self.truncated_importance_sampling_type in ("icepop", "seq-mask-tis"):
-                assert self.truncated_importance_sampling_ratio_min is not None, (
-                    "truncated_importance_sampling_ratio_min required for icepop / seq-mask-tis"
-                )
+                if self.truncated_importance_sampling_ratio_min is None:
+                    raise ValueError(
+                        "truncated_importance_sampling_ratio_min required for icepop / seq-mask-tis"
+                    )
             if self.truncated_importance_sampling_type == "seq-mask-tis":
-                assert not self.sequence_level_importance_ratios, (
-                    "seq-mask-tis is incompatible with sequence_level_importance_ratios=True"
-                )
+                if self.sequence_level_importance_ratios:
+                    raise ValueError(
+                        "seq-mask-tis is incompatible with sequence_level_importance_ratios=True"
+                    )
 
     def __call__(  # type: ignore[override]
         self,
@@ -827,9 +837,10 @@ class CDPOLossFn(DPOLossFn):
     def __init__(self, cfg: DPOLossConfig, use_linear_ce_fusion: bool = False) -> None:
         super().__init__(cfg, use_linear_ce_fusion=use_linear_ce_fusion)
         self.label_smoothing = float(cfg.get("label_smoothing", 0.0))
-        assert 0.0 <= self.label_smoothing < 0.5, (
-            f"cDPO label_smoothing must be in [0, 0.5), got {self.label_smoothing}"
-        )
+        if not (0.0 <= self.label_smoothing < 0.5):
+            raise ValueError(
+                f"cDPO label_smoothing must be in [0, 0.5), got {self.label_smoothing}"
+            )
 
 class DPOPLossFn(DPOLossFn):
     """DPO-positive (DPOP) — adds a positive penalty that resists the chosen
@@ -844,9 +855,8 @@ class DPOPLossFn(DPOLossFn):
     def __init__(self, cfg: DPOLossConfig, use_linear_ce_fusion: bool = False) -> None:
         super().__init__(cfg, use_linear_ce_fusion=use_linear_ce_fusion)
         self.dpop_lambda = float(cfg.get("dpop_lambda", 0.0))
-        assert self.dpop_lambda >= 0.0, (
-            f"DPOP dpop_lambda must be non-negative, got {self.dpop_lambda}"
-        )
+        if self.dpop_lambda < 0.0:
+            raise ValueError(f"DPOP dpop_lambda must be non-negative, got {self.dpop_lambda}")
 
 class RDPOLossFn(DPOLossFn):
     """Length-regularised DPO (R-DPO) — subtracts an explicit length penalty
@@ -862,9 +872,10 @@ class RDPOLossFn(DPOLossFn):
     def __init__(self, cfg: DPOLossConfig, use_linear_ce_fusion: bool = False) -> None:
         super().__init__(cfg, use_linear_ce_fusion=use_linear_ce_fusion)
         self.length_penalty = float(cfg.get("length_penalty", 0.0))
-        assert self.length_penalty >= 0.0, (
-            f"R-DPO length_penalty must be non-negative, got {self.length_penalty}"
-        )
+        if self.length_penalty < 0.0:
+            raise ValueError(
+                f"R-DPO length_penalty must be non-negative, got {self.length_penalty}"
+            )
 
 class IPOLossFn(DPOLossFn):
     """Identity Preference Optimisation (IPO) — replaces the logsigmoid with a
@@ -924,9 +935,8 @@ class KTOLossFn(DPOLossFn):
         super().__init__(cfg, use_linear_ce_fusion=use_linear_ce_fusion)
         self.desirable_weight   = float(cfg.get("desirable_weight", 1.0))
         self.undesirable_weight = float(cfg.get("undesirable_weight", 1.0))
-        assert self.desirable_weight >= 0.0 and self.undesirable_weight >= 0.0, (
-            "KTO desirable_weight / undesirable_weight must be non-negative"
-        )
+        if not (self.desirable_weight >= 0.0 and self.undesirable_weight >= 0.0):
+            raise ValueError("KTO desirable_weight / undesirable_weight must be non-negative")
 
     def __call__(  # type: ignore[override]
         self,
@@ -1009,9 +1019,8 @@ class SimPOLossFn(DPOLossFn):
     def __init__(self, cfg: DPOLossConfig, use_linear_ce_fusion: bool = False) -> None:
         super().__init__(cfg, use_linear_ce_fusion=use_linear_ce_fusion)
         self.simpo_gamma = float(cfg.get("simpo_gamma", 0.0))
-        assert self.simpo_gamma >= 0.0, (
-            f"SimPO simpo_gamma must be non-negative, got {self.simpo_gamma}"
-        )
+        if self.simpo_gamma < 0.0:
+            raise ValueError(f"SimPO simpo_gamma must be non-negative, got {self.simpo_gamma}")
 
     def _dpo_loss(  # type: ignore[override]
         self,
@@ -1050,9 +1059,8 @@ class ORPOLossFn(DPOLossFn):
     def __init__(self, cfg: DPOLossConfig, use_linear_ce_fusion: bool = False) -> None:
         super().__init__(cfg, use_linear_ce_fusion=use_linear_ce_fusion)
         self.orpo_lambda = float(cfg.get("orpo_lambda", 0.1))
-        assert self.orpo_lambda >= 0.0, (
-            f"ORPO orpo_lambda must be non-negative, got {self.orpo_lambda}"
-        )
+        if self.orpo_lambda < 0.0:
+            raise ValueError(f"ORPO orpo_lambda must be non-negative, got {self.orpo_lambda}")
 
     def __call__(  # type: ignore[override]
         self,
@@ -1158,10 +1166,10 @@ class DistillationLossFn(LossFunction):
         self.zero_outside_topk  = cfg["zero_outside_topk"]
         self.log_infinitesimal  = -100
 
-        assert self.kl_type in ("forward", "reverse", "mixed"), (
-            f"Invalid kl_type {self.kl_type!r}"
-        )
-        assert 0.0 <= self.mixed_kl_weight <= 1.0, "mixed_kl_weight must be in [0, 1]"
+        if self.kl_type not in ("forward", "reverse", "mixed"):
+            raise ValueError(f"Invalid kl_type {self.kl_type!r}")
+        if not (0.0 <= self.mixed_kl_weight <= 1.0):
+            raise ValueError("mixed_kl_weight must be in [0, 1]")
 
     def __call__(  # type: ignore[override]
         self,
@@ -1413,28 +1421,30 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         # knobs), so they're NotRequired in the schema but must be present when
         # the loss is constructed.
         student_vocab_size = cfg.get("student_vocab_size")
-        assert student_vocab_size is not None, (
-            "student_vocab_size must be injected into the cross-tokenizer loss "
-            "config by the driver before the loss is built."
-        )
+        if student_vocab_size is None:
+            raise ValueError(
+                "student_vocab_size must be injected into the cross-tokenizer loss "
+                "config by the driver before the loss is built."
+            )
         self.student_vocab_size = student_vocab_size
         projection_matrix_paths = cfg.get("projection_matrix_paths")
         teacher_vocab_sizes = cfg.get("teacher_vocab_sizes")
         teacher_weights = cfg.get("teacher_weights")
         teacher_gold_loss = cfg.get("teacher_gold_loss")
         teacher_xtoken_loss = cfg.get("teacher_xtoken_loss")
-        assert (
-            projection_matrix_paths is not None
-            and teacher_vocab_sizes is not None
-            and teacher_weights is not None
-            and teacher_gold_loss is not None
-            and teacher_xtoken_loss is not None
-        ), (
-            "projection_matrix_paths / teacher_vocab_sizes / teacher_weights / "
-            "teacher_gold_loss / teacher_xtoken_loss must be injected into the "
-            "cross-tokenizer loss config by the driver (one entry per teacher) "
-            "before the loss is built."
-        )
+        if (
+            projection_matrix_paths is None
+            or teacher_vocab_sizes is None
+            or teacher_weights is None
+            or teacher_gold_loss is None
+            or teacher_xtoken_loss is None
+        ):
+            raise ValueError(
+                "projection_matrix_paths / teacher_vocab_sizes / teacher_weights / "
+                "teacher_gold_loss / teacher_xtoken_loss must be injected into the "
+                "cross-tokenizer loss config by the driver (one entry per teacher) "
+                "before the loss is built."
+            )
         self.projection_matrix_paths = list(projection_matrix_paths)
         self.teacher_vocab_sizes = list(teacher_vocab_sizes)
         self.teacher_weights = list(teacher_weights)

@@ -200,17 +200,20 @@ class TestFactory:
         assert is_reference_free("foobar") is False
 
     def test_variant_hyperparameter_bounds(self):
-        with pytest.raises(AssertionError):
+        # ValueError, not AssertionError: these are config-contract checks and
+        # `assert` is stripped under `python -O`, which would let an invalid
+        # hyperparameter through silently.
+        with pytest.raises(ValueError):
             CDPOLossFn(_base_cfg(label_smoothing=0.5))
-        with pytest.raises(AssertionError):
+        with pytest.raises(ValueError):
             DPOPLossFn(_base_cfg(dpop_lambda=-0.1))
-        with pytest.raises(AssertionError):
+        with pytest.raises(ValueError):
             RDPOLossFn(_base_cfg(length_penalty=-0.1))
-        with pytest.raises(AssertionError):
+        with pytest.raises(ValueError):
             KTOLossFn(_base_cfg(desirable_weight=-0.1))
-        with pytest.raises(AssertionError):
+        with pytest.raises(ValueError):
             SimPOLossFn(_base_cfg(simpo_gamma=-0.1))
-        with pytest.raises(AssertionError):
+        with pytest.raises(ValueError):
             ORPOLossFn(_base_cfg(orpo_lambda=-0.1))
 
     def test_sequences_per_datum_contract(self):

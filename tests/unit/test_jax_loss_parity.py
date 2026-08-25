@@ -104,19 +104,16 @@ def test_loss_and_grad_parity(token_level, use_is, clip_c, kl_pen, kl_type, tis,
         # rejection instead, and assert both backends agree on it, which is the
         # parity claim this file exists to make.
         #
-        # Note the exception types differ: torch validates with `assert`
-        # (AssertionError), JAX with `raise ValueError`. Matched on message
-        # rather than type so this test pins the contract without asserting a
-        # divergence it does not endorse.
-        with pytest.raises(
-            (AssertionError, ValueError), match="truncated IS requires"
-        ):
+        # Both backends raise ValueError. They previously disagreed -- torch
+        # validated with `assert`, JAX with `raise` -- which mattered because
+        # `assert` is stripped under `python -O`, leaving the torch path
+        # accepting a config the JAX path refuses. Asserting the exact type
+        # here is what keeps that from regressing.
+        with pytest.raises(ValueError, match="truncated IS requires"):
             ClippedPGLossFn(cfg)
 
         curr_j = jnp.asarray(curr)
-        with pytest.raises(
-            (AssertionError, ValueError), match="truncated IS requires"
-        ):
+        with pytest.raises(ValueError, match="truncated IS requires"):
             jax_loss.clipped_pg_loss(
                 curr_j,
                 _jax_data(prev, gen, ref, adv, token_mask, sample_mask),
@@ -271,7 +268,7 @@ def test_cispo_rejects_incompatible_config():
         {"token_level_loss": False},
     ]
     for extra in incompatible:
-        with pytest.raises((AssertionError, ValueError)):
+        with pytest.raises(ValueError):
             ClippedPGLossFn(ClippedPGLossConfig(use_cispo=True, **extra))
         mask = token_mask * sample_mask[:, None]
         with pytest.raises(ValueError):
@@ -415,7 +412,7 @@ def test_tis_ratio_min_above_ratio_rejected():
         truncated_importance_sampling_ratio=2.0,
         truncated_importance_sampling_ratio_min=3.0,
     )
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError):
         ClippedPGLossFn(ClippedPGLossConfig(**bad))
     mask = token_mask * sample_mask[:, None]
     with pytest.raises(ValueError):
