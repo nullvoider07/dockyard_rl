@@ -201,6 +201,89 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         with self._lock:
             return self.last_target_weight_already_generated
 
+    # Persistence
+    def state_dict(self) -> dict[str, Any]:
+        """Serialize the buffer for checkpointing.
+
+        Nothing persisted the buffer before this: on every async resume, every
+        buffered trajectory was discarded, and the generation work that
+        produced it was unrecoverable.
+
+        Returns a `persisted: False` marker instead of the contents when the
+        entries are data-plane references rather than bulk tensors. Those
+        handles name rows in a transfer queue that does not survive the
+        restart, so saving them would restore a buffer of dangling pointers --
+        strictly worse than restoring nothing, because it fails later and
+        further from the cause.
+        """
+        with self._lock:
+            # Data-plane entries are {"meta", "driver_carry", "rollout_metrics"}
+            # (trajectory_collector._group_to_dataplane_trajectory); legacy
+            # entries are {"batch", "rollout_metrics"} and hold real tensors.
+            dataplane_backed = any(
+                isinstance(t, dict) and "meta" in t and "driver_carry" in t
+                for t in self.trajectories
+            )
+            if dataplane_backed:
+                return {
+                    "persisted": False,
+                    "reason": (
+                        "buffer holds data-plane references, which do not "
+                        "survive a restart"
+                    ),
+                    "max_size": self.max_size,
+                    "discarded_groups": len(self.trajectories),
+                }
+            return {
+                "persisted": True,
+                "max_size": self.max_size,
+                "trajectories": list(self.trajectories),
+                "trajectory_versions": list(self.trajectory_versions),
+                "target_weight_versions": list(self.target_weight_versions),
+                "last_target_weight_already_generated": (
+                    self.last_target_weight_already_generated
+                ),
+            }
+
+    def load_state_dict(self, state: dict[str, Any]) -> bool:
+        """Restore a buffer saved by state_dict.
+
+        Returns False without touching the buffer when the checkpoint recorded
+        that the contents were not persisted, or when the saved entries exceed
+        this run's max_size -- a resume under a smaller buffer must not
+        silently drop trajectories the trainer would then never see.
+        """
+        if not state.get("persisted", False):
+            print(
+                "ReplayBuffer: checkpoint contains no persisted trajectories "
+                f"({state.get('reason', 'unknown reason')}); starting empty.",
+                flush=True,
+            )
+            return False
+
+        trajectories = state["trajectories"]
+        with self._lock:
+            if len(trajectories) > self.max_size:
+                print(
+                    f"ReplayBuffer: checkpoint holds {len(trajectories)} groups "
+                    f"but max_size is {self.max_size}; starting empty rather "
+                    "than truncating.",
+                    flush=True,
+                )
+                return False
+            self.trajectories = list(trajectories)
+            self.trajectory_versions = list(state["trajectory_versions"])
+            self.target_weight_versions = list(state["target_weight_versions"])
+            self.last_target_weight_already_generated = int(
+                state["last_target_weight_already_generated"]
+            )
+            print(
+                f"ReplayBuffer: restored {len(self.trajectories)} groups from "
+                "checkpoint.",
+                flush=True,
+            )
+            return True
+
     def get_existing_target_weights(self) -> set[int]:
         with self._lock:
             return set(self.target_weight_versions)

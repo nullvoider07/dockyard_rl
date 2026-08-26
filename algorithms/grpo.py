@@ -2505,6 +2505,26 @@ def async_grpo_train(
         teacher_seq_pad_multiple = _teacher_seq_pad_multiple,
     )
 
+    # Restore the replay buffer before collection starts, so restored groups
+    # are visible to the first sample() and the collector does not regenerate
+    # target versions the buffer already covers.
+    _resume_path = checkpointer.get_latest_checkpoint_path()
+    if _resume_path is not None:
+        _buffer_ckpt = os.path.join(_resume_path, "replay_buffer.pt")
+        if os.path.exists(_buffer_ckpt):
+            ray.get(
+                replay_buffer.load_state_dict.remote(  # type: ignore[union-attr]
+                    torch.load(_buffer_ckpt, weights_only=False)
+                )
+            )
+        else:
+            # Checkpoints written before replay-buffer persistence existed.
+            print(
+                f"No replay_buffer.pt in {_resume_path}; resuming with an "
+                "empty buffer.",
+                flush=True,
+            )
+
     collection_task = trajectory_collector.start_collection.remote(dataloader)
     trajectory_collector.set_weight_version.remote(weight_version)
 
@@ -3118,6 +3138,27 @@ def async_grpo_train(
                             actual_dataloader_state,
                             os.path.join(checkpoint_path, "train_dataloader.pt"),
                         )
+                        # The replay buffer was never checkpointed, so every
+                        # async resume discarded every buffered trajectory --
+                        # and, before the frontier fix above, also skipped the
+                        # prompts that produced them. The two compounded: the
+                        # generation work was unrecoverable in both directions.
+                        buffer_state = cast(
+                            dict[str, Any],
+                            ray.get(replay_buffer.state_dict.remote()),  # type: ignore[union-attr]
+                        )
+                        torch.save(
+                            buffer_state,
+                            os.path.join(checkpoint_path, "replay_buffer.pt"),
+                        )
+                        if not buffer_state.get("persisted", False):
+                            warnings.warn(
+                                "Replay buffer was not persisted in this "
+                                f"checkpoint: {buffer_state.get('reason')}. "
+                                f"{buffer_state.get('discarded_groups', 0)} "
+                                "trajectory group(s) will be lost on resume.",
+                                stacklevel=2,
+                            )
                         checkpointer.finalize_checkpoint(checkpoint_path)
 
             # Logging

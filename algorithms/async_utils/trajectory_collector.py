@@ -223,6 +223,10 @@ class AsyncTrajectoryCollectorImpl:
 
         self._dataloader: Any = None
 
+        # Dataloader position as of the last *fully enqueued* batch, which is
+        # what a checkpoint must record. See get_dataloader_state.
+        self._enqueued_dataloader_state: Optional[dict[str, Any]] = None
+
         # Data-plane write path (opt-in). When master_config.data_plane is
         # enabled the collector writes each group's bulk tensors to the plane
         # and enqueues only a KVBatchMeta + lightweight driver_carry, so
@@ -272,10 +276,29 @@ class AsyncTrajectoryCollectorImpl:
         self._refit_requested = False
 
     def get_dataloader_state(self) -> Optional[dict[str, Any]]:
-        """Return the underlying dataloader's state dict for checkpointing."""
-        if self._dataloader is None:
-            return None
-        return self._dataloader.state_dict()
+        """Return the dataloader position to checkpoint.
+
+        This is the cursor as of the last *fully enqueued* batch, not the live
+        one. The live cursor has already advanced past prompts that are still
+        generating or sitting in the replay buffer, so checkpointing it made a
+        resume skip those prompts entirely -- they were never trained on, and
+        nothing reported it.
+
+        Checkpointing runs while collection continues (the collector is paused
+        only for validation), so the live cursor is also racing the save.
+
+        Returning the last-enqueued position is the frontier that matters now
+        that the replay buffer is itself persisted: everything at or before it
+        is in the buffer and will be restored, so re-yielding it would train on
+        it twice; everything after it is unaccounted for and must be re-yielded.
+        The batch in flight at checkpoint time falls in the second group and is
+        correctly regenerated.
+
+        Returns None before the first batch completes, which is also what the
+        caller stores -- a resume from such a checkpoint starts the epoch over,
+        having lost nothing.
+        """
+        return self._enqueued_dataloader_state
 
     def stop(self) -> None:
         """Stop the collection loop."""
@@ -420,6 +443,13 @@ class AsyncTrajectoryCollectorImpl:
             # both completed and the groups were enqueued, so this is the point
             # at which the streak is genuinely broken.
             self._record_success()
+
+            # Advance the checkpointable cursor only now. Every prompt in this
+            # batch is in the replay buffer, so a resume from here must not
+            # re-yield them; the batch pulled next is not yet accounted for
+            # anywhere, so a resume must re-yield that one.
+            if self._dataloader is not None:
+                self._enqueued_dataloader_state = self._dataloader.state_dict()
 
     # Internals
     @staticmethod
