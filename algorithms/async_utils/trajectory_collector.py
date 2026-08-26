@@ -623,22 +623,61 @@ class AsyncTrajectoryCollectorImpl:
         if not isinstance(agent_refs, list) or len(agent_refs) != batch_size:
             agent_refs = [{"name": "__opd_default__"}] * batch_size
 
+        # #3430b: a non-colocated teacher was called with input_ids alone, so a
+        # VLM teacher scored rollouts having never seen the images and its
+        # logprobs -- which drive the OPD advantage directly -- were computed
+        # against a different input than the student's. Text-only batches carry
+        # none of these keys, so this is inert there.
         teacher_logprobs, _ = self._compute_teacher_logprobs(
-            token_ids, agent_refs, input_lengths=teacher_input_lengths
+            token_ids,
+            agent_refs,
+            input_lengths=teacher_input_lengths,
+            multimodal_data=flat_for_teacher.get_multimodal_dict(as_tensors=False),
         )
         repeated_batch["teacher_reference_logprobs"] = teacher_logprobs
+
+    @staticmethod
+    def _select_multimodal_rows(key: str, value: Any, row_indices: list[int]) -> Any:
+        """Row-select one multimodal column for a teacher's sub-batch.
+
+        ``get_multimodal_dict(as_tensors=False)`` yields a ``PackedTensor`` (one
+        entry per sample) or, for a plain tensor column, the list form -- both
+        sample-indexed, so both are selected by row. Anything else is refused
+        rather than forwarded whole: a column that cannot be row-selected would
+        reach the teacher misaligned with the rows it is scoring, which is the
+        failure this fix exists to remove.
+        """
+        import torch
+
+        slicer = getattr(value, "slice", None)
+        if callable(slicer):
+            return slicer(row_indices)
+        if isinstance(value, torch.Tensor):
+            return value[row_indices]
+        if isinstance(value, (list, tuple)):
+            return [value[i] for i in row_indices]
+        raise TypeError(
+            f"multimodal column {key!r} is a {type(value).__name__}, which cannot "
+            "be row-selected for a per-teacher sub-batch"
+        )
 
     def _compute_teacher_logprobs(
         self,
         input_ids: Any,
         agent_refs: list[dict[str, Any]],
         input_lengths: Optional[Any] = None,
+        multimodal_data: Optional[dict[str, Any]] = None,
     ) -> tuple[Any, float]:
         """Compute teacher logprobs for non-colocated teachers.
 
         Groups samples by routed teacher, fans out in parallel (one thread per
         teacher, serialized per teacher by a lock), and stitches the results back
         into a ``[B, S]`` tensor index-aligned with ``input_ids``.
+
+        ``multimodal_data`` is the flattened batch's multimodal columns; each is
+        row-selected onto the teacher's sub-batch, DP padding included, and put
+        on the data dict the teacher's policy reads through
+        ``get_multimodal_dict`` in its own logprob forward.
         """
         import concurrent.futures
         import time
@@ -680,10 +719,17 @@ class AsyncTrajectoryCollectorImpl:
             dp_size = twg.sharding_annotations.get_axis_size("data_parallel")
             actual_batch_size = sub_input_ids.shape[0]
             remainder = actual_batch_size % dp_size
+            # Rows of the flattened batch this sub-batch covers, in the order the
+            # teacher receives them. The DP pad repeats the sub-batch's last row,
+            # so the multimodal columns have to repeat the same one -- padding
+            # them with anything else, or not at all, puts every column out of
+            # step with input_ids.
+            row_indices = list(indices)
             if remainder != 0:
                 pad_count = dp_size - remainder
                 pad_rows = sub_input_ids[-1:].expand(pad_count, -1)
                 sub_input_ids = torch.cat([sub_input_ids, pad_rows], dim=0)
+                row_indices = row_indices + [row_indices[-1]] * pad_count
                 if sub_lengths is not None:
                     sub_lengths = torch.cat(
                         [sub_lengths, sub_lengths[-1:].expand(pad_count)], dim=0
@@ -692,6 +738,8 @@ class AsyncTrajectoryCollectorImpl:
             sub_data = BatchedDataDict({"input_ids": sub_input_ids})
             if sub_lengths is not None:
                 sub_data["input_lengths"] = sub_lengths
+            for key, value in (multimodal_data or {}).items():
+                sub_data[key] = self._select_multimodal_rows(key, value, row_indices)
 
             # Serialize forwards on a given teacher (NCCL collective safety).
             with self._teacher_locks[group_key]:

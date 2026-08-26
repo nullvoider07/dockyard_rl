@@ -8,6 +8,8 @@ The teacher worker group + async-GRPO orchestration are GPU/cluster-deferred.
 from types import SimpleNamespace
 
 import pytest
+from typing import Any
+
 import torch
 
 from dockyard_rl.algorithms import opd
@@ -236,6 +238,154 @@ def test_collector_teacher_logprobs_dp_padding_trimmed():
     result, _t = col._compute_teacher_logprobs(input_ids, agent_refs)
     assert seen_batch["B"] == 4  # padded up to a multiple of dp_size
     assert result.shape == (3, 5)  # trimmed back
+
+
+def _collector_capturing_sub_data(dp_size=1, aliases=("t1",)):
+    """Collector whose fake teachers record the BatchedDataDict they were given."""
+    import threading
+    from collections import defaultdict
+    from unittest.mock import MagicMock
+
+    from dockyard_rl.algorithms.async_utils import trajectory_collector as tc
+    from dockyard_rl.distributed.batched_data_dict import BatchedDataDict
+
+    col = tc.AsyncTrajectoryCollectorImpl.__new__(tc.AsyncTrajectoryCollectorImpl)
+    seen: dict[str, Any] = {}
+    groups = {}
+    for alias in aliases:
+        teacher = MagicMock()
+        teacher.sharding_annotations.get_axis_size.return_value = dp_size
+
+        def _get_logprobs(sub_data, _alias=alias):
+            seen[_alias] = sub_data
+            ids = sub_data["input_ids"]
+            return BatchedDataDict(
+                {"reference_logprobs": torch.zeros(ids.shape, dtype=torch.float32)}
+            )
+
+        teacher.get_logprobs.side_effect = _get_logprobs
+        groups[alias] = teacher
+
+    col._teacher_worker_groups = groups
+    col._alias_to_group_alias = {a: a for a in aliases}
+    col._on_policy_distillation_cfg = {
+        "teacher_model_by_agent_name": {a: f"m_{a}" for a in aliases},
+        "default_teacher_alias": aliases[0],
+    }
+    col._teacher_locks = defaultdict(threading.Lock)
+    return col, seen
+
+
+# -- #3430b: multimodal payload reaches the non-colocated teacher -------------
+
+def test_multimodal_columns_reach_the_teacher():
+    """The defect: the teacher was called with input_ids and nothing else."""
+    col, seen = _collector_capturing_sub_data()
+    pixels = torch.arange(6, dtype=torch.float32).reshape(3, 2)
+
+    col._compute_teacher_logprobs(
+        torch.zeros(3, 4, dtype=torch.long),
+        [{"name": "t1"}] * 3,
+        multimodal_data={"pixel_values": pixels},
+    )
+
+    assert "pixel_values" in seen["t1"]
+    assert torch.equal(seen["t1"]["pixel_values"], pixels)
+
+
+def test_each_teacher_receives_only_its_own_rows():
+    """Routing splits the batch; the images have to split the same way."""
+    col, seen = _collector_capturing_sub_data(aliases=("t1", "t2"))
+    # Rows 0 and 2 -> t1, row 1 -> t2.
+    marks = ["img0", "img1", "img2"]
+
+    col._compute_teacher_logprobs(
+        torch.zeros(3, 4, dtype=torch.long),
+        [{"name": "t1"}, {"name": "t2"}, {"name": "t1"}],
+        multimodal_data={"image_sizes": marks},
+    )
+
+    assert seen["t1"]["image_sizes"] == ["img0", "img2"]
+    assert seen["t2"]["image_sizes"] == ["img1"]
+
+
+def test_dp_padding_repeats_the_same_row_in_every_column():
+    """The padding half of #3430b.
+
+    input_ids is padded up to a multiple of dp_size by repeating the sub-batch's
+    last row. A multimodal column padded with anything else -- or not padded --
+    arrives one row short or misaligned, and the teacher scores row i's tokens
+    against row j's image.
+    """
+    col, seen = _collector_capturing_sub_data(dp_size=2)
+
+    col._compute_teacher_logprobs(
+        torch.zeros(3, 5, dtype=torch.long),
+        [{"name": "t1"}] * 3,
+        multimodal_data={"image_sizes": ["a", "b", "c"]},
+    )
+
+    sub = seen["t1"]
+    assert sub["input_ids"].shape[0] == 4  # padded to a multiple of dp_size
+    assert sub["image_sizes"] == ["a", "b", "c", "c"]  # same row repeated
+
+
+def test_a_packed_tensor_column_is_sliced_by_row():
+    """PackedTensor is sample-indexed and exposes .slice; use it, don't stack."""
+    from dockyard_rl.data.multimodal_utils import PackedTensor
+
+    col, seen = _collector_capturing_sub_data(aliases=("t1", "t2"))
+    packed = PackedTensor(
+        [torch.full((1, 2), float(i)) for i in range(3)], dim_to_pack=0
+    )
+
+    col._compute_teacher_logprobs(
+        torch.zeros(3, 4, dtype=torch.long),
+        [{"name": "t1"}, {"name": "t2"}, {"name": "t1"}],
+        multimodal_data={"pixel_values": packed},
+    )
+
+    got = seen["t1"]["pixel_values"]
+    assert isinstance(got, PackedTensor)
+    assert all(t is not None for t in got.tensors)
+    assert [float(t[0, 0]) for t in got.tensors if t is not None] == [0.0, 2.0]
+
+
+def test_a_text_only_batch_is_unchanged():
+    """Inert default: no multimodal keys means the sub-batch is what it was."""
+    col, seen = _collector_capturing_sub_data()
+
+    col._compute_teacher_logprobs(
+        torch.zeros(2, 3, dtype=torch.long), [{"name": "t1"}] * 2
+    )
+
+    assert set(seen["t1"].keys()) == {"input_ids"}
+
+
+def test_a_column_that_cannot_be_row_selected_is_refused():
+    """Forwarding it whole is the misalignment this fix removes."""
+    col, _ = _collector_capturing_sub_data()
+
+    with pytest.raises(TypeError, match="row-selected"):
+        col._compute_teacher_logprobs(
+            torch.zeros(2, 3, dtype=torch.long),
+            [{"name": "t1"}] * 2,
+            multimodal_data={"pixel_values": object()},
+        )
+
+
+def test_the_scorer_passes_the_multimodal_columns():
+    """The wire: _score_teacher_logprobs must read them off the flat batch."""
+    import inspect
+
+    from dockyard_rl.algorithms.async_utils import trajectory_collector as tc
+
+    source = inspect.getsource(
+        tc.AsyncTrajectoryCollectorImpl._score_teacher_logprobs
+    )
+
+    assert "get_multimodal_dict(as_tensors=False)" in source
+    assert "multimodal_data=" in source
 
 
 def test_collector_teacher_logprobs_default_routing_for_unknown_agent():

@@ -113,9 +113,41 @@ GRPO core and differ in dataset, environment, and rollout shape:
 | `grpo_osworld.yaml` | OSWorld computer-use agent. |
 | `grpo_gdpval.yaml` / `grpo_gdpval_agentic.yaml` | GDPval file-producing tasks. |
 | `grpo_hle.yaml` | Humanity's Last Exam. |
+| `v4_consolidation.yaml` | Multi-teacher on-policy distillation — stage 2 of a V4-style recipe. |
 
 Each config's header comment documents the topology and target hardware it was
 written for.
+
+### The V4-style two-stage recipe
+
+`v4_consolidation.yaml` is the one config that composes several of the others
+rather than targeting an environment. DeepSeek-V4's post-training trains a
+separate expert per domain and only then distils them into one student, so each
+domain reaches its own optimum instead of every domain compromising against the
+others in a single joint run. Run it in three passes:
+
+1. **Per-domain SFT** — `sft.yaml`, once per domain, keeping each checkpoint.
+2. **Per-domain GRPO** — the environment config matching that domain
+   (`grpo_swe.yaml` for code, `grpo_hle.yaml` or `gpqa.yaml` for reasoning,
+   `grpo_terminal_bench.yaml` for agentic work), each starting from its stage-1
+   checkpoint.
+3. **Consolidation** — `v4_consolidation.yaml`, with the stage-2 checkpoints as
+   teachers. `grpo.adv_estimator.name: "opd"` replaces the environment reward
+   with `Â = sg[log π_teacher − log π_student]`, and
+   `on_policy_distillation.teacher_model_by_agent_name` selects which teacher
+   scores which rollout from the agent name — V4's per-context teacher
+   selection.
+
+Three constraints are enforced in code and the config satisfies all three: the
+OPD collector lives on the async path, so `grpo.async_grpo.enabled` must stay
+true; OPD on the data plane raises `NotImplementedError`, so `data_plane` stays
+undeclared; and the advantage subtracts `prev_logprobs`, so a config that zeroes
+them is refused at startup.
+
+One difference from V4 worth stating plainly: this is the **token-level**
+estimator, not KL over the full vocabulary. The teacher-side full-vocab logit
+exporter does not exist yet — see `HV-49` in the hardware-deferred validation
+ledger — so full-vocab KL is a build, not a config change.
 
 ## Exporting a trained model to GGUF
 
