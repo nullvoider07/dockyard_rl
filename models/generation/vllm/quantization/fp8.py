@@ -290,19 +290,43 @@ def _get_params_in_layers(param_names, layers):
             params.append(f"model.{name}".removesuffix(".weight"))
     return params
 
+# Suffixes that never carry a quantizable weight: biases, and the scale tensors
+# load_weights emits itself (a refit stream may echo them back).
+_NON_QUANTIZED_SUFFIXES = ("bias", "_scale", "_scale_inv")
+
+def _map_to_vllm_param_name(model, name: str) -> str | None:
+    """Translate a checkpoint-side refit name into vLLM's parameter name.
+
+    A vLLM model declares its own `hf_to_vllm_mapper` and applies it inside
+    `load_weights`, so its module tree is addressed by the mapped name, not the
+    one the trainer streams. Multimodal wrappers are where this matters:
+    Qwen2.5-VL maps the prefix `model.` to `language_model.model.` and the
+    wrapper carries no `model` attribute at all, so walking the raw name fails
+    on its first component and every FP8 weight of a VL policy is classified as
+    non-FP8 and refit unquantized. Returns None when the mapper drops the name.
+    """
+    mapper = getattr(model, "hf_to_vllm_mapper", None)
+    map_name = getattr(mapper, "_map_name", None) if mapper is not None else None
+    if map_name is None:
+        return name
+    return map_name(name)
+
 def _get_module_from_param_name(model, name: str):
+    mapped = _map_to_vllm_param_name(model, name)
+    if mapped is None:
+        return None
     # Split the name into parts (e.g., 'layers', '0', 'self_attn', 'q_proj', 'weight')
     # The module path is all but the last part (the parameter's own name)
-    path_parts = name.split(".")
+    path_parts = mapped.split(".")
     module_path = path_parts[:-1]
     # Replace with the fused model name
-    packed_modules_mapping = model.packed_modules_mapping
+    packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
     reversed_mapping = {
         original_name: fused_name
         for fused_name, original_names_list in packed_modules_mapping.items()
         for original_name in original_names_list
     }
-    if module_path[-1] in reversed_mapping.keys():
+    if module_path and module_path[-1] in reversed_mapping.keys():
         module_path[-1] = reversed_mapping[module_path[-1]]
 
     current_module = model
@@ -316,17 +340,49 @@ def _get_module_from_param_name(model, name: str):
             else:
                 current_module = getattr(current_module, part)
     except (AttributeError, IndexError, ValueError) as e:
-        print(f"Warning: Could not find module for parameter '{name}'. Error: {e}")
+        # Returning the partially traversed module here would let an unrelated
+        # module answer the FP8 dtype question below, which resolves to "not
+        # FP8" and refits the weight at high precision without reporting it.
+        print(
+            f"Warning: Could not find module for parameter '{name}' "
+            f"(vLLM name '{mapped}'). Error: {e}"
+        )
+        return None
     return current_module
+
+def _fp8_scale_name_routes(model, name: str) -> bool:
+    """Whether `<name>_scale_inv` reaches the block scale of `<name>`'s param.
+
+    load_weights emits the block scale as `<name>_scale_inv`. That is only a
+    valid vLLM name because the per-linear and per-expert mappings key on a
+    `.weight` suffix: `make_expert_params_mapping` matches `.weight_scale_inv`
+    alongside `.weight`, and a wrapper's prefix mapping rewrites both alike. A
+    grouped expert slab has no such suffix -- GptOss's WeightsMapper maps
+    `.gate_up_proj` onto `.w13_weight` and carries no entry for
+    `.gate_up_proj_scale_inv` -- so the weight would load while its scale is
+    dropped.
+    """
+    mapped_weight = _map_to_vllm_param_name(model, name)
+    mapped_scale = _map_to_vllm_param_name(model, name + "_scale_inv")
+    if mapped_weight is None or mapped_scale is None:
+        return False
+    return mapped_scale == mapped_weight + "_scale_inv"
 
 def _is_fp8_weight(name, model):
     if name not in fp8_state.seen_params:
         fp8_state.seen_params.add(name)
-        # Filter out bias params
-        if name.endswith("weight"):
+        # Biases and scale tensors are never quantized; everything else is
+        # decided by the module the name resolves to. Keying on a `.weight`
+        # suffix instead skipped grouped MoE expert slabs
+        # (`...mlp.experts.gate_up_proj` / `.down_proj`, streamed verbatim for
+        # HF models that keep experts fused -- see
+        # vllm_backend.fix_gpt_oss_export_transpose), which then reached vLLM at
+        # high precision and were cast element-wise into FP8 params whose block
+        # scales kept their previous values.
+        if not name.endswith(_NON_QUANTIZED_SUFFIXES):
             module = _get_module_from_param_name(model, name)
             # We currently only quantize linear layers
-            if (
+            if module is not None and (
                 isinstance(module, LinearBase)
                 and module.weight.dtype == torch.float8_e4m3fn
                 or (
@@ -346,6 +402,26 @@ def load_weights(weights, model_runner):
         if not _is_fp8_weight(k, model):
             weights_quantized.append((k, v))
             continue
+        if not _fp8_scale_name_routes(model, k):
+            raise ValueError(
+                f"Refit parameter '{k}' targets an FP8 parameter, but its block "
+                f"scale '{k}_scale_inv' does not map onto "
+                f"'{_map_to_vllm_param_name(model, k)}_scale_inv', so vLLM would "
+                "load the weight and drop the scale. This is the grouped-expert "
+                "case: an HF model that keeps its experts fused streams "
+                "'...mlp.experts.gate_up_proj' / '...down_proj', which map "
+                "straight onto 'w13_weight' / 'w2_weight' with no scale route. "
+                "Serving such a model in FP8 needs per-expert refit tensors "
+                "(DTensorPolicyWorkerV2 emits them for native GroupedExperts); "
+                "refitting as-is runs the experts against stale block scales."
+            )
+        if v.ndim != 2:
+            raise ValueError(
+                f"Refit parameter '{k}' targets an FP8 parameter but has shape "
+                f"{tuple(v.shape)}; the block-wise cast is 2D-only. A 3D tensor "
+                "here is a grouped expert slab that has to be expanded per "
+                "expert before refit."
+            )
         # Cast the weight into fp8 and its scale factor
         param_lp, param_scale = cast_tensor_to_fp8_blockwise(
             v.to(torch.float),
