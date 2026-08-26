@@ -2330,6 +2330,47 @@ def vocab_parallel_full_log_softmax(
     return torch.log_softmax(scaled, dim=-1)
 
 
+def vocab_parallel_gather_columns(
+    logits: torch.Tensor,
+    columns: torch.Tensor,
+    *,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> torch.Tensor:
+    """Raw logits at global vocab ids ``columns``, TP-aware and differentiable.
+
+    ``columns`` is a 1-D tensor of global vocab ids shared by every position (the
+    micro-batch-global top-k subset), so the result is ``[B, T, len(columns)]``.
+
+    The alternative -- :func:`vocab_parallel_full_log_softmax` followed by
+    ``[..., columns]`` -- all-gathers ``[B, T, V]`` across TP to read ``k`` of
+    its columns. A consumer that renormalizes within the subset does not need
+    the full-vocab partition function at all: ``log_softmax(logits)[cols]``
+    minus its own ``logsumexp`` equals ``log_softmax(logits[cols])``, so the
+    full ``logZ`` cancels and only the raw columns are required.
+
+    Each global id lives on exactly one TP rank, so the local gather is masked to
+    this rank's shard and a differentiable SUM all-reduce assembles the columns;
+    the gradient routes back to whichever rank owns each one.
+    """
+    if columns.dim() != 1:
+        raise ValueError(f"columns must be 1-D, got shape {tuple(columns.shape)}")
+    local_logits = logits.to_local() if isinstance(logits, DTensor) else logits
+    tp_world = torch.distributed.get_world_size(tp_group) if tp_group is not None else 1
+    if tp_world <= 1:
+        return local_logits[..., columns]
+
+    tp_rank = torch.distributed.get_rank(tp_group)
+    local_vocab_size = int(local_logits.shape[-1])
+    vocab_start = tp_rank * local_vocab_size
+    in_range = (columns >= vocab_start) & (columns < vocab_start + local_vocab_size)
+    # Clamp before the gather so an out-of-range id reads a valid slot; the
+    # mask below discards whatever it read.
+    local_ids = (columns - vocab_start).clamp(min=0, max=local_vocab_size - 1)
+    gathered = local_logits[..., local_ids]
+    gathered = gathered * in_range.to(gathered.dtype)
+    return group_all_reduce_sum_with_grad(gathered, tp_group)
+
+
 def vocab_parallel_argmax(
     logits: torch.Tensor,
     *,

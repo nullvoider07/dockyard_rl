@@ -322,6 +322,57 @@ def test_same_tokenizer_teacher_direct_kl(tmp_path):
     assert "kl_loss_t0" in metrics
 
 
+def _topk_kl_loss_and_grad(*, gather, seed=11):
+    """Run the same-tokenizer direct top-k KL with a chosen student-gather."""
+    from dockyard_rl.algorithms.loss import loss_functions as lf
+
+    torch.manual_seed(seed)
+    logits = torch.randn(1, 4, VS, requires_grad=True)
+    teacher = torch.randn(1, 4, VS)
+    fn = CrossTokenizerDistillationLossFn(cast(Any, _cfg([None], vts=[VS])))
+
+    original = lf.vocab_parallel_gather_columns
+    lf.vocab_parallel_gather_columns = gather
+    try:
+        loss, _ = fn(
+            _data(), torch.tensor(3.0), torch.tensor(3.0),
+            logits, logits, {0: teacher}, {0: _same_align()},
+        )
+        loss.backward()
+    finally:
+        lf.vocab_parallel_gather_columns = original
+    assert logits.grad is not None
+    return loss.detach().clone(), logits.grad.clone()
+
+
+def test_direct_topk_kl_matches_the_full_vocab_log_softmax_route(tmp_path):
+    """#3314 is a memory change; loss and gradient must be unmoved.
+
+    The reference reproduces the pre-change code exactly: full-vocab
+    log-softmax, slice to the top-k columns, renormalize within the subset.
+    Returning raw logits instead is only valid because the full-vocab partition
+    function cancels in that renormalization.
+    """
+    from dockyard_rl.distributed.model_utils import (
+        vocab_parallel_full_log_softmax,
+        vocab_parallel_gather_columns,
+    )
+
+    def reference(logits, columns, *, tp_group=None):
+        # The old route, expressed so its output feeds the same log_softmax the
+        # new call site applies: renormalized subset log-probs are a valid set
+        # of "logits" up to the constant that log_softmax removes.
+        log_probs = vocab_parallel_full_log_softmax(logits, 1.0, tp_group=tp_group)
+        gathered = log_probs[..., columns]
+        return gathered - torch.logsumexp(gathered, dim=-1, keepdim=True)
+
+    ref_loss, ref_grad = _topk_kl_loss_and_grad(gather=reference)
+    got_loss, got_grad = _topk_kl_loss_and_grad(gather=vocab_parallel_gather_columns)
+
+    torch.testing.assert_close(got_loss, ref_loss)
+    torch.testing.assert_close(got_grad, ref_grad)
+
+
 def test_averaged_logits_two_same_tokenizer(tmp_path):
     fn = CrossTokenizerDistillationLossFn(
         _cfg([None, None], vts=[VS, VS], weights=[0.7, 0.3], kd_loss_mode="averaged_logits")
