@@ -150,8 +150,27 @@ def save_checkpoint(
             raise ValueError(
                 "tokenizer_path must be provided when saving tokenizer state"
             )
-        print(f"Saving tokenizer (or processor) to {tokenizer_path}")
-        tokenizer.save_pretrained(tokenizer_path)
+        # save_pretrained is not collective: it writes rank-independent
+        # filenames, so every rank wrote the same files to the same path. It is
+        # also non-atomic -- open(O_TRUNC), write, read back -- so N-1 redundant
+        # writers race the same inodes. On a hard-mounted NFS share that
+        # presents as a hang at checkpoint time rather than as corruption.
+        #
+        # Deliberately NOT applied to the dcp.save calls above. Those are
+        # collective and rank-disjoint; a rank-0 guard there would drop every
+        # other rank's shard and deadlock the collective.
+        #
+        # The barrier is symmetric because tokenizer is passed uniformly by the
+        # caller (dtensor_policy_worker.py:2131 forwards self.tokenizer, set
+        # identically on every rank at construction), so all ranks reach it.
+        distributed = torch.distributed.is_initialized()
+        if not distributed or torch.distributed.get_rank() == 0:
+            print(f"Saving tokenizer (or processor) to {tokenizer_path}")
+            tokenizer.save_pretrained(tokenizer_path)
+        if distributed:
+            # No rank returns before the tokenizer is fully on disk, so a caller
+            # cannot mark the checkpoint complete while rank 0 is still writing.
+            torch.distributed.barrier()
 
 def load_checkpoint(
     model: torch.nn.Module,
