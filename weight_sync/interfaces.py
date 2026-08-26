@@ -143,19 +143,34 @@ def _invalidate_kv_cache_after_refit(
             "may reuse KV blocks computed with the previous weights.",
             transport,
         )
-        return
+    else:
+        invalidate = getattr(generation, "invalidate_kv_cache", None)
+        if invalidate is None:
+            logger.warning(
+                "Generation backend exposes no invalidate_kv_cache(); KV blocks "
+                "from the previous weights may be reused after %s weight sync.",
+                transport,
+            )
+        elif not invalidate():
+            logger.warning(
+                "KV cache invalidation reported failure after %s weight sync.",
+                transport,
+            )
 
-    invalidate = getattr(generation, "invalidate_kv_cache", None)
-    if invalidate is None:
+    # The multimodal encoder cache is the second piece of weight-dependent
+    # state a refit invalidates. Cached vision embeddings come from the
+    # pre-refit vision tower; vLLM clears them inside its own reload_weights,
+    # which this refit path bypasses, so a VLM run would serve embeddings from
+    # the initial weights indefinitely while the language model advanced.
+    #
+    # Separate from the KV flag on purpose: recompute_kv_cache_after_weight_updates
+    # is about prefix-cache reuse, and there is no configuration under which
+    # serving embeddings from superseded weights is wanted. Backends without
+    # the method (SGLang) are skipped silently rather than warned about, since
+    # for them it is not a gap.
+    reset_encoder = getattr(generation, "invalidate_encoder_cache", None)
+    if reset_encoder is not None and not reset_encoder():
         logger.warning(
-            "Generation backend exposes no invalidate_kv_cache(); KV blocks "
-            "from the previous weights may be reused after %s weight sync.",
-            transport,
-        )
-        return
-
-    if not invalidate():
-        logger.warning(
-            "KV cache invalidation reported failure after %s weight sync.",
+            "Encoder cache invalidation reported failure after %s weight sync.",
             transport,
         )

@@ -416,6 +416,34 @@ class VllmGeneration(GenerationInterface):
             logger.warning("KV cache invalidation failed: %s", exc)
             return False
 
+    def invalidate_encoder_cache(self) -> bool:
+        """Reset vLLM's multimodal encoder cache on all workers.
+
+        Must be called after each weight update: cached vision embeddings were
+        produced by the pre-refit vision tower, and vLLM only clears them
+        inside its own reload_weights, which dockyard's refit path bypasses.
+        Without this a VLM run serves embeddings from the initial weights for
+        the entire run while the language model keeps advancing.
+
+        A no-op on text-only models rather than an error -- the scheduler
+        always builds an encoder_cache_manager.
+        """
+        method = (
+            "reset_encoder_cache_async"
+            if self.cfg["vllm_cfg"].get("async_engine", False)
+            else "reset_encoder_cache"
+        )
+        futures = self.worker_group.run_all_workers_single_data(
+            method,
+            run_rank_0_only_axes=None,
+        )
+        try:
+            results = ray.get(futures, timeout=60)
+            return all(r is not False for r in results)
+        except Exception as exc:
+            logger.warning("Encoder cache invalidation failed: %s", exc)
+            return False
+
     # GenerationInterface: weight sync
     def prepare_refit_info(
         self,

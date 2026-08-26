@@ -817,6 +817,23 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
         gc.collect()
         torch.cuda.empty_cache()
 
+    def reset_encoder_cache(self) -> None:
+        """Drop cached multimodal encoder outputs.
+
+        Vision embeddings are computed from the vision tower's weights, so a
+        refit makes every cached entry stale. vLLM clears this itself inside
+        its own reload_weights; dockyard's refit path does not go through that,
+        so the dependent cache has to be told explicitly.
+
+        Safe on text-only models: the scheduler always constructs an
+        encoder_cache_manager (v1/core/sched/scheduler.py:235-240), so the
+        reset is a no-op rather than an error.
+        """
+        assert self.llm is not None
+        if self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError("Use reset_encoder_cache_async.")
+        self.llm.llm_engine.reset_encoder_cache()
+
     def sleep(self) -> None:
         assert self.llm is not None
         if self.cfg["vllm_cfg"]["async_engine"]:

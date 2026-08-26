@@ -679,6 +679,12 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         gc.collect()
         torch.cuda.empty_cache()
 
+    def reset_encoder_cache_async(self) -> None:
+        """Drop cached multimodal encoder outputs. See the sync twin."""
+        async def _inner():
+            await self.llm.reset_encoder_cache()
+        self._run_async(_inner())
+
     def sleep_async(self) -> None:
         async def _inner():
             await self.llm.reset_prefix_cache()
