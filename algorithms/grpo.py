@@ -9,6 +9,7 @@ Entry points:
 
 import gc
 import os
+import pickle
 import sys
 import time
 import warnings
@@ -2512,11 +2513,38 @@ def async_grpo_train(
     if _resume_path is not None:
         _buffer_ckpt = os.path.join(_resume_path, "replay_buffer.pt")
         if os.path.exists(_buffer_ckpt):
-            ray.get(
-                replay_buffer.load_state_dict.remote(  # type: ignore[union-attr]
-                    torch.load(_buffer_ckpt, weights_only=False)
+            # torch.load defaults to weights_only=True, which refuses arbitrary
+            # pickle; keep that default rather than opting out. A checkpoint
+            # directory is normally a shared filesystem -- save_checkpoint's own
+            # rank-0 guard exists because of NFS -- so anyone able to drop a
+            # replay_buffer.pt there would otherwise get code execution in the
+            # trainer at resume, from a file the trainer opens automatically.
+            # The sibling load of train_dataloader.pt (:299) already relies on
+            # the safe default, and this now matches it.
+            #
+            # BatchedDataDict is the only non-primitive the buffer stores:
+            # SequencePackingArgs is a TypedDict and pickles as a plain dict,
+            # and data-plane entries are refused at save time. Allowlisting that
+            # one class is enough to load a genuine checkpoint.
+            torch.serialization.add_safe_globals([BatchedDataDict])
+            try:
+                _buffer_state = torch.load(_buffer_ckpt)
+            except pickle.UnpicklingError as exc:
+                # Refuse rather than retrying with the protection off: a buffer
+                # holding an unexpected type is either a format change or a
+                # tampered file, and neither is worth executing.
+                warnings.warn(
+                    f"Replay buffer checkpoint {_buffer_ckpt} could not be "
+                    f"loaded under the safe unpickler ({exc}); resuming with an "
+                    "empty buffer. Buffered trajectories are lost, but training "
+                    "is otherwise unaffected.",
+                    stacklevel=2,
                 )
-            )
+                _buffer_state = None
+            if _buffer_state is not None:
+                ray.get(
+                    replay_buffer.load_state_dict.remote(_buffer_state)  # type: ignore[union-attr]
+                )
         else:
             # Checkpoints written before replay-buffer persistence existed.
             print(

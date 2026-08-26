@@ -233,3 +233,80 @@ class TestTheTwoHalvesAgree:
             "the in-flight fourth, so the fourth is regenerated and the first "
             "three are not trained on twice"
         )
+
+
+class _NotAllowlisted:
+    """Stands in for any type the safe unpickler has not been told to allow."""
+
+
+class TestBufferCheckpointsLoadUnderTheSafeUnpickler:
+    """The resume path must not opt out of torch's weights_only default.
+
+    grpo.py opens replay_buffer.pt automatically on resume. torch.load defaults
+    to weights_only=True, which refuses arbitrary pickle; the first version of
+    this code passed weights_only=False, which turns any writable checkpoint
+    directory into code execution in the trainer. Checkpoint directories are
+    normally shared filesystems -- save_checkpoint's rank-0 guard exists because
+    of NFS -- so that is a reachable position, not a theoretical one.
+
+    The sibling load of train_dataloader.pt (grpo.py:299) always relied on the
+    safe default. These tests pin that the buffer load matches it.
+    """
+
+    def test_a_real_buffer_state_loads_under_the_safe_unpickler(self, tmp_path):
+        """The allowlist has to actually cover what the buffer stores."""
+        torch = pytest.importorskip("torch")
+        from dockyard_rl.distributed.batched_data_dict import BatchedDataDict
+
+        buf = _buffer()
+        buf.add(
+            {
+                "batch": BatchedDataDict({"input_ids": torch.ones(2, 3)}),
+                "rollout_metrics": {"n": 1},
+            },
+            weight_version=0,
+            target_weight_version=1,
+        )
+        path = tmp_path / "replay_buffer.pt"
+        torch.save(buf.state_dict(), path)
+
+        torch.serialization.add_safe_globals([BatchedDataDict])
+        state = torch.load(path)  # no weights_only=False
+
+        restored = _buffer()
+        assert restored.load_state_dict(state) is True
+        assert restored.size() == 1
+
+    def test_an_arbitrary_class_is_refused(self, tmp_path):
+        """A payload the allowlist does not cover must not be unpickled.
+
+        _NotAllowlisted is module-level because a class defined inside a test
+        cannot be pickled at all -- saving it would fail for the wrong reason
+        and the test would pass without exercising the unpickler.
+        """
+        torch = pytest.importorskip("torch")
+        import pickle
+
+        path = tmp_path / "hostile.pt"
+        torch.save({"persisted": True, "trajectories": [_NotAllowlisted()]}, path)
+
+        with pytest.raises(pickle.UnpicklingError):
+            torch.load(path)
+
+    def test_the_resume_path_does_not_disable_the_safe_unpickler(self):
+        """Source-level guard: weights_only=False must not come back."""
+        from pathlib import Path
+
+        src = Path(
+            "algorithms/grpo.py"
+        ).read_text() if Path("algorithms/grpo.py").exists() else None
+        if src is None:  # running from another cwd
+            import dockyard_rl.algorithms.grpo as grpo_mod
+
+            src = Path(grpo_mod.__file__).read_text()
+
+        assert "replay_buffer.pt" in src
+        assert "weights_only=False" not in src, (
+            "the resume path re-disabled torch's safe unpickler; a writable "
+            "checkpoint directory then means code execution in the trainer"
+        )
