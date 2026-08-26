@@ -41,7 +41,25 @@ def build_data_plane_client(
 
     impl = cfg["impl"]
     if impl == "transfer_queue":
-        from dockyard_rl.data_plane.adapters.transfer_queue import TQDataPlaneClient
+        try:
+            from dockyard_rl.data_plane.adapters.transfer_queue import (
+                TQDataPlaneClient,
+            )
+        except ImportError as exc:
+            # The adapter imports transfer_queue and tensordict at module
+            # level. Neither, nor mooncake, is in ubuntu-base/pyproject.toml
+            # or uv.lock, so in the shipped image this surfaces as a bare
+            # ModuleNotFoundError from inside an adapter rather than as a
+            # statement about the deployment.
+            raise RuntimeError(
+                "data_plane.impl='transfer_queue' needs the transfer_queue "
+                "and tensordict packages (and mooncake for the mooncake_cpu "
+                "backend) in the worker's system Python. The ubuntu-swe image "
+                "does not carry them today -- see ubuntu-base/pyproject.toml. "
+                "Use data_plane.impl='noop' for a single-process run, or add "
+                "the packages to the image. "
+                f"Underlying import error: {exc}"
+            ) from exc
 
         client: DataPlaneClient = TQDataPlaneClient(cfg, bootstrap=bootstrap)
     elif impl == "noop":

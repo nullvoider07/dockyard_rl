@@ -4,19 +4,28 @@ Pure plumbing — it owns the TQ controller / client handle and translates
 :class:`KVBatchMeta` ↔ TQ's own ``BatchMeta`` / ``KVBatchMeta``. No business
 logic.
 
-``transfer_queue`` (and ``mooncake`` for the ``mooncake_cpu`` backend) is baked
-into the ``ubuntu-swe`` image's system Python (convention: no runtime venvs / no
-Ray ``runtime_env`` pip), so TQ's Ray actors inherit it from the job env — the
-upstream's per-actor ``runtime_env`` pip-injection workaround is intentionally
-NOT carried over here.
+``transfer_queue`` (and ``mooncake`` for the ``mooncake_cpu`` backend) must be
+present in the ``ubuntu-swe`` image's system Python (convention: no runtime venvs
+/ no Ray ``runtime_env`` pip), so TQ's Ray actors inherit it from the job env —
+the upstream's per-actor ``runtime_env`` pip-injection workaround is
+intentionally NOT carried over here.
+
+**Neither is in the image today.** ``ubuntu-base/pyproject.toml`` and
+``ubuntu-base/uv.lock`` carry no ``transfer_queue``, ``mooncake`` or
+``tensordict``, directly or transitively, so this module cannot import there.
+That is inert rather than broken — nothing imports it unless
+``data_plane.enabled`` is set, and no shipped config sets it (``grpo.py``'s
+``getattr(master_config, "data_plane", None)`` is always ``None``) — but
+enabling the plane needs the image to carry them first, and the versions have
+to be resolved against this adapter's API rather than guessed.
 """
 
 from __future__ import annotations
 
 import ipaddress
+import logging
 import os
 import socket
-import subprocess
 import time
 from importlib import resources
 from typing import Any
@@ -30,6 +39,9 @@ from dockyard_rl.data_plane.interfaces import (
     DataPlaneConfig,
     KVBatchMeta,
 )
+from dockyard_rl.data_plane.rdma import _mooncake_transport_config
+
+logger = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────────────────────────────────
 # Backend init.
@@ -59,33 +71,6 @@ def _get_local_node_ip() -> str:
         return ip
     except Exception:
         return ""
-
-
-def _mooncake_transport_config() -> dict:
-    protocol = os.environ.get("MC_MOONCAKE_PROTOCOL", "tcp")
-    if protocol != "rdma":
-        return {"protocol": "tcp"}
-    device = os.environ.get("MC_MOONCAKE_DEVICE", "")
-    if not device:
-        try:
-            out = subprocess.run(
-                [
-                    "sh",
-                    "-c",
-                    "for d in /sys/class/infiniband/mlx5_*/ports/1/link_layer; do "
-                    "  test -f $d && grep -q Ethernet $d && basename $(dirname $(dirname $d)); "
-                    "done | head -1",
-                ],
-                check=False,
-                capture_output=True,
-                text=True,
-            ).stdout.strip()
-            device = out or ""
-        except Exception:
-            device = ""
-    if device:
-        os.environ.setdefault("MC_GID_INDEX", os.environ.get("MC_GID_INDEX", "3"))
-    return {"protocol": "rdma", "device_name": device}
 
 
 def _connect_existing() -> None:
