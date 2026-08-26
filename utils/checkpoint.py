@@ -267,22 +267,9 @@ class CheckpointManager:
             else None
         )
 
-        if self.metric_name is None:
-            checkpoint_history.sort(key=lambda x: x[0], reverse=True)
-        else:
-            # Cast to str because the 'else' branch guarantees self.metric_name is not None
-            metric_key = cast(str, self.metric_name)
-            if self.higher_is_better:
-                # higher metric values first, then higher step numbers for ties
-                checkpoint_history.sort(
-                    key=lambda x: (x[2].get(metric_key, -float("inf")), x[0]),
-                    reverse=True,
-                )
-            else:
-                # lower metric values first, then higher step numbers for equal values
-                checkpoint_history.sort(
-                    key=lambda x: (x[2].get(metric_key, float("inf")), -x[0])
-                )
+        _sort_checkpoints_best_first(
+            checkpoint_history, self.metric_name, self.higher_is_better
+        )
 
         for checkpoint in checkpoint_history[self.keep_top_k :]:
             if exclude_latest and checkpoint[0] == latest_step:
@@ -331,9 +318,8 @@ class CheckpointManager:
             )
             return self.get_latest_checkpoint_path()
 
-        # FIX: Reference local metric_key instead of self.metric_name inside lambda
-        valid_checkpoints.sort(
-            key=lambda x: x[2][metric_key], reverse=self.higher_is_better
+        _sort_checkpoints_best_first(
+            valid_checkpoints, metric_key, self.higher_is_better
         )
         return str(valid_checkpoints[0][1])
 
@@ -372,6 +358,42 @@ class CheckpointManager:
             return None
         with open(Path(checkpoint_path) / "training_info.json", "r") as f:
             return json.load(f)
+
+def _sort_checkpoints_best_first(
+    checkpoint_history: list[tuple[int, PathLike, dict[str, Any]]],
+    metric_name: Optional[str],
+    higher_is_better: bool,
+) -> None:
+    """Order a checkpoint history best-first, in place.
+
+    Shared by remove_old_checkpoints and get_best_checkpoint_path so retention
+    and selection cannot disagree. They previously ordered differently:
+    retention sorted on the tuple (metric, step) -- the recency tiebreak its
+    docstring promises -- while selection sorted on the metric alone. Ties then
+    resolved by whatever order _load_checkpoint_history returned, which is
+    glob.glob order, so selection could name a checkpoint retention had already
+    deleted, and could return a different one on a different filesystem.
+
+    Entries missing the metric sort last under either direction.
+
+    Args:
+        checkpoint_history: (step, path, info) tuples; reordered in place.
+        metric_name: Metric to rank by, or None to rank by step.
+        higher_is_better: Whether a larger metric value is better.
+    """
+    if metric_name is None:
+        checkpoint_history.sort(key=lambda x: x[0], reverse=True)
+    elif higher_is_better:
+        # higher metric values first, then higher step numbers for ties
+        checkpoint_history.sort(
+            key=lambda x: (x[2].get(metric_name, -float("inf")), x[0]),
+            reverse=True,
+        )
+    else:
+        # lower metric values first, then higher step numbers for equal values
+        checkpoint_history.sort(
+            key=lambda x: (x[2].get(metric_name, float("inf")), -x[0])
+        )
 
 def _load_checkpoint_history(
     checkpoint_dir: Path,
