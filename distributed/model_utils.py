@@ -1819,20 +1819,55 @@ class ChunkedDistributedEntropy(torch.autograd.Function):
 def from_parallel_hidden_states_to_logprobs(
     tensor_parallel_hidden_states: torch.Tensor,
     output_weight_layer: torch.Tensor,
-    runtime_gather_output: Optional[bool],
     target: torch.Tensor,
     vocab_start_index: int,
     vocab_end_index: int,
     tp_group: torch.distributed.ProcessGroup,
+    chunk_size: int,
     inference_only: bool = False,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
-    chunk_size: Optional[int] = None,
 ) -> torch.Tensor:
-    """Get log probabilities from TP sharded hidden states."""
+    """Log probabilities straight from TP-sharded hidden states (linear-CE fusion).
+
+    Fuses the output projection into the chunked log-softmax so the
+    ``[B, S, V]`` logits are never materialized -- the activation-memory win
+    that motivates it.
+
+    **This has no call site in the tree.** The contract below is stated because
+    it is not dockyard's own layout, and wiring it is a port rather than a
+    connection:
+
+    * ``tensor_parallel_hidden_states`` is **sequence-first**, ``[S, B, H]``,
+      and sequence-parallel sharded over ``tp_group`` -- the implementation
+      chunks ``shape[0]`` and all-gathers dim 0. dockyard's DTensor workers hand
+      HF models ``[B, S]`` and get ``[B, S, H]`` back, with the vocab (not the
+      sequence) sharded at the output projection, so a caller has to transpose
+      and reshard first.
+    * ``target`` is ``[B, S]`` global token ids; it is next-token shifted here,
+      so callers must pass unshifted ids.
+    * Context parallelism is unsupported.
+
+    ``chunk_size`` is required. It was ``Optional[int]`` with a ``None``
+    default while the implementation divides by it unconditionally, so the
+    documented default raised TypeError inside the autograd function. A
+    ``runtime_gather_output`` parameter was accepted and read by nothing; it is
+    removed rather than left as a value a caller could believe in.
+    """
+    if chunk_size is None or chunk_size <= 0:
+        raise ValueError(
+            f"chunk_size must be a positive int, got {chunk_size!r}; the "
+            "chunked log-softmax divides the sequence by it."
+        )
+    if tensor_parallel_hidden_states.dim() != 3:
+        raise ValueError(
+            "tensor_parallel_hidden_states must be [S, B, H] (sequence-first), "
+            f"got shape {tuple(tensor_parallel_hidden_states.shape)}"
+        )
     target = target.roll(shifts=-1, dims=-1)
-    assert cp_group is None or torch.distributed.get_world_size(cp_group) == 1, (
-        "Context parallelism is not supported for linear CE fusion loss"
-    )
+    if cp_group is not None and torch.distributed.get_world_size(cp_group) > 1:
+        raise ValueError(
+            "context parallelism is not supported by the linear-CE fusion path"
+        )
     logprobs: torch.Tensor = ChunkedDistributedHiddenStatesToLogprobs.apply(  # type: ignore
         tensor_parallel_hidden_states,
         target,
