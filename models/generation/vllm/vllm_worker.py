@@ -71,6 +71,46 @@ def _is_vllm_v1_engine_enabled() -> bool:
     return os.environ.get("VLLM_USE_V1", "1") != "0"
 
 # Base worker
+def merge_fp8_kwargs(
+    vllm_kwargs: dict[str, Any], fp8_kwargs: dict[str, Any]
+) -> None:
+    """Fold init_fp8's kwargs into vllm_kwargs without discarding hf_overrides.
+
+    init_fp8 returns its own ``hf_overrides`` carrying ``quantization_config``.
+    A plain ``dict.update`` replaced whatever the user configured through
+    ``policy.hf_config_overrides`` (plumbed at grpo.py:641) with that single
+    key, and did so silently -- the normalization further down only substitutes
+    ``{}`` for a non-dict value and never restores what was dropped.
+
+    ``hf_overrides`` is merged key-wise instead. fp8's values win on the keys it
+    sets, because fp8 cannot load without them, and any collision is logged
+    rather than applied quietly. Every other fp8 kwarg still overwrites, which
+    is intended: ``quantization`` and ``kv_cache_dtype`` are fp8's to decide.
+
+    Upstream reintroduced this same clobber once after fixing it (#1413 ->
+    #2904), which is why the behaviour is pinned by tests.
+
+    Args:
+        vllm_kwargs: Engine kwargs, mutated in place.
+        fp8_kwargs: Kwargs returned by init_fp8. Not mutated.
+    """
+    fp8_kwargs = dict(fp8_kwargs)
+    fp8_overrides = fp8_kwargs.pop("hf_overrides", {})
+    vllm_kwargs.update(fp8_kwargs)
+
+    existing = vllm_kwargs.get("hf_overrides")
+    merged = dict(existing) if isinstance(existing, dict) else {}
+    clobbered = sorted(set(merged) & set(fp8_overrides))
+    if clobbered:
+        logger.warning(
+            "fp8 quantization overrides hf_config_overrides key(s) %s; "
+            "fp8 requires its own values for these.",
+            ", ".join(clobbered),
+        )
+    merged.update(fp8_overrides)
+    vllm_kwargs["hf_overrides"] = merged
+
+
 class BaseVllmGenerationWorker:
     """Shared base for synchronous and asynchronous vLLM generation workers.
 
@@ -346,7 +386,7 @@ class BaseVllmGenerationWorker:
                 fp8_kwargs = init_fp8(
                     self.cfg["vllm_cfg"], self.model_name, model_parallel_size
                 )
-                vllm_kwargs.update(fp8_kwargs)
+                merge_fp8_kwargs(vllm_kwargs, fp8_kwargs)
                 self.precision = "bfloat16"
             except ImportError:
                 logger.warning(
