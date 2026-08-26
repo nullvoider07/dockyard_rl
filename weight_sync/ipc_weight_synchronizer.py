@@ -8,6 +8,8 @@ Lifecycle per sync:
   2. generation.prepare_for_generation(tags=["weights"])  -- allocate buffers
   3. policy.stream_weights_via_ipc_zmq()                  -- send via ZMQ
      generation.update_weights_via_ipc_zmq()              -- receive
+     generation.invalidate_kv_cache()                     -- drop KV blocks
+        computed with the pre-refit weights
   4. policy.offload_after_refit()                         -- restore optimizer state
   5. generation.prepare_for_generation(tags=["kv_cache"]) -- rebuild KV cache
 """
@@ -19,7 +21,10 @@ from typing import Any, Optional
 import ray
 
 from dockyard_rl.utils.timer import Timer
-from dockyard_rl.weight_sync.interfaces import WeightSynchronizer
+from dockyard_rl.weight_sync.interfaces import (
+    WeightSynchronizer,
+    _invalidate_kv_cache_after_refit,
+)
 
 
 class IPCWeightSynchronizer(WeightSynchronizer):
@@ -34,6 +39,8 @@ class IPCWeightSynchronizer(WeightSynchronizer):
         refit_buffer_size_gb: Fixed staging-buffer size in GB. If None, sized
             dynamically from free GPU memory and
             DOCKYARD_REFIT_BUFFER_MEMORY_RATIO.
+        recompute_kv_cache: Whether to drop the generation KV cache after a
+            weight update. From grpo.async_grpo.recompute_kv_cache_after_weight_updates.
     """
 
     def __init__(
@@ -41,10 +48,12 @@ class IPCWeightSynchronizer(WeightSynchronizer):
         policy: Any,
         generation: Any,
         refit_buffer_size_gb: Optional[int] = None,
+        recompute_kv_cache: bool = True,
     ):
         self._policy = policy
         self._generation = generation
         self._refit_buffer_size_gb = refit_buffer_size_gb
+        self._recompute_kv_cache = recompute_kv_cache
         self._stale = True
 
     def sync_weights(
@@ -82,6 +91,10 @@ class IPCWeightSynchronizer(WeightSynchronizer):
                         "usually indicates an issue with cuda-ipc or the vLLM "
                         "worker."
                     )
+
+                _invalidate_kv_cache_after_refit(
+                    self._generation, self._recompute_kv_cache, "IPC/ZMQ"
+                )
             sync_succeeded = True
         finally:
             self._policy.offload_after_refit()

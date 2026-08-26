@@ -20,10 +20,13 @@ heterogeneous weight ages are tracked at the sample level (the replay buffer's
 target_weight_versions), not at the synchronizer level.
 """
 
+import logging
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Any, Optional
 
 from dockyard_rl.utils.timer import Timer
+
+logger = logging.getLogger(__name__)
 
 
 class WeightSynchronizer(ABC):
@@ -103,3 +106,56 @@ class WeightSynchronizer(ABC):
     def shutdown(self) -> None:
         """Release all communication resources."""
         ...
+
+
+def _invalidate_kv_cache_after_refit(
+    generation: Any, recompute_kv_cache: bool, transport: str
+) -> None:
+    """Drop KV blocks computed with the pre-refit weights.
+
+    Shared by the two vLLM transports (collective, IPC). The HTTP/SGLang
+    transport invalidates before its transfer instead, and unconditionally,
+    because that call is SGLang's *only* flush: its finish_generation
+    deliberately preserves the prefix cache between rollout batches to keep
+    RadixAttention warm (sglang_generation.py:439).
+
+    vLLM's finish_generation does invalidate on every batch, which covers the
+    synchronous training loop -- there, sync_weights runs on an already-empty
+    cache and this call is a no-op. It does not cover the asynchronous loop:
+    that cycle is prepare_for_refit -> sync_weights -> resume_after_refit
+    (grpo.py:2885-2896) with no finish_generation, so generation resumed on a
+    cache built from the previous weights. That is the gap this closes, and it
+    is why the config key lives in AsyncGRPOConfig.
+
+    Failure is logged, not raised: the weights are already in place, and
+    aborting the step would leave the engine mid-refit. A stale cache degrades
+    sample quality; a half-applied refit breaks the run.
+
+    Args:
+        generation: Generation object exposing invalidate_kv_cache().
+        recompute_kv_cache: Whether invalidation is enabled for this run.
+        transport: Transport name, for log messages.
+    """
+    if not recompute_kv_cache:
+        logger.warning(
+            "Skipping KV cache invalidation after %s weight sync "
+            "(recompute_kv_cache_after_weight_updates is false). Generation "
+            "may reuse KV blocks computed with the previous weights.",
+            transport,
+        )
+        return
+
+    invalidate = getattr(generation, "invalidate_kv_cache", None)
+    if invalidate is None:
+        logger.warning(
+            "Generation backend exposes no invalidate_kv_cache(); KV blocks "
+            "from the previous weights may be reused after %s weight sync.",
+            transport,
+        )
+        return
+
+    if not invalidate():
+        logger.warning(
+            "KV cache invalidation reported failure after %s weight sync.",
+            transport,
+        )

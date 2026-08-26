@@ -8,6 +8,8 @@ Lifecycle per sync:
   1. policy.broadcast_weights_for_collective()    -- send via NCCL
      generation.update_weights_from_collective()  -- receive via NCCL
   2. Verify transfer success
+  3. generation.invalidate_kv_cache()             -- drop KV blocks computed
+                                                     with the pre-refit weights
 
 No offload/restore is needed: policy and generation run on separate GPUs with
 dedicated memory.
@@ -19,7 +21,10 @@ from typing import Any, Optional
 import ray
 
 from dockyard_rl.utils.timer import Timer
-from dockyard_rl.weight_sync.interfaces import WeightSynchronizer
+from dockyard_rl.weight_sync.interfaces import (
+    WeightSynchronizer,
+    _invalidate_kv_cache_after_refit,
+)
 
 
 class CollectiveWeightSynchronizer(WeightSynchronizer):
@@ -36,6 +41,8 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         inference_world_size: World size of the inference fleet. Provided
             explicitly (computed as inference_nodes * inference_gpus_per_node)
             to match the trainer/inference rendezvous layout exactly.
+        recompute_kv_cache: Whether to drop the generation KV cache after a
+            weight update. From grpo.async_grpo.recompute_kv_cache_after_weight_updates.
     """
 
     def __init__(
@@ -44,11 +51,13 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         generation: Any,
         train_cluster: Any,
         inference_world_size: int,
+        recompute_kv_cache: bool = True,
     ):
         self._policy = policy
         self._generation = generation
         self._train_cluster = train_cluster
         self._inference_world_size = inference_world_size
+        self._recompute_kv_cache = recompute_kv_cache
         self._stale = True
 
     def sync_weights(
@@ -78,6 +87,10 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
                     "usually indicates an issue with the NCCL process group or "
                     "the generation backend worker."
                 )
+
+            _invalidate_kv_cache_after_refit(
+                self._generation, self._recompute_kv_cache, "collective"
+            )
 
         self._stale = False
 

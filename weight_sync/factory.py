@@ -28,6 +28,7 @@ def create_weight_synchronizer(
     train_cluster: Optional[Any] = None,
     inference_world_size: Optional[int] = None,
     refit_buffer_size_gb: Optional[int] = None,
+    recompute_kv_cache: bool = True,
 ) -> WeightSynchronizer:
     """Create the WeightSynchronizer for the given deployment.
 
@@ -40,6 +41,11 @@ def create_weight_synchronizer(
         inference_world_size: Inference-fleet world size (required for
             non-colocated; computed as inference_nodes * inference_gpus_per_node).
         refit_buffer_size_gb: Optional fixed IPC staging buffer size in GB.
+        recompute_kv_cache: Whether the vLLM transports drop the generation KV
+            cache after a weight update, from
+            grpo.async_grpo.recompute_kv_cache_after_weight_updates. The
+            SGLang/HTTP transport ignores it and always invalidates -- that
+            call is SGLang's only flush.
 
     Returns:
         A WeightSynchronizer for the deployment topology.
@@ -76,6 +82,7 @@ def create_weight_synchronizer(
             generation=generation,
             train_cluster=train_cluster,
             inference_world_size=inference_world_size,
+            recompute_kv_cache=recompute_kv_cache,
         )
 
     if generation_backend == SGLANG_BACKEND:
@@ -96,4 +103,5 @@ def create_weight_synchronizer(
         policy=policy,
         generation=generation,
         refit_buffer_size_gb=refit_buffer_size_gb,
+        recompute_kv_cache=recompute_kv_cache,
     )

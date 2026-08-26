@@ -688,6 +688,9 @@ def setup(
         train_cluster=train_cluster,
         inference_world_size=inference_nodes * inference_gpus_per_node,
         refit_buffer_size_gb=generation_config.get("refit_buffer_size_gb"),
+        recompute_kv_cache=master_config.grpo.get("async_grpo", {}).get(
+            "recompute_kv_cache_after_weight_updates", True
+        ),
     )
     weight_synchronizer.init_communicator()
     if not colocated_inference:
