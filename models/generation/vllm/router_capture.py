@@ -15,7 +15,8 @@ once per process by :func:`routed_experts_from_vllm_output` rather than being
 hidden behind a ``getattr`` default.
 
 This module aligns that per-token routing onto the trainer's right-padded layout
-``[padded_length, L, topk]`` so it can ride the rollout data dict and be
+``[padded_length, L, topk]``, carrying the backend's own integer width, so it
+can ride the rollout data dict and be
 replayed in the trainer's MoE forward, removing the router-nondeterminism
 component of the train/generation logprob mismatch.
 
@@ -52,9 +53,45 @@ _PROMPT_ROUTING_ABSENCE_REPORTED = False
 ArrayLike = Union[torch.Tensor, np.ndarray, list]
 
 
-def _as_int32(x: ArrayLike, device: Optional[torch.device]) -> torch.Tensor:
-    """Coerce a routed-experts array (int16 ndarray / tensor / list) to int32."""
-    return torch.as_tensor(x, dtype=torch.int32, device=device)
+# Widest fallback when the source carries no usable integer dtype of its own.
+ROUTED_EXPERTS_FALLBACK_DTYPE = torch.int32
+
+
+def _route_dtype(x: ArrayLike) -> torch.dtype:
+    """The dtype an aligned route should carry for this source.
+
+    vLLM returns ``routed_experts`` as int16; widening every capture to int32
+    doubled a column that is ``[padded_length, L, topk]`` per sample and rides
+    the rollout data dict through the object store. Nothing needs the extra
+    width: the only consumer, ``MoERouter._replayed_topk_ids``, casts to
+    ``torch.long`` before indexing.
+
+    The source dtype is carried through when it is a *signed* integer type --
+    ``MISSING_ROUTE_SENTINEL`` is -1, so an unsigned dtype cannot represent a
+    missing route and is widened instead. Lists and floating sources fall back
+    to int32.
+    """
+    dtype = getattr(x, "dtype", None)
+    if dtype is not None and not isinstance(dtype, torch.dtype):
+        # numpy dtype -> torch dtype, via a zero-copy empty view.
+        try:
+            dtype = torch.from_numpy(np.empty(0, dtype=dtype)).dtype
+        except TypeError:
+            dtype = None
+    if (
+        isinstance(dtype, torch.dtype)
+        and not dtype.is_floating_point
+        and not dtype.is_complex
+        and dtype != torch.bool
+        and dtype.is_signed
+    ):
+        return dtype
+    return ROUTED_EXPERTS_FALLBACK_DTYPE
+
+
+def _as_route_tensor(x: ArrayLike, device: Optional[torch.device]) -> torch.Tensor:
+    """Coerce a routed-experts array to a tensor, carrying its integer dtype."""
+    return torch.as_tensor(x, dtype=_route_dtype(x), device=device)
 
 
 def routed_experts_empty(
@@ -63,14 +100,16 @@ def routed_experts_empty(
     top_k: int,
     *,
     device: Optional[torch.device] = None,
+    dtype: torch.dtype = ROUTED_EXPERTS_FALLBACK_DTYPE,
 ) -> torch.Tensor:
-    """Identity-route ``[padded_length, num_layers, top_k]`` int32 tensor.
+    """Identity-route ``[padded_length, num_layers, top_k]`` integer tensor.
 
     The all-``arange(top_k)`` default route, used for samples/backends that
     return no routing (replay then degenerates to the trainer's own routing for
-    those samples, i.e. a no-op correction).
+    those samples, i.e. a no-op correction). ``dtype`` must match the routing
+    the rest of the batch carries, or the stack below refuses.
     """
-    default_route = torch.arange(top_k, dtype=torch.int32, device=device)
+    default_route = torch.arange(top_k, dtype=dtype, device=device)
     return (
         default_route.view(1, 1, -1)
         .expand(padded_length, num_layers, top_k)
@@ -92,7 +131,7 @@ def align_routed_expert_indices(
     Optional[torch.Tensor],
     tuple[Optional[torch.Tensor], dict[str, int]],
 ]:
-    """Align per-token routing to ``[padded_length, L, topk]`` int32.
+    """Align per-token routing to ``[padded_length, L, topk]``.
 
     Args:
         routed: vLLM ``CompletionOutput.routed_experts`` — ``[gen_tokens, L,
@@ -114,11 +153,14 @@ def align_routed_expert_indices(
         return_stats: If True, also return a route-accounting dict.
 
     Returns:
-        ``[padded_length, L, topk]`` int32 tensor (or ``None`` if no routing was
-        provided), optionally paired with a stats dict.
+        ``[padded_length, L, topk]`` integer tensor carrying the source's own
+        dtype (or ``None`` if no routing was provided), optionally paired with a
+        stats dict.
     """
-    routed_t = None if routed is None else _as_int32(routed, device)
-    prompt_t = None if prompt_routed is None else _as_int32(prompt_routed, device)
+    routed_t = None if routed is None else _as_route_tensor(routed, device)
+    prompt_t = (
+        None if prompt_routed is None else _as_route_tensor(prompt_routed, device)
+    )
 
     if prompt_t is not None and routed_t is not None:
         routed_t = torch.cat((prompt_t, routed_t), dim=0)
@@ -166,7 +208,9 @@ def align_routed_expert_indices(
 
     num_layers = int(routed_t.shape[1])
     top_k = int(routed_t.shape[2])
-    full = routed_experts_empty(padded_length, num_layers, top_k, device=device)
+    full = routed_experts_empty(
+        padded_length, num_layers, top_k, device=device, dtype=routed_t.dtype
+    )
 
     routes_to_copy = min(expected_routes, actual)
     if routes_to_copy > 0:
@@ -213,7 +257,11 @@ def stack_routed_experts(
         if t is None:
             rows.append(
                 routed_experts_empty(
-                    padded_length, num_layers, top_k, device=device
+                    padded_length,
+                    num_layers,
+                    top_k,
+                    device=device,
+                    dtype=reference.dtype,
                 )
             )
         else:
@@ -222,6 +270,14 @@ def stack_routed_experts(
                     "inconsistent aligned routed_experts shapes in batch: "
                     f"{tuple(t.shape)} vs "
                     f"{(padded_length, num_layers, top_k)}"
+                )
+            if t.dtype != reference.dtype:
+                # torch.stack type-promotes rather than refusing, which would
+                # silently widen the column back and hide a backend returning
+                # a different width for one sample.
+                raise ValueError(
+                    "inconsistent aligned routed_experts dtypes in batch: "
+                    f"{t.dtype} vs {reference.dtype}"
                 )
             rows.append(t.to(device) if device is not None else t)
     return torch.stack(rows, dim=0)

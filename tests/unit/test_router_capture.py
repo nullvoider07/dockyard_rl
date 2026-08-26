@@ -3,8 +3,8 @@
 Validates the next-token alignment of vLLM's per-token routed-expert array onto
 the trainer's right-padded sequence layout: prompt/response concatenation, the
 arange default route for the final token + padding, sentinel-marking of missing
-interior routes, the route-accounting stats, dtype coercion, and the vLLM-object
-adapter. All leaf logic, no GPU.
+interior routes, the route-accounting stats, the dtype the column carries, and
+the vLLM-object adapter. All leaf logic, no GPU.
 """
 
 from __future__ import annotations
@@ -172,13 +172,93 @@ def test_wrong_dim_raises():
         raise AssertionError("expected ValueError on 2D routing")
 
 
-def test_int16_numpy_input_coerced_to_int32():
+def _aligned(*args, **kwargs) -> torch.Tensor:
+    """`align_routed_expert_indices` narrowed to its tensor return.
+
+    The public signature is a union over `return_stats` / the no-routing case;
+    these dtype tests always take the plain-tensor branch.
+    """
+    out = align_routed_expert_indices(*args, **kwargs)
+    assert isinstance(out, torch.Tensor)
+    return out
+
+
+def test_int16_numpy_input_keeps_its_width():
+    """vLLM returns int16; widening it doubled the column for no consumer.
+
+    ``MoERouter._replayed_topk_ids`` casts to ``torch.long`` before indexing, so
+    nothing downstream needs 32 bits.
+    """
     routed = np.zeros((3, 2, 2), dtype=np.int16)
     routed[1, 0, 0] = 7
-    full = align_routed_expert_indices(routed, valid_length=4, padded_length=5)
-    assert full is not None
-    assert full.dtype == torch.int32
+    full = _aligned(routed, valid_length=4, padded_length=5)
+    assert full.dtype == torch.int16
     assert int(full[1, 0, 0]) == 7
+
+
+def test_the_default_route_matches_the_captured_width():
+    """The arange tail and the copied head are one tensor; they cannot differ."""
+    routed = np.zeros((3, 2, 2), dtype=np.int16)
+    full = _aligned(routed, valid_length=4, padded_length=6)
+    assert full.dtype == torch.int16
+    # Final token + padding take the identity route, in the same dtype.
+    assert torch.equal(
+        full[4], torch.tensor([[0, 1], [0, 1]], dtype=torch.int16)
+    )
+
+
+def test_the_missing_route_sentinel_survives_the_narrow_width():
+    """int16 is signed, so -1 round-trips; that is why unsigned is refused."""
+    routed = np.zeros((1, 2, 2), dtype=np.int16)
+    full = _aligned(routed, valid_length=5, padded_length=6)
+    assert full.dtype == torch.int16
+    assert int(full[2, 0, 0]) == MISSING_ROUTE_SENTINEL
+
+
+def test_unsigned_input_is_widened_not_carried():
+    """uint8 cannot hold -1, so carrying it would corrupt the sentinel."""
+    routed = np.zeros((1, 1, 2), dtype=np.uint8)
+    full = _aligned(routed, valid_length=4, padded_length=4)
+    assert full.dtype == torch.int32
+    assert int(full[1, 0, 0]) == MISSING_ROUTE_SENTINEL
+
+
+def test_list_input_falls_back_to_int32():
+    routed = [[[0, 1]], [[2, 3]]]
+    full = _aligned(routed, valid_length=3, padded_length=4)
+    assert full.dtype == torch.int32
+
+
+def test_int64_input_is_carried_unchanged():
+    routed = torch.zeros((2, 1, 2), dtype=torch.int64)
+    full = _aligned(routed, valid_length=3, padded_length=4)
+    assert full.dtype == torch.int64
+
+
+def test_stack_synthesizes_empties_at_the_batch_width():
+    narrow = _aligned(
+        np.zeros((2, 1, 2), dtype=np.int16), valid_length=3, padded_length=4
+    )
+    stacked = stack_routed_experts([narrow, None], padded_length=4)
+    assert stacked is not None
+    assert stacked.dtype == torch.int16
+    assert tuple(stacked.shape) == (2, 4, 1, 2)
+
+
+def test_stack_refuses_mixed_widths():
+    """torch.stack type-promotes rather than refusing, hiding the mismatch."""
+    narrow = _aligned(
+        np.zeros((2, 1, 2), dtype=np.int16), valid_length=3, padded_length=4
+    )
+    wide = _aligned(
+        np.zeros((2, 1, 2), dtype=np.int32), valid_length=3, padded_length=4
+    )
+    try:
+        stack_routed_experts([narrow, wide], padded_length=4)
+    except ValueError as e:
+        assert "dtypes" in str(e)
+    else:
+        raise AssertionError("expected ValueError on mixed routed_experts dtypes")
 
 
 def test_valid_length_one_yields_all_default():

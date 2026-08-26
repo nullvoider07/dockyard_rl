@@ -109,10 +109,13 @@ class DistributedLogprob(torch.autograd.Function):
 
         vocab_parallel_logits = vocab_parallel_logits.to(dtype=torch.float32)
 
-        log_probs = _compute_distributed_log_softmax(vocab_parallel_logits, group=group)
-        softmax_output = log_probs.exp()
+        full_log_probs = _compute_distributed_log_softmax(
+            vocab_parallel_logits, group=group
+        )
 
-        log_probs = torch.gather(log_probs, -1, masked_target.unsqueeze(-1)).squeeze(-1)
+        log_probs = torch.gather(
+            full_log_probs, -1, masked_target.unsqueeze(-1)
+        ).squeeze(-1)
         log_probs[target_mask] = 0.0
 
         torch.distributed.all_reduce(
@@ -122,8 +125,14 @@ class DistributedLogprob(torch.autograd.Function):
         )
 
         if not inference_only:
-            # only save for backward when we have inference only=False
-            ctx.save_for_backward(softmax_output, target_mask, masked_target)
+            # only save for backward when we have inference only=False.
+            # The exp() stays inside the guard: it materializes a second
+            # [B, S, V_local] fp32 tensor that only backward reads, and every
+            # shipped config sets logprob_chunk_size: null, so this class --
+            # not the chunked one -- serves the inference-only logprob pass.
+            # exp_() in place because the gather above already consumed
+            # full_log_probs, matching DistributedCrossEntropy:210.
+            ctx.save_for_backward(full_log_probs.exp_(), target_mask, masked_target)
 
         return log_probs
 
