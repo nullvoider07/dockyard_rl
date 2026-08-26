@@ -105,6 +105,7 @@ class AsyncGRPOConfig(TypedDict):
     max_trajectory_age_steps:                int
     in_flight_weight_updates:                NotRequired[bool]
     recompute_kv_cache_after_weight_updates: NotRequired[bool]
+    max_generation_failures:                 NotRequired[int]
 
 class AdvEstimatorConfig(TypedDict):
     """Configuration for advantage estimator (grpo, gdpo, or reinforce_plus_plus)."""
@@ -1089,6 +1090,35 @@ def aggregate_rollout_metrics(per_group_metrics: dict[str, list]) -> dict[str, A
         else:
             aggregated[k] = sum(v) / len(v)
     return aggregated
+
+def _raise_if_collector_unhealthy(trajectory_collector: Any) -> None:
+    """Abort the run if the async collector has stopped producing trajectories.
+
+    The collector caught every rollout exception, slept, and continued, with no
+    counter and no way for the trainer to see it. Meanwhile the trainer waits
+    for the replay buffer in its own loop. A wedged generation worker therefore
+    hung both sides silently and indefinitely -- no error, no exit, just
+    "Wait iteration N" forever.
+
+    Args:
+        trajectory_collector: The AsyncTrajectoryCollector actor handle.
+
+    Raises:
+        RuntimeError: When the collector reports consecutive failures at or
+            above max_generation_failures.
+    """
+    health = cast(dict[str, Any], ray.get(trajectory_collector.check_health.remote()))
+    if health["healthy"]:
+        return
+    raise RuntimeError(
+        "Async trajectory collection has stopped producing trajectories: "
+        f"{health['consecutive_failures']} consecutive failures "
+        f"(limit {health['max_generation_failures']}), "
+        f"{health['total_failures']} total. "
+        f"By stage: {health['failures_by_stage']}. "
+        f"By type: {health['failures_by_type']}. "
+        f"Last error: {health['last_error']}"
+    )
 
 def _route_histogram_metrics(logger, metrics: dict, step: int) -> None:
     """Route and remove every histogram/* entry from a metrics dict.
@@ -2562,6 +2592,7 @@ def async_grpo_train(
         )
         if buffer_size_current >= min_trajectories_needed:
             break
+        _raise_if_collector_unhealthy(trajectory_collector)
         time.sleep(1.0)
         wait_iterations += 1
 
@@ -2576,6 +2607,8 @@ def async_grpo_train(
             maybe_gpu_profile_step(policy, step + 1)
             if policy != policy_generation and hasattr(policy_generation, "start_gpu_profiling"):
                 maybe_gpu_profile_step(cast(Any, policy_generation), step + 1)
+
+            _raise_if_collector_unhealthy(trajectory_collector)
 
             with timer.time("total_step_time"):
                 # Sample from replay buffer

@@ -201,6 +201,26 @@ class AsyncTrajectoryCollectorImpl:
         self._stopped: bool = False
         self._gen_lock = asyncio.Lock()
 
+        # Failure accounting. Every rollout exception used to be printed, slept
+        # on, and continued, with no counter and nothing the trainer could read:
+        # a wedged generation worker spun here forever while the trainer sat in
+        # its own `while True` waiting for a buffer that would never fill
+        # (grpo.py:2557). Neither side could see the other was stuck.
+        #
+        # No lock: these are touched only from the actor's event loop -- the
+        # except blocks run there after the executor future resolves, and
+        # check_health is a Ray actor method, which the loop serialises against
+        # them.
+        _async_cfg = master_config.grpo.get("async_grpo", {})
+        self._max_generation_failures: int = int(
+            _async_cfg.get("max_generation_failures", 20)
+        )
+        self._consecutive_failures: int = 0
+        self._total_failures: int = 0
+        self._failures_by_stage: dict[str, int] = {}
+        self._failures_by_type: dict[str, int] = {}
+        self._last_error: Optional[str] = None
+
         self._dataloader: Any = None
 
         # Data-plane write path (opt-in). When master_config.data_plane is
@@ -261,6 +281,63 @@ class AsyncTrajectoryCollectorImpl:
         """Stop the collection loop."""
         self._stopped = True
 
+    def _record_failure(self, stage: str, exc: BaseException) -> None:
+        """Count one rollout-stage failure and report it.
+
+        Stage and exception type are tracked separately so the health report
+        distinguishes "generation keeps timing out" from "teacher scoring is
+        OOMing" -- the two need different operator responses, and a single
+        counter cannot tell them apart.
+        """
+        self._consecutive_failures += 1
+        self._total_failures += 1
+        self._failures_by_stage[stage] = self._failures_by_stage.get(stage, 0) + 1
+        type_name = type(exc).__name__
+        self._failures_by_type[type_name] = self._failures_by_type.get(type_name, 0) + 1
+        self._last_error = f"{stage}: {type_name}: {exc}"
+        print(
+            f"⚠️ AsyncTrajectoryCollector {stage} failed "
+            f"({self._consecutive_failures}/{self._max_generation_failures} "
+            f"consecutive): {type_name}: {exc}",
+            flush=True,
+        )
+
+    def _record_success(self) -> None:
+        """Clear the consecutive-failure streak after a completed rollout.
+
+        Consecutive rather than total is the signal that matters: a long run
+        may absorb many isolated failures and still be healthy, while a wedged
+        worker never succeeds again.
+        """
+        self._consecutive_failures = 0
+
+    def is_healthy(self) -> bool:
+        """Whether the consecutive-failure streak is still under the limit."""
+        if self._max_generation_failures <= 0:
+            return True
+        return self._consecutive_failures < self._max_generation_failures
+
+    def check_health(self) -> dict[str, Any]:
+        """Report collection health for the trainer to act on.
+
+        Called between training iterations and while waiting for the replay
+        buffer to fill. Without it a wedged collector is indistinguishable from
+        a slow one, and the run hangs instead of failing.
+
+        Returns:
+            healthy, the consecutive and total failure counts, per-stage and
+            per-exception-type breakdowns, and the last error string.
+        """
+        return {
+            "healthy": self.is_healthy(),
+            "consecutive_failures": self._consecutive_failures,
+            "total_failures": self._total_failures,
+            "max_generation_failures": self._max_generation_failures,
+            "failures_by_stage": dict(self._failures_by_stage),
+            "failures_by_type": dict(self._failures_by_type),
+            "last_error": self._last_error,
+        }
+
     # Collection loop
     async def start_collection(self, dataloader: Any) -> None:
         """Continuously generate trajectory groups and add them to the buffer."""
@@ -297,7 +374,18 @@ class AsyncTrajectoryCollectorImpl:
                         None, self._generate_batch, batch
                     )
                 except Exception as exc:  # noqa: BLE001 - surface and continue
-                    print(f"⚠️ AsyncTrajectoryCollector rollout failed: {exc}")
+                    self._record_failure("generation", exc)
+                    if not self.is_healthy():
+                        print(
+                            f"❌ AsyncTrajectoryCollector halting: "
+                            f"{self._consecutive_failures} consecutive failures "
+                            f"reached max_generation_failures="
+                            f"{self._max_generation_failures}. "
+                            f"check_health() will report this to the trainer.",
+                            flush=True,
+                        )
+                        self._stopped = True
+                        return
                     await asyncio.sleep(0.5)
                     continue
 
@@ -310,13 +398,28 @@ class AsyncTrajectoryCollectorImpl:
                         None, self._score_teacher_logprobs, repeated_batch
                     )
                 except Exception as exc:  # noqa: BLE001 - surface and continue
-                    print(f"⚠️ OPD teacher scoring failed: {exc}")
+                    self._record_failure("teacher_scoring", exc)
+                    if not self.is_healthy():
+                        print(
+                            f"❌ AsyncTrajectoryCollector halting: "
+                            f"{self._consecutive_failures} consecutive failures "
+                            f"reached max_generation_failures="
+                            f"{self._max_generation_failures}.",
+                            flush=True,
+                        )
+                        self._stopped = True
+                        return
                     await asyncio.sleep(0.5)
                     continue
 
             # Split the rollout batch back into per-prompt groups and enqueue each
             # with its target step.
             await self._enqueue_groups(repeated_batch, rollout_metrics, gen_version)
+
+            # Reached only when generation and (if configured) teacher scoring
+            # both completed and the groups were enqueued, so this is the point
+            # at which the streak is genuinely broken.
+            self._record_success()
 
     # Internals
     @staticmethod
