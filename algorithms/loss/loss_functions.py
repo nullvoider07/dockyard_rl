@@ -2162,10 +2162,10 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             student_vocab_size=self.student_vocab_size,
             teacher_vocab_size=teacher_vocab_size,
         )
-        projected_full = project_student_to_teacher_vocab(
-            student_probs, sparse_projection, tp_group=tp_group
-        )
-        full_teacher_vocab_size = projected_full.shape[-1]
+        # The projection's teacher axis, without doing the matmul: the top-k
+        # subset has to be chosen before the projection so only those columns
+        # are ever contracted.
+        full_teacher_vocab_size = sparse_projection.size(1)
 
         # HF models commonly pad lm_head out_features beyond len(tokenizer); the
         # projection is sized to the real tokenizer vocab, so slice the teacher
@@ -2185,7 +2185,17 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             teacher_full_logits, vocab_topk, cp_group=cp_group
         )
 
-        projected_topk = projected_full[..., global_top_indices]
+        # Project into the top-k subset directly. Materializing [B, T, V_t] fp32
+        # -- all-reduced across TP -- and then reading k of its columns was the
+        # largest allocation on this path; each teacher column of M.t() @ p is an
+        # independent contraction over the student axis, so column-selecting the
+        # sparse matrix first is value-preserving.
+        projected_topk = project_student_to_teacher_vocab(
+            student_probs,
+            sparse_projection,
+            tp_group=tp_group,
+            teacher_columns=global_top_indices,
+        )
         teacher_topk_logits = teacher_full_logits[..., global_top_indices]
         target_log_probs = torch.log_softmax(teacher_topk_logits / T, dim=-1)
 

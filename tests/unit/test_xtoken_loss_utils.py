@@ -2,8 +2,8 @@
 
 These cover the single-rank, transport-free pieces of the cross-tokenizer
 distillation loss: the FP32 sparse-dense matmul autograd function, the
-chunk-average reductions, the sparse-projection contraction, top-k teacher
-selection, the projection-file loaders/caches, the common/uncommon exact-token
+chunk-average reductions, the sparse-projection contraction and its
+column selection, top-k teacher selection, the projection-file loaders/caches, the common/uncommon exact-token
 partition, and the flat-batch rehydrator. The TP/CP-collective and CUDA-IPC
 paths are GPU-only and validate on hardware.
 """
@@ -110,6 +110,75 @@ def test_project_student_to_teacher_vocab_single_rank_matches_dense():
     assert out.shape == (2, 5, 2)
     expected = probs.reshape(-1, 3) @ sp.to_dense()
     assert torch.allclose(out.reshape(-1, 2), expected, atol=1e-5)
+
+
+def test_slice_sparse_projection_cols_matches_dense_indexing():
+    M = _coo([0, 1, 2, 3], [0, 2, 1, 3], [1.0, 2.0, 3.0, 4.0], (4, 4))
+    cols = torch.tensor([3, 0], dtype=torch.long)
+
+    sliced = lu.slice_sparse_projection_cols(M, cols)
+
+    assert sliced.shape == (4, 2)
+    # Column order follows `cols`, not the original ordering.
+    assert torch.equal(sliced.to_dense(), M.to_dense()[:, cols])
+
+
+def test_slice_sparse_projection_cols_drops_unselected_entries():
+    M = _coo([0, 1], [0, 1], [1.0, 2.0], (2, 2))
+
+    sliced = lu.slice_sparse_projection_cols(M, torch.tensor([1], dtype=torch.long))
+
+    assert sliced.shape == (2, 1)
+    assert sliced._nnz() == 1
+    assert sliced.to_dense()[1, 0].item() == 2.0
+
+
+def test_slice_sparse_projection_cols_refuses_duplicates():
+    """A repeated column makes the position lookup ambiguous, silently."""
+    M = _coo([0], [0], [1.0], (2, 2))
+    try:
+        lu.slice_sparse_projection_cols(M, torch.tensor([1, 1], dtype=torch.long))
+    except ValueError as e:
+        assert "duplicates" in str(e)
+    else:
+        raise AssertionError("expected ValueError on duplicate columns")
+
+
+def test_projecting_into_columns_equals_projecting_then_indexing():
+    """The value-preservation claim #3564 rests on, checked directly.
+
+    Each teacher column of ``M.t() @ p`` is an independent contraction over the
+    student axis, so selecting columns of ``M`` first must give exactly the
+    same numbers as building the full projection and indexing it.
+    """
+    sp = _coo([0, 1, 2, 2, 3], [0, 3, 1, 2, 0], [1.0, 1.5, 2.0, 0.5, 3.0], (4, 4))
+    probs = torch.rand(2, 5, 4)
+    cols = torch.tensor([0, 2, 3], dtype=torch.long)
+
+    full = lu.project_student_to_teacher_vocab(probs, sp)
+    direct = lu.project_student_to_teacher_vocab(probs, sp, teacher_columns=cols)
+
+    assert direct.shape == (2, 5, 3)
+    assert torch.allclose(direct, full[..., cols], atol=1e-6)
+
+
+def test_projecting_into_columns_gives_the_same_student_gradient():
+    """Unselected columns contribute nothing, so the gradient must not move."""
+    sp = _coo([0, 1, 2, 2, 3], [0, 3, 1, 2, 0], [1.0, 1.5, 2.0, 0.5, 3.0], (4, 4))
+    base = torch.rand(2, 5, 4)
+    cols = torch.tensor([0, 2, 3], dtype=torch.long)
+    seed = torch.arange(2 * 5 * 3, dtype=torch.float32).view(2, 5, 3) + 1.0
+
+    via_full = base.clone().requires_grad_(True)
+    lu.project_student_to_teacher_vocab(via_full, sp)[..., cols].backward(seed)
+
+    via_cols = base.clone().requires_grad_(True)
+    lu.project_student_to_teacher_vocab(
+        via_cols, sp, teacher_columns=cols
+    ).backward(seed)
+
+    assert via_full.grad is not None and via_cols.grad is not None
+    assert torch.allclose(via_full.grad, via_cols.grad, atol=1e-6)
 
 
 # -- top-k teacher selection --------------------------------------------------

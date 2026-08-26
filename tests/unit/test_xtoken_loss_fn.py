@@ -10,6 +10,8 @@ surface: two cross-tokenizer teachers (weighted sum), a same-tokenizer teacher
 teacher weighting, per-teacher ``_t{i}`` metrics, and the config validators.
 """
 
+from typing import Any, cast
+
 import torch
 
 from dockyard_rl.algorithms.loss.loss_functions import CrossTokenizerDistillationLossFn
@@ -109,6 +111,109 @@ def test_pkl_finite_loss_grad_and_metrics(tmp_path):
             "num_valid_pairs_t0", "weight_t0"} <= set(metrics)
     assert metrics["num_valid_pairs_t0"] == 3  # 3 valid chunks, 1 unmasked sample
     assert metrics["weight_t0"] == 1.0
+
+
+def _pkl_loss_and_grad(tmp_path, *, project, seed=7, **cfg_over):
+    """Run the single-teacher P-KL path with a chosen projection implementation."""
+    from dockyard_rl.algorithms.loss import loss_functions as lf
+
+    torch.manual_seed(seed)
+    logits = torch.randn(1, 4, VS, requires_grad=True)
+    teacher = torch.randn(1, 4, VT)
+    data = _data()
+    fn = CrossTokenizerDistillationLossFn(
+        cast(Any, _single(_projection_file(tmp_path), **cfg_over))
+    )
+
+    original = lf.project_student_to_teacher_vocab
+    lf.project_student_to_teacher_vocab = project
+    try:
+        loss, _ = fn(
+            data, torch.tensor(3.0), torch.tensor(3.0),
+            logits, logits, {0: teacher}, {0: _align()},
+        )
+        loss.backward()
+    finally:
+        lf.project_student_to_teacher_vocab = original
+    assert logits.grad is not None
+    return loss.detach().clone(), logits.grad.clone()
+
+
+def _project_then_index(student_probs, sparse_projection, *, tp_group=None,
+                        teacher_columns=None):
+    """The pre-#3564 route: build the full [B, T, V_t] projection, then index it."""
+    from dockyard_rl.algorithms.x_token.loss_utils import (
+        project_student_to_teacher_vocab as real,
+    )
+
+    full = real(student_probs, sparse_projection, tp_group=tp_group)
+    return full if teacher_columns is None else full[..., teacher_columns]
+
+
+def test_pkl_topk_projection_matches_projecting_the_full_vocab(tmp_path):
+    """#3564 is a memory change, so loss and gradient must be unmoved.
+
+    Projecting into the top-k teacher columns replaces materializing
+    [B, T, V_t] fp32 -- all-reduced across TP -- and reading k of its columns.
+    """
+    from dockyard_rl.algorithms.x_token.loss_utils import (
+        project_student_to_teacher_vocab as real,
+    )
+
+    ref_loss, ref_grad = _pkl_loss_and_grad(tmp_path, project=_project_then_index)
+    got_loss, got_grad = _pkl_loss_and_grad(tmp_path, project=real)
+
+    torch.testing.assert_close(got_loss, ref_loss)
+    torch.testing.assert_close(got_grad, ref_grad)
+
+
+def test_pkl_matches_when_topk_covers_the_whole_teacher_vocab(tmp_path):
+    """The degenerate k == V_t case still routes through the column slice."""
+    from dockyard_rl.algorithms.x_token.loss_utils import (
+        project_student_to_teacher_vocab as real,
+    )
+
+    ref_loss, ref_grad = _pkl_loss_and_grad(
+        tmp_path, project=_project_then_index, vocab_topk=VT
+    )
+    got_loss, got_grad = _pkl_loss_and_grad(tmp_path, project=real, vocab_topk=VT)
+
+    torch.testing.assert_close(got_loss, ref_loss)
+    torch.testing.assert_close(got_grad, ref_grad)
+
+
+def test_pkl_never_builds_the_full_vocab_projection(tmp_path):
+    """The wire: the projection call must carry the top-k columns.
+
+    Goes red if _compute_p_kl reverts to projecting the full teacher vocab and
+    indexing the result -- the equivalence tests above cannot catch that, since
+    both routes give the same numbers.
+    """
+    from dockyard_rl.algorithms.loss import loss_functions as lf
+    from dockyard_rl.algorithms.x_token.loss_utils import (
+        project_student_to_teacher_vocab as real,
+    )
+
+    seen: list[tuple[torch.Tensor | None, int]] = []
+
+    def spy(student_probs, sparse_projection, *, tp_group=None, teacher_columns=None):
+        out = real(
+            student_probs,
+            sparse_projection,
+            tp_group=tp_group,
+            teacher_columns=teacher_columns,
+        )
+        seen.append((teacher_columns, int(out.shape[-1])))
+        return out
+
+    assert K < VT, "the test only means something when top-k is a strict subset"
+    _pkl_loss_and_grad(tmp_path, project=spy)
+
+    assert seen, "the P-KL path did not call the projection"
+    for columns, width in seen:
+        assert columns is not None, "projection was called without teacher_columns"
+        assert int(columns.numel()) == K
+        assert width == K, f"projected width {width} is the full teacher vocab"
 
 
 def test_pkl_reverse_kl_runs(tmp_path):

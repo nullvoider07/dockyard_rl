@@ -176,6 +176,51 @@ def slice_sparse_projection_rows(
     ).coalesce()
 
 
+def slice_sparse_projection_cols(
+    sparse_matrix: torch.Tensor,
+    columns: torch.Tensor,
+) -> torch.Tensor:
+    """Column-select a sparse-COO projection ``[V_s, V_t]`` to ``[V_s, len(columns)]``.
+
+    ``columns`` is a 1-D long tensor of teacher-vocab ids; the result's column
+    ``j`` is the original column ``columns[j]``, so the output ordering follows
+    ``columns`` exactly and matches ``dense[..., columns]``.
+
+    This is what lets P-KL project straight into the top-k teacher subset
+    instead of materializing the full ``[B, T, V_t]`` projection and reading
+    ``k`` of its columns: every teacher column of ``M.t() @ p`` is an
+    independent contraction over the student axis, so selecting columns of
+    ``M`` first is value-preserving.
+    """
+    if columns.dim() != 1:
+        raise ValueError(f"columns must be 1-D, got shape {tuple(columns.shape)}")
+    num_cols = sparse_matrix.size(1)
+    # Position lookup over the teacher axis: -1 for a column that is not kept,
+    # otherwise its index in `columns`. Duplicates in `columns` would make this
+    # ambiguous (the last one would win), so they are refused.
+    position = torch.full(
+        (num_cols,), -1, dtype=torch.long, device=sparse_matrix.device
+    )
+    position[columns] = torch.arange(
+        columns.numel(), dtype=torch.long, device=sparse_matrix.device
+    )
+    if int((position >= 0).sum()) != columns.numel():
+        raise ValueError("columns must not contain duplicates")
+
+    indices = sparse_matrix.indices()
+    values = sparse_matrix.values()
+    mapped = position[indices[1]]
+    mask = mapped >= 0
+    kept_indices = torch.stack((indices[0][mask], mapped[mask]))
+    return torch.sparse_coo_tensor(
+        kept_indices,
+        values[mask],
+        (sparse_matrix.size(0), columns.numel()),
+        device=sparse_matrix.device,
+        dtype=sparse_matrix.dtype,
+    ).coalesce()
+
+
 # ---------------------------------------------------------------------------
 # TP/CP-aware loss primitives
 #
@@ -188,6 +233,7 @@ def project_student_to_teacher_vocab(
     sparse_projection: torch.Tensor,
     *,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    teacher_columns: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Project student vocab probs ``[B, T, V_s(/TP)]`` to teacher vocab ``[B, T, V_t]``.
 
@@ -197,7 +243,17 @@ def project_student_to_teacher_vocab(
     partial teacher-vocab sum, and a ``group_all_reduce_sum_with_grad`` over the
     TP group combines the partials into the full ``V_s`` contraction. Otherwise a
     single sparse matmul over the full matrix is used.
+
+    ``teacher_columns`` restricts the output to those teacher-vocab ids, in that
+    order, giving ``[B, T, len(teacher_columns)]``. It is equivalent to indexing
+    the full result -- see :func:`slice_sparse_projection_cols` -- but the full
+    ``[B, T, V_t]`` tensor is never built, and under TP the all-reduce carries
+    ``k`` columns instead of ``V_t``.
     """
+    if teacher_columns is not None:
+        sparse_projection = slice_sparse_projection_cols(
+            sparse_projection, teacher_columns
+        )
     batch_size, seq_len, local_vocab_size = student_probs.shape
     flat = student_probs.reshape(batch_size * seq_len, local_vocab_size)
     tp_world = torch.distributed.get_world_size(tp_group) if tp_group is not None else 1
