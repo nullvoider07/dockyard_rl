@@ -101,15 +101,51 @@ def is_non_colocated_teachers_enabled(master_config: Any) -> bool:
     )
 
 
+def _config_section(master_config: Any, name: str) -> Any:
+    """Fetch a top-level config section, whatever shape the config is.
+
+    Same tolerance as :func:`_opd_cfg` -- a MasterConfig, a plain dict, or a
+    config missing the section entirely.
+    """
+    if isinstance(master_config, dict):
+        return master_config.get(name)
+    return getattr(master_config, name, None)
+
+
+def _config_value(section: Any, key: str, default: Any = None) -> Any:
+    """Read ``key`` off a config section that may be a dict, BaseModel, or object."""
+    if section is None:
+        return default
+    if isinstance(section, dict):
+        return section.get(key, default)
+    if isinstance(section, BaseModel):
+        return getattr(section, key, default)
+    return getattr(section, key, default)
+
+
 def _skip_prev_logprobs(master_config: Any) -> bool:
     """Whether the training loop will zero ``prev_logprobs`` instead of computing it.
 
     Mirrors the predicate in the GRPO loop: ``force_on_policy_ratio`` with no
     ``seq_logprob_error_threshold`` skips the student logprob pass.
+
+    Read through the shape-tolerant accessors above rather than by direct
+    attribute access. ``_opd_cfg`` documents this module as accepting a plain
+    dict, and ``is_opd_enabled`` honours that, but this predicate did not: a
+    dict config raised ``AttributeError`` from inside
+    :func:`assert_prev_logprobs_available`, which is a guard -- so the shape
+    that was meant to be supported failed in the one place whose job is to
+    report a different problem clearly.
+
+    An absent section reads as "not skipping", which is what the loop does with
+    the same keys absent: no ``force_on_policy_ratio`` means the student logprob
+    pass runs, so the guard has nothing to refuse.
     """
-    force_on_policy_ratio = master_config.loss_fn.force_on_policy_ratio
-    seq_logprob_error_threshold = master_config.grpo.get(
-        "seq_logprob_error_threshold", None
+    force_on_policy_ratio = _config_value(
+        _config_section(master_config, "loss_fn"), "force_on_policy_ratio", False
+    )
+    seq_logprob_error_threshold = _config_value(
+        _config_section(master_config, "grpo"), "seq_logprob_error_threshold", None
     )
     return bool(force_on_policy_ratio and seq_logprob_error_threshold is None)
 

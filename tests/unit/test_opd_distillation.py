@@ -182,6 +182,75 @@ def test_opd_advantage_metrics_populated():
     assert "on_policy_distillation/adv_std" in m
 
 
+# -- the prev_logprobs guard accepts every config shape the module claims -----
+
+def _opd_on() -> dict:
+    return {"enabled": True, "default_teacher_alias": "t1"}
+
+
+def test_prev_logprobs_guard_accepts_a_plain_dict_config():
+    """`_opd_cfg` documents dict configs and `is_opd_enabled` honours them.
+
+    The guard did not: it read master_config.loss_fn directly, so a dict raised
+    AttributeError from inside the one function whose job is to report a
+    different misconfiguration clearly.
+    """
+    from dockyard_rl.algorithms.opd import assert_prev_logprobs_available
+
+    cfg = {
+        "on_policy_distillation": _opd_on(),
+        "loss_fn": {"force_on_policy_ratio": False},
+        "grpo": {"seq_logprob_error_threshold": None},
+    }
+
+    assert_prev_logprobs_available(cfg)  # must not raise
+
+
+def test_prev_logprobs_guard_still_refuses_a_bad_dict_config():
+    """Tolerating the shape must not stop it catching the thing it exists for."""
+    from dockyard_rl.algorithms.opd import assert_prev_logprobs_available
+
+    cfg = {
+        "on_policy_distillation": _opd_on(),
+        "loss_fn": {"force_on_policy_ratio": True},
+        "grpo": {"seq_logprob_error_threshold": None},
+    }
+
+    with pytest.raises(ValueError, match="requires real prev_logprobs"):
+        assert_prev_logprobs_available(cfg)
+
+
+def test_prev_logprobs_guard_accepts_an_object_config():
+    """The MasterConfig shape the real call site passes."""
+    from types import SimpleNamespace
+
+    from dockyard_rl.algorithms.opd import assert_prev_logprobs_available
+
+    master = SimpleNamespace(
+        on_policy_distillation=_opd_on(),
+        loss_fn=SimpleNamespace(force_on_policy_ratio=True),
+        grpo={"seq_logprob_error_threshold": 1.5},
+    )
+
+    assert_prev_logprobs_available(master)  # threshold set -> not skipping
+
+
+def test_a_missing_section_reads_as_not_skipping():
+    """Absent force_on_policy_ratio means the logprob pass runs, so nothing to refuse."""
+    from dockyard_rl.algorithms.opd import assert_prev_logprobs_available
+
+    assert_prev_logprobs_available({"on_policy_distillation": _opd_on()})
+
+
+def test_the_guard_is_inert_when_opd_is_off():
+    """A non-OPD recipe must not be touched by any of this."""
+    from dockyard_rl.algorithms.opd import assert_prev_logprobs_available
+
+    assert_prev_logprobs_available(
+        {"loss_fn": {"force_on_policy_ratio": True}, "grpo": {}}
+    )
+
+
 # -- collector teacher scoring (routing + DP padding + stitching) -------------
 
 def _make_collector_with_teacher(teacher_logprob_fn, dp_size=1):
