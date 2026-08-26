@@ -39,31 +39,53 @@ def _cap(major: int, minor: int, name: str = "test device") -> DeviceCapability:
 # The measured table. Keeping it as data makes the source of truth explicit and
 # a threshold change fail loudly rather than drift.
 ARCH_TABLE = [
-    # (major, minor, name,              bf16,  fp8,   block_fp8, mxfp8)
-    (7, 0, "V100 Volta",                False, False, False,     False),
-    (7, 5, "T4 Turing",                 False, False, False,     False),
-    (8, 0, "A100 Ampere",               True,  False, False,     False),
-    (8, 6, "A10 / RTX 3090",            True,  False, False,     False),
-    (8, 9, "L40S / L4 Ada",             True,  True,  False,     False),
-    (9, 0, "H100 / H200 Hopper",        True,  True,  True,      False),
-    (10, 0, "B200 Blackwell",           True,  True,  True,      True),
-    (10, 3, "GB300",                    True,  True,  True,      True),
-    (12, 0, "RTX PRO 6000 Blackwell",   True,  True,  True,      True),
+    # (major, minor, name,              bf16,  fp8,   block_fp8)
+    (7, 0, "V100 Volta",                False, False, False),
+    (7, 5, "T4 Turing",                 False, False, False),
+    (8, 0, "A100 Ampere",               True,  False, False),
+    (8, 6, "A10 / RTX 3090",            True,  False, False),
+    (8, 9, "L40S / L4 Ada",             True,  True,  False),
+    (9, 0, "H100 / H200 Hopper",        True,  True,  True),
+    (10, 0, "B200 Blackwell",           True,  True,  True),
+    (10, 3, "GB300",                    True,  True,  True),
+    (12, 0, "RTX PRO 6000 Blackwell",   True,  True,  True),
 ]
 
 
 class TestCapabilityTable:
-    @pytest.mark.parametrize(
-        "major,minor,name,bf16,fp8,block_fp8,mxfp8", ARCH_TABLE
-    )
+    @pytest.mark.parametrize("major,minor,name,bf16,fp8,block_fp8", ARCH_TABLE)
     def test_predicates_match_the_measured_table(
-        self, major, minor, name, bf16, fp8, block_fp8, mxfp8
+        self, major, minor, name, bf16, fp8, block_fp8
     ):
         cap = _cap(major, minor, name)
         assert cap.supports_native_bf16 is bf16
         assert cap.supports_fp8 is fp8
         assert cap.supports_block_fp8 is block_fp8
-        assert cap.supports_mxfp8_nvfp4 is mxfp8
+
+    def test_no_unconsumed_capability_predicates(self):
+        """Every predicate here is read somewhere outside this module.
+
+        The MXFP8 / NVFP4 predicate was removed for failing exactly this: it
+        gated on sm100 while vLLM 0.27.1's Marlin MXFP8 kernel runs from sm75,
+        and nothing in the tree asked the question. Adding a predicate back
+        without a consumer fails here.
+        """
+        consumed = {
+            "sm",
+            "supports_native_bf16",
+            "supports_fp8",
+            "supports_block_fp8",
+            "supports_prefix_caching",
+        }
+        declared = {
+            name
+            for name, attr in vars(DeviceCapability).items()
+            if isinstance(attr, property)
+        }
+        assert declared == consumed, (
+            "A DeviceCapability predicate was added or removed; name its "
+            "consumer at a file:line and update this set, or drop it."
+        )
 
     def test_sm_is_the_integer_vllm_predicates_take(self):
         assert _cap(9, 0).sm == 90

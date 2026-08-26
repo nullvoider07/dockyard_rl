@@ -33,6 +33,21 @@ Two consequences that documentation alone would have got wrong:
   *created*. On a T4 it returns True while every bf16 op is emulated. Native
   bf16 is `major >= 8`, and that is what `supports_native_bf16` reports.
 
+No MXFP8 / NVFP4 predicate ships here yet, and the omission is deliberate.
+A `supports_mxfp8_nvfp4` property gating on sm100 was written alongside the
+three above; measuring vLLM 0.27.1's kernel ladder showed both halves of it to
+be wrong. `_POSSIBLE_MXFP8_KERNELS[CUDA]` is FlashInfer CuteDSL, FlashInfer
+CUTLASS, Marlin, emulation, Humming -- and only the two FlashInfer kernels
+require sm100. `MarlinMxfp8LinearKernel.is_supported` defers to
+`is_fp8_marlin_supported()`, which is `has_device_capability(75)`, and Marlin
+sits *above* emulation in that list, so MXFP8 linear reaches a real kernel from
+sm75 up. One integer cannot express that: sm100 is the native-tensor-core line,
+sm75 the Marlin-fallback line, and which one a deployment should refuse below
+depends on a performance claim no CPU measurement can settle. The predicate
+also had no consumer -- dockyard has no MXFP8 precision path, and a capability
+question nothing asks is the shape the wiring gate exists to catch. It returns
+when C2 lands a path that reads it, with the threshold that path actually needs.
+
 Degradation policy: **refuse, never downgrade.** If a config asks for a
 precision the device cannot run natively, startup fails with the device name,
 its capability, and what would be required. Silently substituting a different
@@ -56,7 +71,6 @@ logger = logging.getLogger(__name__)
 SM_NATIVE_BF16 = 80
 SM_FP8 = 89
 SM_BLOCK_FP8 = 90
-SM_MXFP8_NVFP4 = 100
 SM_PREFIX_CACHING = 80
 
 
@@ -95,11 +109,6 @@ class DeviceCapability:
     def supports_block_fp8(self) -> bool:
         """Block-scaled FP8 (Hopper sm90 and newer) -- the only FP8 dockyard emits."""
         return self.sm >= SM_BLOCK_FP8
-
-    @property
-    def supports_mxfp8_nvfp4(self) -> bool:
-        """MXFP8 / NVFP4 (Blackwell sm100 and newer)."""
-        return self.sm >= SM_MXFP8_NVFP4
 
     @property
     def supports_prefix_caching(self) -> bool:

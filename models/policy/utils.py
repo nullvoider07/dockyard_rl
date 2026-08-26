@@ -1,4 +1,5 @@
 import gc
+import importlib.util
 import os
 import traceback
 from enum import Enum
@@ -52,14 +53,31 @@ class IPCProtocol(Enum):
 # quant_cfg is set. Core has no knowledge of ModelOpt internals beyond
 # this table — the override is resolved lazily in resolve_policy_worker_cls.
 #
-# TODO: Replace this hard-coded map with a generic plugin-registration hook
-# on Policy (e.g. a worker_cls_overrides registry populated by
-# dockyard_rl.modelopt on import) so core has no knowledge of ModelOpt-
-# specific worker classes.
+# Both targets are currently unwritten: dockyard_rl/modelopt/ carries the
+# inference half of the ModelOpt path (vllm_quant_worker, vllm_quant_backend,
+# vllm_modelopt_patch) and no models/policy/ subpackage at all. The names are
+# kept rather than deleted because they are the intended landing sites, and
+# resolve_policy_worker_cls refuses on an unimportable target so the gap is
+# reported at config resolution instead of as a ModuleNotFoundError raised
+# inside Ray actor construction, several layers from the config key that
+# caused it.
 POLICY_WORKER_OVERRIDES = {
     "dockyard_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker": "dockyard_rl.modelopt.models.policy.workers.dtensor_quant_policy_worker.DTensorQuantPolicyWorker",
     "dockyard_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2": "dockyard_rl.modelopt.models.policy.workers.dtensor_quant_policy_worker_v2.DTensorQuantPolicyWorkerV2",
 }
+
+def _worker_cls_is_importable(fqn: str) -> bool:
+    """Whether the module half of a worker FQN can be located on this path.
+
+    find_spec, not import: locating the module is enough to tell a missing
+    landing site from a present one, and importing a policy worker in the
+    driver pulls in torch.distributed machinery the driver has no use for.
+    """
+    module_path = fqn.rsplit(".", 1)[0]
+    try:
+        return importlib.util.find_spec(module_path) is not None
+    except (ImportError, ValueError):
+        return False
 
 def resolve_policy_worker_cls(default_cls: str, config: dict) -> str:
     """Return the quantized policy worker FQN if ``quant_cfg`` is set, else ``default_cls``.
@@ -67,10 +85,28 @@ def resolve_policy_worker_cls(default_cls: str, config: dict) -> str:
     Safe to call even when ModelOpt is not installed — returns ``default_cls``
     unchanged whenever ``quant_cfg`` is ``None``, so the core policy path stays
     import-free of ModelOpt.
+
+    Raises:
+        ValueError: If ``quant_cfg`` is set and the override this table names
+            does not exist in the tree.
     """
     if config.get("quant_cfg") is None:
         return default_cls
-    return POLICY_WORKER_OVERRIDES.get(default_cls, default_cls)
+    override = POLICY_WORKER_OVERRIDES.get(default_cls)
+    if override is None:
+        return default_cls
+    if not _worker_cls_is_importable(override):
+        raise ValueError(
+            f"policy.quant_cfg is set, which selects the quantized policy "
+            f"worker '{override}', but that module is not present in this "
+            f"tree. Only the inference half of the ModelOpt path is built "
+            f"(dockyard_rl.modelopt.models.generation); the trainer half has "
+            f"no models/policy subpackage. Unset policy.quant_cfg to train "
+            f"unquantized. Serving a quantized rollout is configured "
+            f"separately under policy.generation.quant_cfg and does not need "
+            f"this worker."
+        )
+    return override
 
 def resolve_model_class(model_name: str) -> Any:
     """Resolve the appropriate HuggingFace AutoModel class for a given model name."""
