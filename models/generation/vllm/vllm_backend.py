@@ -104,7 +104,14 @@ class VllmInternalWorkerExtension:
 
     # ZMQ socket (IPC weight streaming path)
     def get_zmq_address(self) -> str:
-        return f"ipc:///tmp/{self.report_device_id()}.sock"
+        """Endpoint the colocated trainer worker binds; this side connects.
+
+        Deferred import to match this file's convention for trainer-side
+        modules; the construction is shared so the two ends cannot drift.
+        """
+        from dockyard_rl.models.policy.utils import refit_socket_address
+
+        return refit_socket_address(self.report_device_id())
 
     def maybe_init_zmq(self) -> None:
         """Lazily initialise a ZMQ REP socket for IPC weight streaming."""
@@ -289,6 +296,7 @@ class VllmInternalWorkerExtension:
             IPCProtocol,
             calculate_aligned_size,
             rebuild_cuda_tensor_from_ipc,
+            recv_refit_payload,
         )
 
         buffer  = None
@@ -298,7 +306,7 @@ class VllmInternalWorkerExtension:
             self.maybe_init_zmq()
 
             while True:
-                payload = self.zmq_socket.recv_pyobj()
+                payload = recv_refit_payload(self.zmq_socket)
 
                 if payload == IPCProtocol.COMPLETE:
                     from vllm.model_executor.model_loader.utils import (

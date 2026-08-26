@@ -136,16 +136,42 @@ bring-up on a tiny model, then a small MoE model for the EP-specific rows.
 | HV-48 | Colocated vLLM weight refit over ZMQ IPC (`models/policy/workers/dtensor_policy_worker.py::stream_weights_via_ipc_zmq` → `models/policy/utils.py:186-307` → `models/generation/vllm/vllm_backend.py`) | CPU-tested: both ends derive the same `ipc:///tmp/{device_uuid}.sock` from their own device UUID (pinned as a string equality, since a divergence would surface only as a refit hanging to the 120s ZMQ timeout); the sender rejects `kv_scales` rather than dropping it, matching `broadcast_weights_for_collective`; `Policy` exposes the dispatch `IPCWeightSynchronizer:69` calls; the receiver's three symbols resolve; and both sides share the 512-byte alignment rule the receiver asserts on. **Unverified / needs GPU:** nothing about the transport itself has run. Specifically (a) the REQ-bind / REP-connect handshake — the receiver connects, which is inverted from the usual REP-binds pattern, so a bind ordering or stale `/tmp` socket problem would only appear live; (b) CUDA-IPC handle validity across the two processes, including the `device_id` override in `rebuild_cuda_tensor_from_ipc`; (c) the ping-pong double-buffer overlap under real parameter volume, and the receiver's `offset == used_bytes` assert against real `state_dict_info`; (d) the use-after-free window the receiver guards by deleting views before ACK. This path is the factory default for colocated + vLLM, so `distillation.yaml`, `eval.yaml` and `gpqa.yaml` exercise it first. | High | Run one of those three configs on a single colocated GPU and confirm a refit completes; then confirm generation output changes across the refit, since a silently-failed weight update would otherwise look like a successful step. |
 
 ## Notes
-- **IPC refit socket path (hardening, not a defect).** HV-48's transport binds
+- **IPC refit socket path — raised twice, and now closed.** HV-48's transport bound
   `ipc:///tmp/{device_uuid}.sock` and the receiver `recv_pyobj()`s CUDA-IPC handles off it
-  — an unauthenticated, predictable path, and pickle on the receive side. The scheme is
-  pre-existing (`models/policy/workers/base_policy_worker.py:77`,
-  `models/generation/vllm/vllm_backend.py:107`); the 2026-08-25 sender wiring matched it
-  because both ends must derive the same address. Reaching it needs a hostile same-host,
-  same-UID process, and the untrusted sandbox runs in separate CPU-only containers with no
-  host `/tmp` share, so it is not exploitable in the current deployment. **If this socket
-  ever lands on a shared-tenant node, move it under a per-run `0700` directory first.**
-  Raised by the 2026-08-26 branch security audit and deliberately not treated as a finding.
+  — an unauthenticated, predictable path, and pickle on the receive side.
+
+  The **address scheme** was pre-existing (`models/policy/workers/base_policy_worker.py:75`,
+  `models/generation/vllm/vllm_backend.py:106`), and the 2026-08-25 sender wiring matched it
+  because both ends must derive the same address. **The reachability was not**, and the
+  first write-up of this note understated that: on `main`,
+  `vllm_backend.update_weights_via_ipc_zmq` imported `models.policy.ipc_utils` — a module
+  that has never existed — *above* its `try:` block, so the method raised
+  `ModuleNotFoundError` before touching a socket. `be8daec` repointed that import at
+  `models.policy.utils` and `78f0159` replaced the sender's `NotImplementedError` with a
+  real binder, so this branch is what turned a dead method into a live `pickle.loads` on a
+  socket, and into the factory default for colocated + vLLM. That correction is the one
+  factual gap the 2026-08-26 audit identified in this note.
+
+  The audit's **verdict was still not-a-finding**, on grounds it verified independently:
+  the socket lives in the mount namespace the trainer and vLLM actors share (same pyxis
+  container on Slurm, same pod on k8s), the sandbox fleet is a separate Deployment behind a
+  NetworkPolicy with no `hostIPC`/`hostPID`/`shareProcessNamespace` and runs agent code in
+  nested containers, and — decisively — the configs that select this transport and the
+  configs that run untrusted code are **disjoint**: the six colocated+vLLM configs
+  (`distillation`, `eval`, `gpqa`, `mmlu`, `online_dpo`, `rlaif`) all use `env.math`, which
+  executes no model-generated code, while every config setting `sandbox_urls` is
+  `colocated: false` → NCCL, or SGLang → HTTP. The only principal able to pre-bind the
+  endpoint already had root in the container it would be attacking.
+
+  **Closed anyway on 2026-08-26**, before anything untrusted is ever colocated:
+  `models/policy/utils.py::refit_socket_address` puts the endpoint in a per-uid `0700`
+  directory (symlink / ownership / mode checked before binding), so a *different* account
+  can no longer create the socket; and `recv_refit_payload` unpickles under an allowlist
+  read off `reduce_tensor`'s CUDA branch, so a `__reduce__` gadget cannot resolve whoever
+  reaches it. A same-uid process can still squat — but it can already attach to the trainer
+  directly, so no boundary is crossed there. Both ends still derive the address
+  independently, which `test_weight_sync_factory.py` pins, since a divergence would surface
+  only as a refit hanging to the 120s ZMQ timeout.
 - **Chunked delta-rule kernel (perf, not correctness):** the J11 linear-attention recurrence uses a `lax.scan` (O(S) sequential); the HF chunked kernel is a perf optimization computing identical math (CPU-parity-proven). Implementing/benchmarking the chunked form is a J10/perf task (any GPU), not a correctness HV — correctness is already covered.
 - **`apply_mask_to_padding_states` omitted in the JAX linear-attn module (right-padding assumption):** correct for right-padded causal training (padded positions never pollute real ones); would bite only under left-padding. A documented assumption, not a GPU-gated check — the trainer must keep right-padding.
 - Resolved-without-hardware (NOT deferred): A.1 #2569 reasoning-parser wiring was hardened

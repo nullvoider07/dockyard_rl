@@ -1,6 +1,9 @@
 import gc
 import importlib.util
+import io
 import os
+import pickle
+import stat
 import traceback
 from enum import Enum
 from typing import Any, Dict, Optional, cast
@@ -179,6 +182,132 @@ def get_gpu_info(model: torch.nn.Module) -> dict[str, Any]:
             if k.startswith("CUDA") or k in ["LOCAL_RANK", "RANK", "WORLD_SIZE"]
         },
     }
+
+# Refit IPC socket: private directory, shared address, restricted unpickler.
+
+REFIT_SOCKET_DIR_ENV = "DOCKYARD_REFIT_SOCKET_DIR"
+_DEFAULT_REFIT_SOCKET_PARENT = "/tmp"
+
+
+def _ensure_private_dir(path: str) -> None:
+    """Create ``path`` mode 0700, or verify an existing one is safe to bind in."""
+    try:
+        os.mkdir(path, 0o700)
+        return
+    except FileExistsError:
+        pass
+
+    info = os.lstat(path)
+    if stat.S_ISLNK(info.st_mode):
+        raise RuntimeError(
+            f"refit socket directory {path!r} is a symlink; refusing to bind "
+            "inside it. Remove it or set "
+            f"{REFIT_SOCKET_DIR_ENV} to a directory this run owns."
+        )
+    if not stat.S_ISDIR(info.st_mode):
+        raise RuntimeError(f"refit socket path {path!r} exists and is not a directory")
+    if info.st_uid != os.getuid():
+        raise RuntimeError(
+            f"refit socket directory {path!r} is owned by uid {info.st_uid}, not "
+            f"{os.getuid()}; refusing to bind inside another user's directory"
+        )
+    if info.st_mode & 0o077:
+        raise RuntimeError(
+            f"refit socket directory {path!r} is mode "
+            f"{oct(info.st_mode & 0o777)}; it must not be group- or "
+            "other-accessible, or another account could pre-bind the endpoint"
+        )
+
+
+def refit_socket_dir() -> str:
+    """Directory holding the colocated-refit IPC sockets, created 0700.
+
+    The endpoint used to be ``ipc:///tmp/{device_uuid}.sock`` directly in a
+    world-writable directory, under a name any local process can read out of
+    ``nvidia-smi -L``. The receiver connects rather than binds, so whoever holds
+    the bind drives its unpickle, and pre-creating the path was enough to become
+    that party.
+
+    The directory name is a pure function of the uid rather than a per-run
+    secret, deliberately: both fleets derive the address independently and never
+    exchange it, so a run id would have to reach every Ray actor in both, and a
+    mismatch surfaces only as a refit hanging to the 120s ZMQ timeout. What 0700
+    buys is that a *different* account can no longer create a socket in there.
+    A same-uid process could still squat -- but a same-uid process can already
+    attach to the trainer directly, so no privilege boundary is crossed.
+
+    ``DOCKYARD_REFIT_SOCKET_DIR`` overrides the location for deployments whose
+    ``/tmp`` is unusual; it is held to the same ownership and mode checks.
+    """
+    configured = os.environ.get(REFIT_SOCKET_DIR_ENV)
+    path = configured or os.path.join(
+        _DEFAULT_REFIT_SOCKET_PARENT, f"dockyard-refit-{os.getuid()}"
+    )
+    _ensure_private_dir(path)
+    return path
+
+
+def refit_socket_address(device_uuid: str) -> str:
+    """The ``ipc://`` endpoint for the colocated refit channel on ``device_uuid``.
+
+    Single source for both ends: the trainer worker binds it and the colocated
+    vLLM worker connects to it, each computing it from the device UUID it
+    observes, so the two must not drift apart.
+    """
+    return f"ipc://{os.path.join(refit_socket_dir(), f'{device_uuid}.sock')}"
+
+
+# Globals the refit payload legitimately names. Read off
+# torch.multiprocessing.reductions.reduce_tensor's CUDA branch -- it returns
+# (rebuild_cuda_tensor, (type(tensor), tensor.size(), tensor.stride(), offset,
+# type(storage), tensor.dtype, device, handle, ...)) -- rather than guessed, so
+# the classes here are exactly the ones a real handle carries.
+_REFIT_ALLOWED_GLOBALS = frozenset(
+    {
+        ("torch", "Tensor"),
+        ("torch", "Size"),
+        ("torch.storage", "TypedStorage"),
+        ("torch.storage", "UntypedStorage"),
+        (__name__, "IPCProtocol"),
+    }
+)
+
+
+class _RefitUnpickler(pickle.Unpickler):
+    """Unpickler that resolves only the globals a refit payload can contain."""
+
+    def find_class(self, module: str, name: str) -> Any:
+        if (module, name) in _REFIT_ALLOWED_GLOBALS:
+            return super().find_class(module, name)
+        # torch dtypes pickle as module-level globals (`torch.bfloat16`).
+        if module == "torch" and isinstance(getattr(torch, name, None), torch.dtype):
+            return super().find_class(module, name)
+        raise pickle.UnpicklingError(
+            f"refusing to resolve {module}.{name} from a refit payload; only "
+            "the CUDA-IPC handle types and the protocol sentinel are allowed"
+        )
+
+
+def loads_refit_payload(data: bytes) -> Any:
+    """Unpickle a refit payload under an allowlist.
+
+    ``recv_pyobj`` is ``pickle.loads``, so whatever reaches the socket runs the
+    ``__reduce__`` it carries. The payload has a fixed shape -- the
+    ``(cuda_ipc_handle, param_names, used_bytes)`` tuple built by
+    ``get_handle_from_tensor``, or the ``IPCProtocol`` sentinel -- so refusing
+    every other global keeps a gadget naming ``os.system`` or ``builtins.eval``
+    from resolving.
+
+    Same posture as the replay-buffer checkpoint load in ``algorithms/grpo.py``:
+    keep the deserializer, narrow what it may construct.
+    """
+    return _RefitUnpickler(io.BytesIO(data)).load()
+
+
+def recv_refit_payload(zmq_socket: Any) -> Any:
+    """``recv_pyobj()`` with :func:`loads_refit_payload`'s allowlist applied."""
+    return loads_refit_payload(zmq_socket.recv())
+
 
 def configure_dynamo_cache() -> None:
     """Disable dynamo autotune_local_cache.

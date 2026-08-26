@@ -74,7 +74,9 @@ class AbstractPolicyWorker:
 
     def get_zmq_address(self) -> str:
         """Get the ZMQ address for the current device."""
-        return f"ipc:///tmp/{self.report_device_id()}.sock"
+        from dockyard_rl.models.policy.utils import refit_socket_address
+
+        return refit_socket_address(self.report_device_id())
 
     def maybe_init_zmq(self) -> None:
         """Initialize the ZMQ socket if it doesn't exist."""

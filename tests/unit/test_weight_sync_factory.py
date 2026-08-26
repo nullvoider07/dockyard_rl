@@ -68,6 +68,7 @@ class TestIPCSenderContract:
         from dockyard_rl.models.generation.vllm.vllm_backend import (
             VllmInternalWorkerExtension,
         )
+        from dockyard_rl.models.policy.utils import refit_socket_dir
         from dockyard_rl.models.policy.workers.dtensor_policy_worker import (
             DTensorPolicyWorkerImpl,
         )
@@ -80,7 +81,14 @@ class TestIPCSenderContract:
         receiver.report_device_id = lambda: uuid  # type: ignore[method-assign]
 
         assert sender.get_ipc_zmq_address() == receiver.get_zmq_address()
-        assert sender.get_ipc_zmq_address() == f"ipc:///tmp/{uuid}.sock"
+        # The endpoint moved out of shared /tmp into a per-uid 0700 directory
+        # (2026-08-26 audit follow-up); what this test pins is that both ends
+        # still derive the identical path, since a divergence surfaces only as
+        # a refit hanging to the 120s ZMQ timeout.
+        assert sender.get_ipc_zmq_address().endswith(f"/{uuid}.sock")
+        assert sender.get_ipc_zmq_address().startswith(
+            f"ipc://{refit_socket_dir()}/"
+        )
 
     def test_kv_scales_is_rejected_not_silently_dropped(self):
         """#3226 as originally reported: accepted and never referenced.

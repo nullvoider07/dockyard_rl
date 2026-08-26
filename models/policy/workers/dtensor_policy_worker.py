@@ -49,6 +49,7 @@ from dockyard_rl.utils.device_capability import (
     resolve_device_capability,
     validate_precision,
 )
+from dockyard_rl.models.policy.utils import refit_socket_address
 from dockyard_rl.utils.packed_tensor import packed_broadcast_producer
 
 # Deferred: algorithms/loss submodules
@@ -1922,9 +1923,10 @@ class DTensorPolicyWorkerImpl(
         """Socket path for the colocated vLLM worker on this same GPU.
 
         Must stay identical to VllmBackend.get_zmq_address — both sides compute
-        it independently from the device UUID they each observe.
+        it independently from the device UUID they each observe, which is why
+        the construction lives in one place rather than being spelled out here.
         """
-        return f"ipc:///tmp/{self.report_device_id()}.sock"
+        return refit_socket_address(self.report_device_id())
 
     def _get_ipc_zmq_socket(self):
         """Lazily bind the REQ socket used for IPC weight streaming.

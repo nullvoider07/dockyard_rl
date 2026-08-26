@@ -10,6 +10,7 @@ from dockyard_rl.models.policy.utils import (
     IPCProtocol,
     calculate_aligned_size,
     rebuild_cuda_tensor_from_ipc,
+    recv_refit_payload,
 )
 from dockyard_rl.modelopt.utils import (
     iter_quant_ignore_name_candidates,
@@ -137,7 +138,7 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
         prepare_modelopt_for_weight_reload(self.model_runner.model, device=self.device)
         self.maybe_init_zmq()
         while True:
-            payload = self.zmq_socket.recv_pyobj()
+            payload = recv_refit_payload(self.zmq_socket)
 
             if payload == IPCProtocol.COMPLETE:
                 modelopt_process_weights_after_loading(self.model_runner.model)
