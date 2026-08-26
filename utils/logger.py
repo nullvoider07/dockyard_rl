@@ -65,6 +65,32 @@ class LoggerConfig(TypedDict):
     gpu_monitoring: GPUMonitoringConfig
     num_val_samples_to_print: NotRequired[int]
 
+def _histogram_summary(histogram: list[Any]) -> dict[str, float]:
+    """Reduce a histogram sample list to scalar summary statistics.
+
+    For backends with no histogram media type (swanlab, MLflow). Returns an
+    empty dict for an empty or non-numeric input rather than raising, since a
+    logging failure must not abort a training step.
+    """
+    if len(histogram) == 0:
+        return {}
+    try:
+        values = np.asarray(histogram, dtype=np.float64)
+    except (TypeError, ValueError):
+        return {}
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return {}
+    return {
+        "mean":  float(values.mean()),
+        "min":   float(values.min()),
+        "max":   float(values.max()),
+        "p50":   float(np.percentile(values, 50)),
+        "p90":   float(np.percentile(values, 90)),
+        "p99":   float(np.percentile(values, 99)),
+        "count": float(values.size),
+    }
+
 class LoggerInterface(ABC):
     """Abstract base class for logger backends."""
 
@@ -153,8 +179,28 @@ class TensorboardLogger(LoggerInterface):
                 continue
 
     def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
-        """Log histogram metrics to Tensorboard."""
-        return
+        """Log histogram metrics to Tensorboard.
+
+        Args:
+            histogram: List of histogram values
+            step: Global step value
+            name: Name of the metric
+        """
+        if len(histogram) == 0:
+            return
+        try:
+            self.writer.add_histogram(name, np.asarray(histogram), step)
+        except Exception as e:
+            # add_histogram raises on non-finite values and on inputs numpy
+            # cannot bin. Fall back to the mean so the step is still recorded,
+            # matching the WandB backend's degenerate-input handling.
+            print(f"Warning: Failed to log histogram '{name}' to TensorBoard: {e}")
+            scalar = self._coerce_to_scalar(histogram[0])
+            if scalar is not None:
+                try:
+                    self.writer.add_scalar(name, scalar, step)
+                except Exception:
+                    pass
 
     def log_hyperparams(self, params: Mapping[str, Any]) -> None:
         """Log hyperparameters to Tensorboard.
@@ -428,8 +474,21 @@ class SwanlabLogger(LoggerInterface):
         self.run.log({name: swanlab.Image(figure)}, step=step)
 
     def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
-        """Log histogram metrics to swanlab."""
-        return
+        """Log histogram summary statistics to swanlab.
+
+        swanlab exposes no histogram media type, so the distribution is
+        recorded as scalar summary statistics under ``name``. That loses the
+        shape of the distribution but keeps the run comparable; returning
+        without logging dropped the metric entirely.
+
+        Args:
+            histogram: List of histogram values
+            step: Global step value
+            name: Name of the metric
+        """
+        stats = _histogram_summary(histogram)
+        if stats:
+            self.run.log({f"{name}/{k}": v for k, v in stats.items()}, step=step)
 
 class GpuMetricSnapshot(TypedDict):
     step: int
@@ -809,8 +868,19 @@ class MLflowLogger(LoggerInterface):
         )
 
     def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
-        """Log histogram metrics to MLflow."""
-        return
+        """Log histogram summary statistics to MLflow.
+
+        MLflow has no histogram metric type, so the distribution is recorded as
+        scalar summary statistics under ``name``. See SwanlabLogger for the
+        same trade.
+
+        Args:
+            histogram: List of histogram values
+            step: Global step value
+            name: Name of the metric
+        """
+        for key, value in _histogram_summary(histogram).items():
+            mlflow.log_metric(f"{name}/{key}", value, step=step)
 
     def __del__(self) -> None:
         """Clean up resources when the logger is destroyed."""

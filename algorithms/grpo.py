@@ -1087,6 +1087,31 @@ def aggregate_rollout_metrics(per_group_metrics: dict[str, list]) -> dict[str, A
             aggregated[k] = sum(v) / len(v)
     return aggregated
 
+def _route_histogram_metrics(logger, metrics: dict, step: int) -> None:
+    """Route and remove every histogram/* entry from a metrics dict.
+
+    histogram/* entries are lists of per-sample token counts, emitted
+    unconditionally by the rollout path (experience/rollouts.py:1431,
+    experience/cua/rollout.py:440). Routing them used to be gated on
+    vllm_cfg.async_engine, so a sync-engine run produced them and logged none:
+    the keys fell through to log_metrics, where _coerce_to_scalar rejects a list
+    and the key is skipped with a warning. The producers do not depend on the
+    engine, so neither does the routing.
+
+    Entries are popped rather than copied so the lists do not also reach
+    log_metrics, which is what emitted that warning on every step even when
+    async_engine was set.
+
+    Args:
+        logger: Logger to route to.
+        metrics: Metrics dict, mutated in place.
+        step: Global step value.
+    """
+    for metric_name in [k for k in metrics if k.startswith("histogram/")]:
+        logger.log_histogram(
+            metrics.pop(metric_name), step, f"generation_metrics/{metric_name}"
+        )
+
 def _log_mixed_rewards_and_advantages_information(
     logger,
     total_steps: int,
@@ -2095,18 +2120,7 @@ def grpo_train(
                     logger,
                 )
 
-            if (
-                master_config.policy["generation"]
-                .get("vllm_cfg", {})
-                .get("async_engine", False)
-            ):
-                for metric_name in metrics.keys():
-                    if metric_name.startswith("histogram/"):
-                        logger.log_histogram(
-                            metrics[metric_name],
-                            total_steps + 1,
-                            f"generation_metrics/{metric_name}",
-                        )
+            _route_histogram_metrics(logger, metrics, total_steps + 1)
 
             print("\n📊 Training Results:")
             print(f"  • Loss: {metrics['loss']:.4f}")
@@ -3140,18 +3154,7 @@ def async_grpo_train(
                     logger,
                 )
 
-            if (
-                master_config.policy["generation"]
-                .get("vllm_cfg", {})
-                .get("async_engine", False)
-            ):
-                for metric_name in metrics.keys():
-                    if metric_name.startswith("histogram/"):
-                        logger.log_histogram(
-                            metrics[metric_name],
-                            step + 1,
-                            f"generation_metrics/{metric_name}",
-                        )
+            _route_histogram_metrics(logger, metrics, step + 1)
 
             print("\n📊 Training Results:")
             print(f"  • Loss: {metrics['loss']:.4f}")
