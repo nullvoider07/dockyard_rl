@@ -1082,6 +1082,34 @@ class DTensorPolicyWorkerImpl(
 
             return metrics
 
+    def _restore_packed_row_order(
+        self, outputs: torch.Tensor, data: BatchedDataDict
+    ) -> torch.Tensor:
+        """Scatter per-micro-batch outputs back into ``data``'s row order.
+
+        A no-op unless sequence packing is on. With packing, the micro-batch
+        iterator yields bin-packer row subsets, so concatenating their outputs
+        gives ``outputs[j] = f(data[order[j]])`` for the flattened pack order.
+        The caller wants ``result[i] = f(data[i])``, which is the scatter below.
+
+        Without it the outputs are silently attributed to the wrong sequences:
+        the row count matches, nothing errors, and the driver's ``reorder_data``
+        -- which only undoes the length sort applied before sharding -- assumes
+        the gathered rows are already in this shard's order.
+        """
+        if not self.enable_seq_packing:
+            return outputs
+        order = data.get_packable_sequence_order()
+        if len(order) != outputs.shape[0]:
+            raise RuntimeError(
+                "packed micro-batch outputs do not cover the shard exactly: "
+                f"{outputs.shape[0]} rows for {len(order)} packed indices"
+            )
+        index = torch.as_tensor(order, dtype=torch.long, device=outputs.device)
+        restored = torch.empty_like(outputs)
+        restored[index] = outputs
+        return restored
+
     @wrap_with_nvtx_name("dtensor_policy_worker/get_logprobs")
     def get_logprobs(
         self, data: BatchedDataDict[Any], micro_batch_size: Optional[int] = None
@@ -1371,6 +1399,12 @@ class DTensorPolicyWorkerImpl(
                 )
             all_log_probs_padded.append(lp)
         token_logprobs = torch.cat(all_log_probs_padded, dim=0)
+        # The packed iterator yields bin-packer row subsets, so the concatenation
+        # above is in pack order, not this shard's row order. Everything after
+        # this point -- the mask below, and the driver's reorder_data() undo of
+        # the length sort -- indexes by shard row, so the permutation has to be
+        # undone here.
+        token_logprobs = self._restore_packed_row_order(token_logprobs, data)
 
         if need_top_k_or_top_p_filtering(self.sampling_params):
             mask = data["token_mask"] * data["sample_mask"].unsqueeze(-1)
@@ -1489,9 +1523,16 @@ class DTensorPolicyWorkerImpl(
 
                 rm_scores = to_local_if_dtensor(logits)
                 rm_scores = rm_scores.squeeze(-1)
+                # The dummy micro-batches exist only to keep the collective
+                # count equal across DP ranks; their rows are duplicates of
+                # real ones and must not reach the output (get_logprobs drops
+                # them the same way).
+                if batch_idx >= iterator_len:
+                    continue
                 all_rm_scores.append(rm_scores)
 
         all_rm_scores = torch.cat(all_rm_scores, dim=0)
+        all_rm_scores = self._restore_packed_row_order(all_rm_scores, data)
         all_rm_scores = all_rm_scores.squeeze(-1).cpu()
         return_data = BatchedDataDict[ScoreOutputSpec](
             {

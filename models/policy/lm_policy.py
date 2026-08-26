@@ -307,8 +307,18 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         if config["sequence_packing"]["enabled"]:
             self.use_sequence_packing = True
             sequence_length_pad_multiple = config["make_sequence_length_divisible_by"]
+            # Validate here rather than letting pack_sequences raise KeyError at
+            # the first packed micro-batch, which is after cluster spin-up,
+            # model load and a full rollout.
+            from dockyard_rl.data.packing.algorithms import (
+                validate_packing_algorithm,
+            )
+
+            packing_algorithm = validate_packing_algorithm(
+                config["sequence_packing"]["algorithm"]
+            )
             self.sequence_packing_args: SequencePackingArgs = {
-                "algorithm": config["sequence_packing"]["algorithm"],
+                "algorithm": packing_algorithm,
                 "input_key": "input_ids",
                 "input_lengths_key": "input_lengths",
                 "sequence_length_pad_multiple": sequence_length_pad_multiple,

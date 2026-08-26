@@ -242,6 +242,30 @@ _ALGORITHM_REGISTRY: dict[str, object] = {
     "online_packing": online_packing,
 }
 
+def available_algorithms() -> list[str]:
+    """Names ``pack_sequences`` accepts, sorted.
+
+    Public so a config can be validated where it is read, rather than at the
+    first packed micro-batch -- which is after cluster spin-up, model load and
+    a full rollout.
+    """
+    return sorted(_ALGORITHM_REGISTRY)
+
+
+def validate_packing_algorithm(algorithm: str) -> str:
+    """Return ``algorithm`` if ``pack_sequences`` accepts it, else raise.
+
+    Callers validate at config-resolution time so an unknown name is refused
+    when the policy is constructed, not at the first packed micro-batch.
+    """
+    if algorithm not in _ALGORITHM_REGISTRY:
+        raise ValueError(
+            f"policy.sequence_packing.algorithm={algorithm!r} is not a packing "
+            f"algorithm. Available: {available_algorithms()}."
+        )
+    return algorithm
+
+
 def pack_sequences(
     lengths: list[int],
     max_pack_size: int,

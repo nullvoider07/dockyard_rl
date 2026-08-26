@@ -821,14 +821,37 @@ class BatchedDataDict(Generic[_T]):
         from dockyard_rl.data.packing.algorithms import pack_sequences
 
         lengths = self._packable_lengths(args["input_lengths_key"])
-        # Fixed seed: the iterator and its _len companion are called separately
-        # and must produce identical packs.
-        return pack_sequences(
+        # Fixed seed: the iterator, its _len companion and
+        # get_packable_sequence_order are called separately and must produce
+        # identical packs in an identical order.
+        packs = pack_sequences(
             lengths,
             args["max_tokens_per_microbatch"],
             args.get("algorithm", "first_fit_decreasing"),
             seed=0,
         )
+        # Largest pack first. Every DP rank steps through its micro-batches in
+        # lockstep -- they synchronise at each gradient all-reduce -- so if one
+        # rank meets its heaviest pack at step 0 and another at step 5, both
+        # steps cost the heavy one. Ordering by weight aligns the heavy packs at
+        # the same step index on every rank, and puts peak activation memory on
+        # the first step, where an OOM is immediate rather than mid-epoch. The
+        # index tie-break keeps the order deterministic across the three call
+        # sites above.
+        packs.sort(key=lambda pack: (-sum(lengths[i] for i in pack), pack[0]))
+        return packs
+
+    def get_packable_sequence_order(self) -> list[int]:
+        """Row indices in the order the packed micro-batch iterator yields them.
+
+        ``make_microbatch_iterator_for_packable_sequences`` yields bin-packer
+        row subsets, so concatenating per-micro-batch results reproduces this
+        order and not ``range(size)`` -- the packer sorts by length internally
+        and the pack ordering above sorts by weight. A consumer that returns one
+        output row per input row has to scatter through this permutation before
+        its result lines up with the batch it was handed.
+        """
+        return [index for pack in self._compute_packs() for index in pack]
 
     def make_microbatch_iterator_for_packable_sequences(
         self,
