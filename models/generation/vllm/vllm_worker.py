@@ -13,6 +13,10 @@ import torch
 from transformers import AutoConfig
 
 from dockyard_rl.distributed.batched_data_dict import BatchedDataDict
+from dockyard_rl.utils.device_capability import (
+    resolve_device_capability,
+    validate_precision,
+)
 from dockyard_rl.distributed.worker_groups_utils import (
     get_nsight_config_if_pattern_matches,
 )
@@ -377,6 +381,17 @@ class BaseVllmGenerationWorker:
             )
             vllm_kwargs["ray_workers_use_nsight"] = True
 
+        # Refuse a generation precision this GPU cannot run, before the engine
+        # is constructed. Without this an fp8 config on anything below Hopper
+        # failed somewhere inside vLLM's quantization import instead of at
+        # startup with the device name and what it would need.
+        _capability = resolve_device_capability()
+        validate_precision(
+            str(self.cfg["vllm_cfg"].get("precision", "bfloat16")),
+            _capability,
+            context="policy.generation.vllm_cfg.precision",
+        )
+
         # fp8 quantization (optional ModelOpt integration).
         if self.cfg["vllm_cfg"].get("precision") == "fp8":
             try:
@@ -426,9 +441,13 @@ class BaseVllmGenerationWorker:
             pipeline_parallel_size   = self.pipeline_parallel_size,
             enable_expert_parallel   = self.enable_expert_parallel,
             gpu_memory_utilization   = self.gpu_memory_utilization,
+            # Was `get_device_capability()[0] >= 8` inline -- the only arch
+            # check that existed anywhere in the tree before C1. Same threshold,
+            # now expressed once. A CPU-only resolve (None) keeps the historical
+            # default of off.
             enable_prefix_caching    = self.cfg["vllm_cfg"].get(
                 "enable_prefix_caching",
-                torch.cuda.get_device_capability()[0] >= 8,
+                _capability is not None and _capability.supports_prefix_caching,
             ),
             dtype                    = self.precision,
             seed                     = seed,

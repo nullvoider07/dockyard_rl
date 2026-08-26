@@ -11,6 +11,10 @@ import requests
 import torch
 
 from dockyard_rl.distributed.batched_data_dict import BatchedDataDict
+from dockyard_rl.utils.device_capability import (
+    resolve_device_capability,
+    validate_precision,
+)
 from dockyard_rl.distributed.virtual_cluster import _get_free_port_local, _get_node_ip_local
 from dockyard_rl.distributed.worker_groups_utils import get_nsight_config_if_pattern_matches
 from dockyard_rl.models.generation.interfaces import (
@@ -235,6 +239,18 @@ class SGLangGenerationWorker:
             "port": free_port,
             "torchao_config": "",
         }
+
+        # Same capability gate as the vLLM worker. sglang_cfg.dtype defaults to
+        # ${policy.precision} (bfloat16 in the shipped config) and is forwarded
+        # straight to the SGLang server, so a pre-Ampere card would run emulated
+        # bf16 here exactly as it would on the vLLM path. Applying this to one
+        # transport and not the other is how #3152 happened.
+        if "dtype" in sglang_cfg:
+            validate_precision(
+                str(sglang_cfg["dtype"]),
+                resolve_device_capability(),
+                context="policy.generation.sglang_cfg.dtype",
+            )
 
         for key in [
             "dtype",

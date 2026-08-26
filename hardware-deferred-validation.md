@@ -25,6 +25,23 @@ or PR referencing the `HV-` id.
 
 ## Planned validation pass — Kaggle 2×T4
 
+**Precision override is mandatory on T4 (surfaced by C1, 2026-08-26).** Every shipped
+config sets `precision: "bfloat16"`, and T4 is sm_75 — below the sm80 native-bf16 floor.
+As of C1 the DTensor worker refuses at startup with the device name rather than running
+emulated, so **every config as shipped will now refuse to start on a T4**. Run the pass with
+`policy.precision=float16` (and `policy.generation.vllm_cfg.precision=float16`) overridden
+on the command line.
+
+Do not "fix" this by relaxing the check: `torch.cuda.is_bf16_supported()` returns True on a
+T4 because it counts emulation (`including_emulation=True` falls through to
+`_check_bf16_tensor_supported`), and emulated bf16 is unusable for training throughput —
+it presents as a hang, not an error. The refusal is the feature.
+
+`precision: fp8` is also unavailable on T4, and in fact needs **sm90**, not sm89: dockyard
+only emits block-scaled FP8, and block FP8 starts at Hopper. Measured against the shipped
+vLLM 0.27.1 binary, not inferred.
+
+
 **The intent is to close as much of this ledger as a T4 allows.** Once the upstream-sync
 work is complete (including whatever lands upstream in the meantime), a validation pass
 runs privately on Kaggle, which offers **~30 GPU-hours/week on 2× NVIDIA T4**. That is

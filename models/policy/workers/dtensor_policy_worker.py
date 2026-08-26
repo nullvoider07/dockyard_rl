@@ -45,6 +45,10 @@ from dockyard_rl.models.policy.interfaces import (
     LogprobOutputSpec,
     ScoreOutputSpec,
 )
+from dockyard_rl.utils.device_capability import (
+    resolve_device_capability,
+    validate_precision,
+)
 from dockyard_rl.utils.packed_tensor import packed_broadcast_producer
 
 # Deferred: algorithms/loss submodules
@@ -304,6 +308,17 @@ class DTensorPolicyWorkerImpl(
         self.cpu_offload = self.cfg["dtensor_cfg"]["cpu_offload"]
         self.offload_optimizer_for_logprob = self.cfg["offload_optimizer_for_logprob"]
         self.max_grad_norm = self.cfg["max_grad_norm"]
+
+        # Refuse a precision this GPU cannot run natively, here rather than on
+        # the driver: the worker is the process that owns the device, so this is
+        # the first point where the real capability is knowable. bfloat16 on a
+        # pre-Ampere card is the case that matters -- it runs, emulated, at a
+        # throughput that looks like a hang rather than an error.
+        validate_precision(
+            str(self.cfg["precision"]),
+            resolve_device_capability(),
+            context="policy.precision",
+        )
 
         if self.cfg["precision"] == "float32":
             self.dtype = torch.float32
