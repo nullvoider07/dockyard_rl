@@ -492,8 +492,14 @@ class ClippedPGLossFn(LossFunction):
             )
 
         if self.sequence_level_importance_ratios:
+            # actor_importance_weights is [B, 1] here (unsqueezed at the seq-level
+            # branch above) while sample_mask is [B]. masked_mean multiplies the
+            # two, so passing it unsqueezed broadcasts to [B, B] and sums B^2
+            # terms over global_valid_seqs, inflating the metric ~B-fold. The
+            # gradient path is unaffected -- it consumes the [B, 1] shape against
+            # the [B, S] clip_loss, which is the broadcast it wants.
             sample_importance_ratio = masked_mean(
-                actor_importance_weights, sample_mask,
+                actor_importance_weights.squeeze(-1), sample_mask,
                 global_normalization_factor=global_valid_seqs,
             )
         else:

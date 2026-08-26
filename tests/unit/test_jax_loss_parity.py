@@ -421,3 +421,85 @@ def test_tis_ratio_min_above_ratio_rejected():
             jnp.asarray(float(sample_mask.sum())), jnp.asarray(float(mask.sum())),
             ClippedPGLossConfig(**bad),
         )
+
+
+# The matrix above never sets sequence_level_importance_ratios, and every
+# assertion in this file compares loss and gradient only. That pair of gaps is
+# what let #3753 live: the torch backend inflated sampling_importance_ratio
+# ~B-fold on the seq-level path while JAX computed it correctly, and neither
+# the loss nor the gradient differed, so nothing here could see it.
+_SEQ_MATRIX = list(
+    itertools.product(
+        [True, False],          # use_importance_sampling_correction
+        [None, 3.0],            # ratio_clip_c
+        [0.0, 0.05],            # reference_policy_kl_penalty
+        [None, "tis", "icepop"],  # truncated IS (seq-mask-tis is rejected here)
+    )
+)
+
+
+@pytest.mark.parametrize("use_is,clip_c,kl_pen,tis", _SEQ_MATRIX)
+def test_seq_level_is_parity_including_metrics(use_is, clip_c, kl_pen, tis):
+    """Sequence-level IS: loss, gradient and every shared metric key must agree.
+
+    sequence_level_importance_ratios is mutually exclusive with
+    token_level_loss, so this axis cannot be folded into _MATRIX.
+    """
+    curr, prev, gen, ref, adv, token_mask, sample_mask = _fixtures(seed=7)
+
+    cfg = ClippedPGLossConfig(
+        token_level_loss=False,
+        sequence_level_importance_ratios=True,
+        ratio_clip_min=0.2,
+        ratio_clip_max=0.2,
+        ratio_clip_c=clip_c,
+        reference_policy_kl_penalty=kl_pen,
+        reference_policy_kl_type="k3",
+        use_importance_sampling_correction=use_is,
+        truncated_importance_sampling_type=tis,
+        truncated_importance_sampling_ratio=2.0 if tis else None,
+        truncated_importance_sampling_ratio_min=0.1 if tis == "icepop" else None,
+    )
+
+    mask = token_mask * sample_mask[:, None]
+    gvt = torch.tensor(float(mask.sum()))
+    gvs = torch.tensor(float(sample_mask.sum()))
+
+    if tis is not None and not use_is:
+        with pytest.raises(ValueError, match="truncated IS requires"):
+            ClippedPGLossFn(cfg)
+        return
+
+    curr_t = torch.from_numpy(curr).clone().requires_grad_(True)
+    loss_t, metrics_t = ClippedPGLossFn(cfg)(
+        curr_t,
+        # Plain dict, matching the duck-typed fixture the rest of this file uses.
+        _torch_data(prev, gen, ref, adv, token_mask, sample_mask),  # pyright: ignore[reportArgumentType]
+        gvs,
+        gvt,
+    )
+    loss_t.backward()
+    assert curr_t.grad is not None
+    grad_t = curr_t.grad.detach().numpy()
+
+    def f(curr_j):
+        return jax_loss.clipped_pg_loss(
+            curr_j, _jax_data(prev, gen, ref, adv, token_mask, sample_mask),
+            jnp.asarray(float(sample_mask.sum())), jnp.asarray(float(mask.sum())), cfg,
+        )
+
+    (loss_j, metrics_j), grad_j = jax.value_and_grad(f, has_aux=True)(jnp.asarray(curr))
+
+    np.testing.assert_allclose(float(loss_j), float(loss_t.detach()), atol=2e-4, rtol=2e-4)
+    np.testing.assert_allclose(np.asarray(grad_j), grad_t, atol=2e-4, rtol=2e-4)
+
+    # The metric comparison is the point of this test. sampling_importance_ratio
+    # is the key that diverged; asserting every shared key keeps the next one
+    # from hiding the same way.
+    shared = set(metrics_t) & set(metrics_j)
+    assert "sampling_importance_ratio" in shared
+    for key in sorted(shared):
+        np.testing.assert_allclose(
+            float(metrics_j[key]), float(metrics_t[key]), atol=2e-4, rtol=2e-4,
+            err_msg=f"metric {key!r} diverges between the torch and JAX backends",
+        )
