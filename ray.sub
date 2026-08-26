@@ -258,9 +258,20 @@ if [[ -n "\${DOCKYARD_SEGMENT_SIZE:-}" ]]; then
     CLUSTER_UUID=\$(nvidia-smi -q 2>/dev/null \\
         | grep -m1 -i "ClusterUUID" | awk -F: '{gsub(/[ \\t]/,"",\$2); print \$2}')
     if [[ -n "\$CLUSTER_UUID" ]]; then
+        # Ray silently drops a custom resource whose value is 0. The reader
+        # (virtual_cluster.py:136) then reports TOPO_RANK_UNKNOWN (-1), which
+        # sorts *first*, while nvlink_domain (value 1) still registers so the
+        # node is not skipped -- a rank-0 node is promoted to lowest rank
+        # rather than merely losing its place. Every rank is shifted by 1 so
+        # none is ever 0; the shift is monotonic, so ordering is preserved.
+        #
+        # SLURM_PROCID is not a usable fallback: the head and each worker are
+        # launched as separate --nodes=1 --ntasks=1 srun steps, so PROCID is 0
+        # in every one of them and all nodes would collide on the same rank.
+        # The launcher's node index is injected instead -- 0 for the head,
+        # $i for worker i -- so head lands on 1 and workers on 2..N.
         TOPO_RANK=\$(echo "\${SLURM_TOPOLOGY_ADDR:-}" | grep -oE '[0-9]+' | tail -1)
-        TOPO_RANK="\${TOPO_RANK:-\${SLURM_PROCID:-\$(hostname | grep -oE '[0-9]+' | tail -1)}}"
-        TOPO_RANK="\${TOPO_RANK:-0}"
+        TOPO_RANK=\$(( \${TOPO_RANK:-0} + 1 ))
         RAY_TOPOLOGY_RESOURCES=", \"nvlink_domain_\${CLUSTER_UUID}\": 1, \"topo_rank\": \${TOPO_RANK}"
         echo "[TOPOLOGY] head node: nvlink_domain_\${CLUSTER_UUID}, topo_rank \${TOPO_RANK}"
     else
@@ -384,9 +395,21 @@ if [[ -n "\${DOCKYARD_SEGMENT_SIZE:-}" ]]; then
     CLUSTER_UUID=\$(nvidia-smi -q 2>/dev/null \\
         | grep -m1 -i "ClusterUUID" | awk -F: '{gsub(/[ \\t]/,"",\$2); print \$2}')
     if [[ -n "\$CLUSTER_UUID" ]]; then
+        # Ray silently drops a custom resource whose value is 0. The reader
+        # (virtual_cluster.py:136) then reports TOPO_RANK_UNKNOWN (-1), which
+        # sorts *first*, while nvlink_domain (value 1) still registers so the
+        # node is not skipped -- a rank-0 node is promoted to lowest rank
+        # rather than merely losing its place. Every rank is shifted by 1 so
+        # none is ever 0; the shift is monotonic, so ordering is preserved.
+        #
+        # SLURM_PROCID is not a usable fallback: the head and each worker are
+        # launched as separate --nodes=1 --ntasks=1 srun steps, so PROCID is 0
+        # in every one of them and all nodes would collide on the same rank.
+        # $i is the launcher's node index (the loop starts at 1), expanded
+        # here at write time, so workers land on 2..N and never collide with
+        # the head's 1.
         TOPO_RANK=\$(echo "\${SLURM_TOPOLOGY_ADDR:-}" | grep -oE '[0-9]+' | tail -1)
-        TOPO_RANK="\${TOPO_RANK:-\${SLURM_PROCID:-\$(hostname | grep -oE '[0-9]+' | tail -1)}}"
-        TOPO_RANK="\${TOPO_RANK:-0}"
+        TOPO_RANK=\$(( \${TOPO_RANK:-$i} + 1 ))
         RAY_TOPOLOGY_RESOURCES=", \"nvlink_domain_\${CLUSTER_UUID}\": 1, \"topo_rank\": \${TOPO_RANK}"
         echo "[TOPOLOGY] worker node: nvlink_domain_\${CLUSTER_UUID}, topo_rank \${TOPO_RANK}"
     else
