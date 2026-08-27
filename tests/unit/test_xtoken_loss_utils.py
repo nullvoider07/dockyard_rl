@@ -400,3 +400,60 @@ def test_alignment_from_flat_batch_rebuilds_schema():
     assert batch.pair_valid.shape == (B, P)
     assert batch.student_chunk_id.shape == (B, T_s)
     assert batch.num_chunks.tolist() == [1, 2]
+
+
+# -- projection file: weights_only unpickler ----------------------------------
+#
+# Projection matrices are operator-supplied artifacts -- nothing in the tree
+# produces one -- so the readers must not run whatever __reduce__ the file
+# carries. These pin that the safe unpickler stays on, that the allowlist is
+# wide enough for both real formats, and that it is not wide enough for a
+# gadget.
+
+def test_projection_load_refuses_arbitrary_callables(tmp_path):
+    """A file naming os.system must be refused, not executed."""
+    import os
+    import pickle
+
+    class _Gadget:
+        def __reduce__(self):
+            return (os.system, ("exit 0",))
+
+    p = tmp_path / "gadget.pt"
+    with open(p, "wb") as fh:
+        pickle.dump(_Gadget(), fh)
+
+    for reader in (lu.parse_projection_file, lambda q: lu.get_topk_projection(q, torch.device("cpu"))):
+        try:
+            reader(p)
+            assert False, "expected the gadget to be refused"
+        except ValueError as exc:
+            assert "projection_matrix_path" in str(exc)
+
+
+def test_projection_load_accepts_numpy_counts(tmp_path):
+    """The sparse format's counts may be numpy scalars; the allowlist covers them.
+
+    torch's weights_only unpickler rejects numpy scalars by default, so this
+    fails if _projection_safe_globals stops naming the numpy reconstructor.
+    """
+    import numpy as np
+
+    for dtype in (np.int64, np.int32, np.float64, np.float32):
+        p = tmp_path / f"np_{dtype.__name__}.pt"
+        torch.save({(0, 5): dtype(3), (2, 1): dtype(7)}, p)
+        _indices, values, v_s, v_t = lu.parse_projection_file(p)
+        assert v_s == 3 and v_t == 6
+        assert values.dtype == torch.float32
+
+
+def test_projection_readers_do_not_disable_weights_only():
+    """Source guard: weights_only=False must not come back to this module."""
+    import inspect
+
+    src = inspect.getsource(lu)
+    assert "weights_only=False" not in src, (
+        "a projection reader re-disabled torch's weights_only unpickler; these "
+        "files are operator-supplied artifacts, so that is arbitrary code "
+        "execution from a path in the config"
+    )

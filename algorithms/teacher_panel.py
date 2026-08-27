@@ -46,6 +46,8 @@ from typing import Any, Optional, Sequence
 
 import torch
 
+from dockyard_rl.algorithms.config_access import read_config_value
+
 # How panel logprobs are folded together with the base teacher's.
 COMBINE_MODES = frozenset({"mixture", "geometric"})
 
@@ -64,10 +66,7 @@ def _cfg(cfg: Any, key: str, default: Any) -> Any:
     so the launcher refusal silently never fires, which is the failure this
     module exists to prevent.
     """
-    if hasattr(cfg, "get"):
-        value = cfg.get(key, default)
-    else:
-        value = getattr(cfg, key, default)
+    value = read_config_value(cfg, key, default)
     return default if value is None else value
 
 

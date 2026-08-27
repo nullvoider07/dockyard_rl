@@ -29,6 +29,7 @@ stays import-clean.
 from __future__ import annotations
 
 import os
+import pickle
 from dataclasses import dataclass, fields
 from typing import Any, Dict, Mapping, Optional, Tuple, Union
 
@@ -318,6 +319,65 @@ def valid_chunk_mask(
     return (s_sizes > 0) & (t_sizes > 0) & pair_valid
 
 
+# Projection-matrix files are operator-supplied artifacts named by
+# `projection_matrix_path`, not checkpoints this tree writes: nothing in
+# dockyard_rl produces one. `torch.load` therefore runs whatever `__reduce__`
+# the file carries unless the weights_only unpickler is left on, so these two
+# readers keep torch's default and refuse rather than retrying without it.
+#
+# The allowlist is measured against the two documented formats rather than
+# guessed. Both load under the default: the dense format is `dict[str, Tensor]`,
+# and the sparse format is `dict[(int, int)] -> count`, whose tuple keys the
+# weights_only unpickler already admits. The one real format it rejects is a
+# sparse file whose counts are numpy scalars -- plausible from a counter built
+# over numpy -- so the numpy scalar reconstructor and the dtype classes it names
+# are allowlisted. Verified with torch 2.13.0: int64/int32/float64/float32
+# counts all load, and an `os.system` gadget is still refused with the
+# allowlist active.
+def _projection_safe_globals() -> list[Any]:
+    """Globals a legitimately produced projection matrix may name."""
+    import numpy as np
+
+    globals_: list[Any] = [np.dtype]
+    scalar = getattr(getattr(np, "_core", None), "multiarray", None)
+    if scalar is None:  # numpy < 2 exposes it unprefixed
+        scalar = getattr(getattr(np, "core", None), "multiarray", None)
+    if scalar is not None and hasattr(scalar, "scalar"):
+        globals_.append(scalar.scalar)
+    for name in ("Int64DType", "Int32DType", "Float64DType", "Float32DType"):
+        dtype_cls = getattr(getattr(np, "dtypes", None), name, None)
+        if dtype_cls is not None:
+            globals_.append(dtype_cls)
+    return globals_
+
+
+def _load_projection_file(path: Union[str, os.PathLike]) -> Any:
+    """Load a projection-matrix file under torch's weights_only unpickler.
+
+    Args:
+        path: Path to a ``torch.save``d projection-matrix file.
+
+    Returns:
+        The unpickled object, for the caller to shape-check.
+
+    Raises:
+        ValueError: The file names a global outside the projection formats.
+    """
+    try:
+        with torch.serialization.safe_globals(_projection_safe_globals()):
+            return torch.load(path, map_location="cpu")
+    except pickle.UnpicklingError as exc:
+        raise ValueError(
+            f"Refusing to load the projection matrix at {path}: it names a "
+            "global outside the supported formats, and loading it would run "
+            "code the file chooses. Supported formats are a dense "
+            "dict with 'indices'/'likelihoods' tensors, or a sparse "
+            "dict[(student_id, teacher_id)] -> count whose counts are Python "
+            "or numpy numbers. Regenerate the file, or point "
+            "projection_matrix_path at one that was."
+        ) from exc
+
+
 def parse_projection_file(
     path: Union[str, os.PathLike],
 ) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
@@ -353,7 +413,7 @@ def parse_projection_file(
     """
     if not os.path.exists(path):
         raise FileNotFoundError(f"Projection matrix file not found: {path}")
-    data = torch.load(path, map_location="cpu", weights_only=False)
+    data = _load_projection_file(path)
 
     if isinstance(data, dict) and "indices" in data and "likelihoods" in data:
         # Dense top-k format: indices [V_s, top_k] holds teacher token ids;
@@ -521,7 +581,7 @@ def get_topk_projection(
 
     if not os.path.exists(path):
         raise FileNotFoundError(f"Projection matrix file not found: {path}")
-    data = torch.load(path, map_location="cpu", weights_only=False)
+    data = _load_projection_file(path)
     if not (isinstance(data, dict) and "indices" in data and "likelihoods" in data):
         raise ValueError(
             f"gold_loss requires the dense projection-matrix format "

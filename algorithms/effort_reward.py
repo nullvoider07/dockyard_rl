@@ -52,6 +52,7 @@ import torch
 from typing_extensions import NotRequired, TypedDict
 
 from dockyard_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
+from dockyard_rl.algorithms.config_access import read_config_value
 
 # Estimators whose advantage is a per-prompt group baseline over `rewards`.
 # Everything else either ignores `rewards` outright or has no group at all, so a
@@ -87,7 +88,8 @@ class EffortRewardConfig(TypedDict):
 
 
 def _cfg(cfg: Any, key: str, default: Any) -> Any:
-    value = cfg.get(key, default) if hasattr(cfg, "get") else default
+    """Read one key, tolerating a dict or a pydantic config (see config_access)."""
+    value = read_config_value(cfg, key, default)
     return default if value is None else value
 
 
@@ -107,7 +109,7 @@ def validate_effort_reward_config(
             not positive, the exponent or floor is out of range, or the selected
             advantage estimator / trainer cannot consume the shaped reward.
     """
-    if not cfg or not cfg.get("enabled", False):
+    if not cfg or not _cfg(cfg, "enabled", False):
         return
 
     coefficient = _cfg(cfg, "coefficient", 0.0)
@@ -256,7 +258,7 @@ def apply_effort_reward(
             it: a multi-reward environment sums its components unweighted, so
             `MathMultiRewardEnvironment` alone reaches 3.0.
     """
-    if not cfg or not cfg.get("enabled", False):
+    if not cfg or not _cfg(cfg, "enabled", False):
         return batch
 
     rewards = batch["total_reward"]

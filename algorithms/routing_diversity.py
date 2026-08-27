@@ -47,6 +47,7 @@ import torch
 from typing_extensions import NotRequired, TypedDict
 
 from dockyard_rl.models.generation.vllm.router_capture import MISSING_ROUTE_SENTINEL
+from dockyard_rl.algorithms.config_access import read_config_value
 
 # Column carrying the per-rollout signal from the reward stage to the allocator.
 ROUTING_DIVERSITY_KEY = "routing_diversity"
@@ -67,7 +68,8 @@ class RoutingDiversityConfig(TypedDict):
 
 
 def _cfg(cfg: Any, key: str, default: Any) -> Any:
-    value = cfg.get(key, default) if hasattr(cfg, "get") else default
+    """Read one key, tolerating a dict or a pydantic config (see config_access)."""
+    value = read_config_value(cfg, key, default)
     return default if value is None else value
 
 

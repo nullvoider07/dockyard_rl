@@ -42,6 +42,7 @@ from typing import Any, Optional
 
 import torch
 from typing_extensions import NotRequired, TypedDict
+from dockyard_rl.algorithms.config_access import read_config_value
 
 # Column carrying each row's group id from the caller (which knows the prompt
 # tensor) into the allocator (which does not). Popped off the batch before it
@@ -75,7 +76,8 @@ class GradedAllocationConfig(TypedDict):
 
 
 def _cfg(cfg: Any, key: str, default: Any) -> Any:
-    value = cfg.get(key, default) if hasattr(cfg, "get") else default
+    """Read one key, tolerating a dict or a pydantic config (see config_access)."""
+    value = read_config_value(cfg, key, default)
     return default if value is None else value
 
 
