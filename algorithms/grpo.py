@@ -260,6 +260,44 @@ def _validate_effort_reward_compat(master_config: MasterConfig) -> None:
     )
 
 
+def _validate_kl_in_reward_compat(master_config: MasterConfig) -> None:
+    """Refuse ``use_kl_in_reward`` where ``prev_logprobs`` is a zero placeholder.
+
+    ``loss_fn.force_on_policy_ratio`` with no ``grpo.seq_logprob_error_threshold``
+    skips the prev_logprobs forward and substitutes ``torch.zeros_like`` (the
+    sync path at the train-data assembly, and the async colocated path). Every
+    ``compute_advantage`` call site passes that column as ``logprobs_policy``,
+    so ``ReinforcePlusPlusAdvantageEstimator`` would evaluate
+    ``calculate_kl(zeros, reference)`` and subtract ``kl_coef`` times a
+    fabricated divergence from every advantage -- silently, since the shapes
+    are right and nothing errors.
+
+    ``reference_policy_kl_penalty == 0`` zeros the term regardless, so that
+    combination is allowed. The data-plane path refuses ``force_on_policy_ratio``
+    outright and is unaffected; ``opd.assert_prev_logprobs_available`` guards
+    the OPD estimator only, not this one.
+    """
+    loss_cfg = master_config.loss_fn
+    if not getattr(loss_cfg, "use_kl_in_reward", False):
+        return
+    if not getattr(loss_cfg, "force_on_policy_ratio", False):
+        return
+    if master_config.grpo.get("seq_logprob_error_threshold") is not None:
+        return
+    if not getattr(loss_cfg, "reference_policy_kl_penalty", 0.0):
+        return
+    raise ValueError(
+        "loss_fn.use_kl_in_reward=True is unsupported with "
+        "loss_fn.force_on_policy_ratio=True and grpo.seq_logprob_error_threshold "
+        "unset: prev_logprobs is replaced by zeros on that path, so the KL term "
+        "would measure the distance from a zero tensor to the reference policy "
+        "and subtract it from every advantage. Set "
+        "grpo.seq_logprob_error_threshold to keep the prev_logprobs forward, "
+        "disable loss_fn.use_kl_in_reward, or set "
+        "loss_fn.reference_policy_kl_penalty to 0."
+    )
+
+
 def _validate_graded_allocation_compat(master_config: MasterConfig) -> None:
     """Marshal config for ``validate_graded_allocation_config`` (F3a).
 
@@ -711,6 +749,7 @@ def setup(
     # vLLM-engine configs before any worker is constructed.
     _validate_router_replay_compat(master_config, generation_config, backend)
     _validate_effort_reward_compat(master_config)
+    _validate_kl_in_reward_compat(master_config)
     _validate_graded_allocation_compat(master_config)
     _validate_routing_diversity_compat(master_config)
 
