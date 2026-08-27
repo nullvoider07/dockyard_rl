@@ -285,6 +285,95 @@ class TestApplyingTheTerm:
             apply_effort_reward(batch, CFG, prompt_ids=prompts)
 
 
+class TestItComposesWithTheRestOfTheRewardPipeline:
+    """The term runs last, after scaling, shaping and the invalid-action penalty.
+
+    The first implementation wrote `correctness * (1 - lambda_eff*cost)`, which
+    discards every upstream modification. With `reward_shaping.enabled: true` --
+    the default in grpo_swe.yaml -- a rollout penalised to -3.72 for overrunning
+    its length budget came back out at +0.82, its penalty silently gone. Every
+    unit test passed before and after that was fixed, which is why these exist.
+    """
+
+    def test_an_upstream_penalty_survives(self):
+        from dockyard_rl.algorithms.reward_functions import apply_reward_shaping
+
+        batch, prompts = _batch(
+            [1.0, 1.0, 0.0, 0.0], [_log(3000), _log(500), _log(400), _log(400)]
+        )
+        apply_reward_shaping(
+            batch,
+            cast(Any, {
+                "enabled": True,
+                "overlong_buffer_length": 256,
+                "overlong_buffer_penalty": 1.0,
+                "max_response_length": 2048,
+                "stop_properly_penalty_coef": None,
+            }),
+        )
+        shaped = batch["total_reward"].clone()
+        assert shaped[0] < -3.0, "precondition: shaping penalised the long rollout"
+
+        apply_effort_reward(batch, dict(CFG, max_response_tokens=4096), prompt_ids=prompts)
+
+        assert batch["total_reward"][0] < shaped[0], (
+            "the effort term must subtract from the shaped reward, not replace it"
+        )
+
+    def test_the_upstream_delta_is_preserved_exactly(self):
+        """R = r - c*lambda_eff*k, so (R - r) depends only on this term."""
+        batch, prompts = _batch([1.0, 1.0, 0.0, 0.0], [_log(50)] * 4)
+        batch["unshaped_total_reward"] = torch.tensor([1.0, 1.0, 0.0, 0.0])
+        batch["total_reward"] = torch.tensor([-5.0, 1.0, 0.0, 0.0])
+
+        apply_effort_reward(batch, CFG, prompt_ids=prompts)
+
+        delta = batch["total_reward"] - torch.tensor([-5.0, 1.0, 0.0, 0.0])
+        torch.testing.assert_close(delta[0], delta[1])
+
+    def test_it_reduces_to_the_plain_form_when_nothing_ran_before(self):
+        """r == c, so R == c*(1 - lambda_eff*k) exactly."""
+        batch, prompts = _batch([1.0, 1.0, 0.0, 0.0], [_log(50)] * 4)
+
+        apply_effort_reward(batch, CFG, prompt_ids=prompts)
+
+        lam_eff = 0.8 * 0.5**2
+        expected = 1.0 * (1.0 - lam_eff * 0.5)
+        assert batch["total_reward"][0].item() == pytest.approx(expected)
+
+    def test_a_failed_rollout_keeps_its_upstream_penalty_untouched(self):
+        """c == 0, so the term contributes exactly nothing to a failure."""
+        batch, prompts = _batch([1.0, 0.0], [_log(50), _log(100)])
+        batch["unshaped_total_reward"] = torch.tensor([1.0, 0.0])
+        batch["total_reward"] = torch.tensor([1.0, -2.0])
+
+        apply_effort_reward(batch, CFG, prompt_ids=prompts)
+
+        assert batch["total_reward"][1].item() == pytest.approx(-2.0)
+
+    def test_a_message_log_of_the_wrong_length_is_refused(self):
+        """Otherwise each rollout is priced against another rollout's tokens.
+
+        `BatchedDataDict` enforces this itself, so the guard only fires for the
+        plain-mapping call shape the signature also admits.
+        """
+        batch = {
+            "total_reward": torch.tensor([1.0, 1.0]),
+            "message_log": [_log(50)],
+        }
+        prompts = torch.full((2, 1), 7, dtype=torch.long)
+
+        with pytest.raises(ValueError, match="message_log has 1 entries"):
+            apply_effort_reward(batch, CFG, prompt_ids=prompts)
+
+    def test_the_container_catches_it_first_on_the_normal_path(self):
+        """Pins that the guard is belt-and-braces, not the only line of defence."""
+        batch: Any = BatchedDataDict({"total_reward": torch.tensor([1.0, 1.0])})
+
+        with pytest.raises(ValueError, match="batch size"):
+            batch["message_log"] = [_log(50)]
+
+
 class TestTheBoundIsWhatPreventsInversion:
     """Property test, not a worked example.
 

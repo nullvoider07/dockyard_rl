@@ -59,6 +59,12 @@ grpo:
   # difficulty_exponent 1.0 + difficulty_floor 1/num_generations_per_prompt
   # reproduces ALP (arXiv 2506.05256); a higher exponent is more permissive on
   # hard prompts. Requires adv_estimator.name=grpo and the sync trainer.
+  #
+  # This term runs LAST and subtracts from whatever the pipeline produced, so it
+  # composes with reward_shaping above rather than replacing it. Note that both
+  # price length: reward_shaping is a threshold penalty on pathological outputs,
+  # this is a graded difficulty-gated tax. Running both is deliberate only if
+  # you want both -- otherwise set reward_shaping.enabled to false.
   effort_reward:
     enabled: false
     coefficient: 0.5

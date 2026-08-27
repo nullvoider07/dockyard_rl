@@ -4,8 +4,11 @@ The objective: spend fewer tokens where the group already solves the prompt, and
 stop taxing long reasoning where it does not. Difficulty is read from the group's
 own pass rate, so no difficulty labels exist anywhere.
 
-    R_i      =  c_i · (1 − λ_eff · k_i)
+    R_i      =  r_i − c_i · λ_eff · k_i
     λ_eff    =  λ · max(p̄, floor)^γ
+
+which is ``c_i · (1 − λ_eff · k_i)`` whenever nothing upstream has modified the
+reward, and preserves the upstream delta when something has.
 
 where ``c_i`` is correctness, ``k_i`` is normalized effort cost, and ``p̄`` is the
 group's mean correctness.
@@ -274,8 +277,17 @@ def apply_effort_reward(
             "environment reward or leave this term disabled."
         )
 
+    message_log = batch["message_log"]
+    if len(message_log) != len(rewards):
+        raise ValueError(
+            f"effort_reward: message_log has {len(message_log)} entries but the "
+            f"batch has {len(rewards)} rewards. Cost is read per row from the "
+            "message log, so a mismatch would price each rollout against another "
+            "rollout's token count."
+        )
+
     cost = normalize_effort_cost(
-        response_token_counts(batch["message_log"]),
+        response_token_counts(message_log),
         int(_cfg(cfg, "max_response_tokens", 0)),
     ).to(rewards.device)
 
@@ -287,7 +299,16 @@ def apply_effort_reward(
     # `input_ids` is deleted long before metrics are assembled, and reaching for
     # it there raises UnboundLocalError on every step, enabled or not.
     batch["effort_pass_rate"] = pass_rate.to(rewards.device)
-    batch["total_reward"] = correctness * (1.0 - lam_eff * cost)
+    # Subtract rather than replace, so the term COMPOSES with whatever ran
+    # before it. Writing `correctness * (1 - lam_eff*cost)` discards every
+    # upstream modification: with reward_shaping enabled -- the default in
+    # grpo_swe.yaml -- a rollout penalised to -3.72 for overrunning its length
+    # budget came back out at +0.82, its penalty silently gone. Expanding
+    #     c*(1 - lam_eff*k) + (r - c)   ==   r - c*lam_eff*k
+    # keeps the identical result when nothing upstream touched the reward
+    # (r == c), leaves failures untouched (c == 0), and preserves the upstream
+    # delta exactly when something did.
+    batch["total_reward"] = rewards - correctness * lam_eff * cost
     return batch
 
 
