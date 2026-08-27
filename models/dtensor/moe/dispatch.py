@@ -70,9 +70,9 @@ class LocalTokenDispatcher:
         expert-sorted scores.
         """
         token_indices_experts_sorted_N = torch.argsort(
-            topk_expert_ids_TK.view(-1), stable=True
+            topk_expert_ids_TK.reshape(-1), stable=True
         )
-        topk_scores_experts_sorted_N = topk_scores_TK.view(-1)[
+        topk_scores_experts_sorted_N = topk_scores_TK.reshape(-1)[
             token_indices_experts_sorted_N
         ]
         # N routed slots map back to T tokens (K slots per token).
@@ -227,7 +227,7 @@ class AllToAllTokenDispatcher(LocalTokenDispatcher):
                 )
             )
             input_splits = (
-                num_local_tokens_per_expert_E.view(ep_size, -1)
+                num_local_tokens_per_expert_E.reshape(ep_size, -1)
                 .sum(dim=1)
                 .to(torch.device("cpu"))
             )
@@ -283,11 +283,11 @@ class AllToAllTokenDispatcher(LocalTokenDispatcher):
         ep_size = self.ep_mesh.size()
         device = num_global_tokens_per_local_expert_E.device
 
-        t_mat = num_global_tokens_per_local_expert_E.view(ep_size, -1)
+        t_mat = num_global_tokens_per_local_expert_E.reshape(ep_size, -1)
         input_starts = (
             num_global_tokens_per_local_expert_E.cumsum(0)
             - num_global_tokens_per_local_expert_E
-        ).view(ep_size, -1)
+        ).reshape(ep_size, -1)
 
         # Transpose (EP, e) -> (e, EP) and flatten for expert-major segments.
         segment_lens = t_mat.t().reshape(-1)

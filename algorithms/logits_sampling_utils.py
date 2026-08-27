@@ -132,7 +132,10 @@ def _apply_top_k_top_p_fn(
     # Save original shape and flatten to 2D for consistent chunking.
     original_shape = logits.shape
     vocab_size = logits.shape[-1]
-    logits = logits.view(-1, vocab_size)  # [*, vocab_size] -> [num_tokens, vocab_size]
+    # reshape, not view: the caller owns this tensor's layout, and a
+    # sequence-dim slice (logits[:, :-1], a chunked [:, a:b, :]) is not
+    # contiguous for any batch size above 1.
+    logits = logits.reshape(-1, vocab_size)  # [*, V] -> [num_tokens, V]
     num_tokens = logits.shape[0]
 
     chunk_size = chunk_size if chunk_size is not None else num_tokens

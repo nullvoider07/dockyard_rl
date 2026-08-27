@@ -392,8 +392,14 @@ def stream_weights_via_ipc_zmq_impl(
     def pack_tensor(buffer, tensor, used_bytes) -> int:
         """Pack tensor into buffer and return new used_bytes."""
         tensor_bytes = tensor.nbytes
+        # reshape, not view: this receives whatever the refit generator yields.
+        # Before the fp32 router bias was exempted from the dtype cast, every
+        # tensor arrived as a fresh contiguous copy from .to(bf16); a tensor
+        # already in the target dtype is now passed through with its layout
+        # intact. reshape(-1) also guarantees the 1-D result the uint8
+        # reinterpretation below requires.
         buffer[used_bytes : used_bytes + tensor_bytes].data.copy_(
-            tensor.data.view(-1).view(dtype=torch.uint8), non_blocking=True
+            tensor.data.reshape(-1).view(dtype=torch.uint8), non_blocking=True
         )
         return used_bytes + calculate_aligned_size(tensor_bytes)
 

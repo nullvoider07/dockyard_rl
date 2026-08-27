@@ -396,7 +396,7 @@ class DistributedLogprobWithSampling(torch.autograd.Function):
         BS_local = BS // world_size
 
         # Reshape to 2D for all_to_all
-        reshaped_vocab_parallel_logits = vocab_parallel_logits.view(BS, V_local)
+        reshaped_vocab_parallel_logits = vocab_parallel_logits.reshape(BS, V_local)
 
         # Flatten target: [B, S] -> [BS]
         target_flat = target.flatten()  # [BS]
@@ -526,7 +526,7 @@ class ChunkedDistributedLogprobWithSampling(torch.autograd.Function):
 
         # Convert chunk_size from sequence dimension to batch-sequence dimension
         effective_chunk_size = chunk_size * B
-        reshaped_vocab_parallel_logits = vocab_parallel_logits.view(BS, V_local)
+        reshaped_vocab_parallel_logits = vocab_parallel_logits.reshape(BS, V_local)
 
         # Make sure the effective chunk size is divisible by the world size
         # This ensure all the chunks (including the last one) meet the world size requirement.
@@ -1259,7 +1259,8 @@ class AllGatherCPTensor(torch.autograd.Function):
         # slicer[seq_dim] = slice(ctx.unpadded_seqlen, None)
         #     grad_output[tuple(slicer)] = 0
 
-        grad_output = grad_output.view(
+        # autograd makes no contiguity guarantee about grad_output.
+        grad_output = grad_output.reshape(
             *grad_output.shape[0:seq_dim],
             2 * cp_size,
             grad_output.shape[seq_dim] // (2 * cp_size),
@@ -2150,7 +2151,7 @@ def all_to_all_sq2vp(
 
     # Rearrange input: split vocab into chunks for sending to different ranks
     # Equivalent to: "bs (w v) -> (w bs v)", w=world_size, bs=BS_local, v=V_local
-    input_reshaped = seq_parallel_logits.view(BS_local, world_size, V_local)
+    input_reshaped = seq_parallel_logits.reshape(BS_local, world_size, V_local)
     input_permuted = input_reshaped.permute(1, 0, 2).contiguous()
     input_flat = input_permuted.flatten()
 

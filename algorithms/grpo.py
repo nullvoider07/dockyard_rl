@@ -1220,7 +1220,7 @@ def compute_and_apply_seq_logprob_error_masking(
         if num_masked_seqs > 0:
             diff_mask_bool        = diff_mask.bool()
             masked_correct_count  = (
-                rewards.view(-1)[diff_mask_bool] == 1
+                rewards.reshape(-1)[diff_mask_bool] == 1
             ).sum().item()
             masked_correct_pct = masked_correct_count / num_masked_seqs
 

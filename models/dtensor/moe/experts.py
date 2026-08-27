@@ -86,9 +86,12 @@ class GroupedExperts(nn.Module):
         B, L, D = x_BLD.shape
         K = topk_scores_BLK.size(-1)
         T = B * L
-        x_TD = x_BLD.view(T, D)
-        topk_scores_TK = topk_scores_BLK.view(T, K)
-        topk_expert_ids_TK = topk_expert_ids_BLK.view(T, K)
+        # reshape: these arrive from the caller, so their layout is not this
+        # module's to assume (a context-parallel or sliced activation is not
+        # contiguous).
+        x_TD = x_BLD.reshape(T, D)
+        topk_scores_TK = topk_scores_BLK.reshape(T, K)
+        topk_expert_ids_TK = topk_expert_ids_BLK.reshape(T, K)
 
         routed_input_RD, counts_E, metadata = self.dispatcher.dispatch(
             x_TD, topk_scores_TK, topk_expert_ids_TK, num_local_tokens_per_expert_E
