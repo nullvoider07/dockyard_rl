@@ -35,6 +35,12 @@ from dockyard_rl.algorithms.loss import (
     ClippedPGLossFn,
 )
 from dockyard_rl.algorithms.loss.interfaces import LossFunction
+from dockyard_rl.algorithms.effort_reward import (
+    EffortRewardConfig,
+    apply_effort_reward,
+    effort_reward_metrics,
+    validate_effort_reward_config,
+)
 from dockyard_rl.algorithms.reward_functions import (
     RewardShapingConfig,
     apply_invalid_action_penalty,
@@ -137,6 +143,9 @@ class GRPOConfig(TypedDict):
     batch_multiplier:                           NotRequired[float]
     reward_shaping:                             RewardShapingConfig
     reward_scaling:                             RewardScalingConfig
+    # Difficulty-gated effort reward (F2). Disabled by default; the disabled
+    # path is byte-unchanged.
+    effort_reward:                              NotRequired[EffortRewardConfig | None]
     # Native invalid-action / malformed-thinking reward penalty (#2656).
     invalid_action_penalty:                     NotRequired[InvalidActionPenaltyConfig | None]
     # Structured (Hermes) tool-use protocol. Disabled (default) is a strict
@@ -208,6 +217,22 @@ def _validate_router_replay_compat(
         data_plane_enabled=data_plane_enabled,
         vllm_cfg=generation_config.get("vllm_cfg", {}),
         vllm_kwargs=generation_config.get("vllm_kwargs", {}),
+    )
+
+
+def _validate_effort_reward_compat(master_config: MasterConfig) -> None:
+    """Marshal config for ``validate_effort_reward_config`` (F2).
+
+    Inert when the effort reward is disabled. Runs at setup so an estimator or
+    trainer that cannot consume the shaped reward is refused before any worker
+    is constructed, rather than producing a run whose config reads as live.
+    """
+    grpo_cfg = master_config.grpo
+    estimator = (grpo_cfg.get("adv_estimator") or {}).get("name", "grpo")
+    validate_effort_reward_config(
+        grpo_cfg.get("effort_reward"),
+        estimator_name=estimator,
+        trainer="sync",
     )
 
 
@@ -619,6 +644,7 @@ def setup(
     # Router-replay (#2908): fail fast on incompatible backend / data_plane /
     # vLLM-engine configs before any worker is constructed.
     _validate_router_replay_compat(master_config, generation_config, backend)
+    _validate_effort_reward_compat(master_config)
 
     if backend == "vllm":
         generation_config = cast(VllmConfig, generation_config)
@@ -1622,6 +1648,23 @@ def grpo_train(
                     master_config.grpo.get("invalid_action_penalty"),
                     step=total_steps,
                 )
+                # F2: prices generated tokens against how hard the group found
+                # the prompt. Runs last in the reward pipeline so `p̄` reads the
+                # correctness the environment and the penalties agreed on, and
+                # before the baseline below so the shaped reward is what the
+                # advantage is taken over. It leaves `unshaped_total_reward`
+                # behind, which is what keeps dynamic sampling's variance gate
+                # on the task metric rather than on this term's spread.
+                # `input_ids` is the flattened PROMPT (built at :1536, before
+                # generation appends responses), which is the same grouping key
+                # the baseline below uses. Grouping p̄ by anything else -- the
+                # full sequence, say -- would put every rollout in its own group
+                # and make the pass rate identically its own correctness.
+                repeated_batch = apply_effort_reward(
+                    repeated_batch,
+                    master_config.grpo.get("effort_reward"),
+                    prompt_ids=input_ids,
+                )
 
                 # Rewards & advantages
                 memory_tracker.snapshot_start_of_stage("Processing rewards", dir())
@@ -1972,6 +2015,7 @@ def grpo_train(
                     metrics.update(
                         {f"moe/{k}": v for k, v in train_results["moe_metrics"].items()}
                     )
+                metrics.update(effort_reward_metrics(repeated_batch))
                 if master_config.grpo["use_dynamic_sampling"]:
                     metrics["filtered_reward"] = rewards.numpy()
                     # Unfiltered rewards for this generation batch, so the logged

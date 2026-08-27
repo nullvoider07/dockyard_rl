@@ -46,6 +46,26 @@ grpo:
     max_response_length: ${policy.max_total_sequence_length}
     stop_properly_penalty_coef: null
 
+  # F2 — difficulty-gated effort reward. Prices generated tokens against how
+  # hard the prompt's own rollout group found it: full pressure where the group
+  # already succeeds, effectively none where it does not. Off by default; the
+  # disabled path is byte-unchanged.
+  #
+  # coefficient must be < 1. Effort cost is clamped to [0, 1], so that is
+  # exactly the bound keeping every successful rollout ranked above every failed
+  # one -- at or above 1 the group-relative advantage can invert on hard prompts
+  # and the policy learns to give up early.
+  #
+  # difficulty_exponent 1.0 + difficulty_floor 1/num_generations_per_prompt
+  # reproduces ALP (arXiv 2506.05256); a higher exponent is more permissive on
+  # hard prompts. Requires adv_estimator.name=grpo and the sync trainer.
+  effort_reward:
+    enabled: false
+    coefficient: 0.5
+    difficulty_exponent: 1.0
+    difficulty_floor: 0.125          # 1 / num_generations_per_prompt
+    max_response_tokens: 4096
+
   reward_scaling:
     enabled: false
     source_min: 0.0

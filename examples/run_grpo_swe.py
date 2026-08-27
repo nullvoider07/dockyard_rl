@@ -72,9 +72,13 @@ def _validate_async_grpo_config(config: MasterConfig) -> None:
             "use_dynamic_sampling is not supported with async GRPO."
         )
 
-    # Reward scaling and shaping not supported with async GRPO.
-    for feature in ("reward_scaling", "reward_shaping"):
-        if feature in config.grpo and config.grpo[feature].get("enabled", False):
+    # Reward scaling, shaping and the effort term are applied only by the sync
+    # trainer's reward pipeline; the async and data-plane paths run the
+    # invalid-action penalty and nothing else, so an enabled one here would read
+    # as configured and never be applied.
+    for feature in ("reward_scaling", "reward_shaping", "effort_reward"):
+        feature_cfg = config.grpo.get(feature)
+        if feature_cfg and feature_cfg.get("enabled", False):
             raise NotImplementedError(
                 f"{feature} is not supported with async GRPO."
             )
