@@ -25,6 +25,10 @@ from dockyard_rl.models.generation.interfaces import (
 )
 from dockyard_rl.models.generation.sglang.config import SGLangConfig
 from dockyard_rl.models.generation.sglang.utils import AsyncLoopThread
+from dockyard_rl.utils.device_query import (
+    suppress_ray_visible_devices,
+    visible_devices_value,
+)
 
 try:
     from dockyard_rl.utils.nsys import wrap_with_nvtx_name
@@ -144,10 +148,10 @@ class SGLangGenerationWorker:
             # All workers see the same global CUDA_VISIBLE_DEVICES, but use different
             # logical GPU ranges via base_gpu_id
             resources["num_gpus"] = 0
-            env_vars["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
+            suppress_ray_visible_devices(env_vars)
             init_kwargs["fraction_of_gpus"] = num_gpus
         else:
-            env_vars["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
+            suppress_ray_visible_devices(env_vars)
 
         return resources, env_vars, init_kwargs
 
@@ -199,8 +203,8 @@ class SGLangGenerationWorker:
 
         base_gpu_id = bundle_indices[0] if bundle_indices else 0
 
-        # Get the global CUDA_VISIBLE_DEVICES (all engines see the same global value)
-        global_cvd = os.environ.get("CUDA_VISIBLE_DEVICES", None)
+        # The global visible-device list (all engines see the same value).
+        global_cvd = visible_devices_value()
 
         logger.info(
             f"[SGLang Server] Rank {self.global_rank}: "
@@ -276,7 +280,7 @@ class SGLangGenerationWorker:
         self.base_url = f"http://{node_ip}:{free_port}"
 
         logger.info(
-            f"[SGLang Worker] Rank {self.global_rank} Starting on {self.base_url}, CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', None)}, base_gpu_id: {base_gpu_id}"
+            f"[SGLang Worker] Rank {self.global_rank} Starting on {self.base_url}, visible_devices: {visible_devices_value()}, base_gpu_id: {base_gpu_id}"
         )
 
         self.session: Optional[aiohttp.ClientSession] = None
@@ -351,7 +355,7 @@ class SGLangGenerationWorker:
         Returns:
             List of GPU UUIDs (e.g., ["GPU-xxxxx", "GPU-yyyyy"])
         """
-        from dockyard_rl.utils.nvml import get_device_uuid
+        from dockyard_rl.utils.device_query import get_device_uuid
 
         # Get all GPU UUIDs used by this server
         # SGLang server uses GPUs starting from base_gpu_id with tp_size GPUs

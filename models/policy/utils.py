@@ -19,6 +19,8 @@ from transformers import (
     AutoModelForTextToWaveform,
 )
 
+from dockyard_rl.utils.device_query import visible_devices_entries
+
 # Deferred — dockyard_rl.distributed.worker_group_utils is not yet written.
 try:
     from dockyard_rl.distributed.worker_groups_utils import (
@@ -143,10 +145,9 @@ def get_gpu_info(model: torch.nn.Module) -> dict[str, Any]:
     local_device_id = device
     global_device_id = local_device_id
 
-    if "CUDA_VISIBLE_DEVICES" in os.environ:
-        cuda_visible_devices = os.environ["CUDA_VISIBLE_DEVICES"].split(",")
-        if local_rank < len(cuda_visible_devices):
-            global_device_id = int(cuda_visible_devices[local_rank])
+    visible_devices = visible_devices_entries()
+    if visible_devices is not None and local_rank < len(visible_devices):
+        global_device_id = int(visible_devices[local_rank])
 
     # Grab one trainable parameter to confirm CUDA device placement.
     param_info = {}

@@ -31,6 +31,10 @@ from dockyard_rl.models.generation.vllm.router_capture import (
     routed_experts_from_vllm_output,
     stack_routed_experts,
 )
+from dockyard_rl.utils.device_query import (
+    clear_visible_devices,
+    suppress_ray_visible_devices,
+)
 from .utils import (
     format_prompt_for_vllm_generation,
 )
@@ -172,7 +176,7 @@ class BaseVllmGenerationWorker:
         if is_parallel:
             # vLLM manages CUDA device assignment internally for TP/PP groups.
             resources["num_gpus"] = 0
-            env_vars["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
+            suppress_ray_visible_devices(env_vars)
             init_kwargs["fraction_of_gpus"] = num_gpus
 
         env_vars["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
@@ -333,7 +337,7 @@ class BaseVllmGenerationWorker:
         model_parallel_size = self.tensor_parallel_size * self.pipeline_parallel_size
 
         if model_parallel_size > 1:
-            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+            clear_visible_devices()
             os.environ["VLLM_RAY_PER_WORKER_GPUS"] = str(
                 self.fraction_of_gpus / model_parallel_size
             )

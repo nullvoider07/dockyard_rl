@@ -8,7 +8,8 @@ strategy, resource spec, and NCCL topology to apply.
 Two operating modes:
   Data-centre  — RAY_ADDRESS is set; attach unconditionally.
   Local-dev    — RAY_ADDRESS absent; reuse or start a local cluster
-                 keyed by CUDA_VISIBLE_DEVICES for fast iteration.
+                 keyed by the effective visible-device list for fast
+                 iteration.
 """
 
 import importlib
@@ -17,6 +18,10 @@ import os
 from typing import Optional
 
 import ray
+from dockyard_rl.utils.device_query import (
+    drop_ray_visible_device_opt_outs,
+    visible_devices_value,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,9 +72,9 @@ def init_ray(log_dir: Optional[str] = None) -> None:
                  Defaults to Ray's own default when None.
     """
     env_vars = dict(os.environ)
-    # Ray sets this internally on workers; carrying it across causes
+    # Ray sets these internally on workers; carrying them across causes
     # double-init errors on any worker that calls ray.init() itself.
-    env_vars.pop("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", None)
+    drop_ray_visible_device_opt_outs(env_vars)
     runtime_env = {"env_vars": env_vars}
 
     temp_dir = os.path.abspath(log_dir) if log_dir else None
@@ -104,10 +109,14 @@ def _attach_or_start_local(
     """Attempt to reuse a local cluster; start a fresh one if none exists.
 
     Clusters started by this function carry a custom resource
-    "dockyard_tag_<cvd>" so a second process on the same machine whose
-    CUDA_VISIBLE_DEVICES matches can reattach rather than cold-start.
+    "dockyard_tag_<devices>" so a second process on the same machine whose
+    visible devices match can reattach rather than cold-start. The tag is built
+    from the effective visible-device list rather than CUDA_VISIBLE_DEVICES
+    alone: on a host where the devices are pinned by HIP_VISIBLE_DEVICES, every
+    distinct set would otherwise tag as "ALL" and two processes holding
+    different GPUs would reattach to each other's cluster.
     """
-    cvd     = os.environ.get("CUDA_VISIBLE_DEVICES", "ALL")
+    cvd     = visible_devices_value() or "ALL"
     cvd     = ",".join(sorted(cvd.split(",")))
     cvd_tag = f"{_TAG_PREFIX}{cvd.replace(',', '_')}"
 

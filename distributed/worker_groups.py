@@ -20,6 +20,7 @@ from dockyard_rl.distributed.worker_groups_utils import (
     get_nsight_config_if_pattern_matches,
     recursive_merge_options,
 )
+from dockyard_rl.utils.device_query import drop_ray_visible_device_opt_outs
 
 logger = logging.getLogger(__name__)
 
@@ -829,8 +830,8 @@ class RayWorkerGroup:
                 worker_env = deepcopy(base_env)
 
                 # Drop Ray internal vars that workers must set themselves.
+                drop_ray_visible_device_opt_outs(worker_env)
                 for key in (
-                    "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
                     "RAY_CLIENT_MODE",
                     "RAY_JOB_ID",
                     "RAY_LD_PRELOAD",

@@ -210,3 +210,37 @@ def validate_precision(
         f"than substituting a different dtype, because a silent downgrade "
         f"changes training numerics without reporting it."
     )
+
+
+def fp8_e4m3_dtype() -> torch.dtype:
+    """The e4m3 FP8 encoding the current device actually implements.
+
+    Two encodings exist and they are not interchangeable. NVIDIA and CDNA4
+    (gfx950) use OCP ``float8_e4m3fn``; CDNA3 (gfx942 -- MI300X/MI325X) uses
+    ``float8_e4m3fnuz``, which differs in how it encodes zero's sign and NaN.
+    Casting with the wrong one produces wrong numbers rather than an error,
+    which is why this is resolved rather than hardcoded.
+
+    The answer is taken from the pinned vLLM's own platform layer rather than
+    reimplemented here: ``RocmPlatform.is_fp8_fnuz()`` matches ``"gfx94"`` as a
+    prefix of the reported ``gcnArchName``, and a second copy of that rule in
+    this tree could only drift away from the kernels that consume the tensors.
+
+    Raises:
+        RuntimeError: On a HIP build where vLLM cannot be imported. The encoding
+            is genuinely ambiguous there and guessing it would corrupt weights
+            silently; on a CUDA build it is not ambiguous, so vLLM's absence is
+            not an error.
+    """
+    try:
+        from vllm.platforms import current_platform
+    except ImportError as exc:
+        if torch.version.hip:
+            raise RuntimeError(
+                "Cannot determine the FP8 e4m3 encoding for this ROCm device: "
+                "vLLM is not importable, and CDNA3 (gfx942) and CDNA4 (gfx950) "
+                "use different encodings (float8_e4m3fnuz vs float8_e4m3fn). "
+                "Casting with the wrong one is silent numerical corruption."
+            ) from exc
+        return torch.float8_e4m3fn
+    return current_platform.fp8_dtype()

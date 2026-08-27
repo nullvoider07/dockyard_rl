@@ -65,7 +65,7 @@ class AbstractPolicyWorker:
         Returns:
             str: UUID of the device in the format "GPU-xxxxx"
         """
-        from dockyard_rl.utils.nvml import get_device_uuid
+        from dockyard_rl.utils.device_query import get_device_uuid
 
         # Get current device index from torch
         device_idx = torch.cuda.current_device()
@@ -94,14 +94,14 @@ class AbstractPolicyWorker:
 
     def get_free_memory_bytes(self) -> int:
         """Get the available free memory."""
-        from dockyard_rl.utils.nvml import get_free_memory_bytes
+        from dockyard_rl.utils.device_query import get_free_memory_bytes
 
         device_idx = torch.cuda.current_device()
         return get_free_memory_bytes(device_idx)
 
     def get_total_memory_bytes(self) -> int:
         """Get the total GPU memory capacity of this worker's device."""
-        from dockyard_rl.utils.nvml import get_total_memory_bytes
+        from dockyard_rl.utils.device_query import get_total_memory_bytes
 
         device_idx = torch.cuda.current_device()
         return get_total_memory_bytes(device_idx)

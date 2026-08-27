@@ -26,7 +26,7 @@ import torch
 import zmq
 
 from dockyard_rl.distributed.stateless_process_group import StatelessProcessGroup
-from dockyard_rl.utils.nvml import get_device_uuid
+from dockyard_rl.utils.device_query import get_device_uuid
 from dockyard_rl.utils.packed_tensor import packed_broadcast_consumer
 
 try:

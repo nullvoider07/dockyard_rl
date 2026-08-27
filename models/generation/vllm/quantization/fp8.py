@@ -10,6 +10,7 @@ from vllm.model_executor.layers.linear import LinearBase
 from vllm.triton_utils import tl, triton
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.engine.utils import CoreEngineProcManager
+from dockyard_rl.utils.device_capability import fp8_e4m3_dtype
 
 FP8_BLOCK_QUANT_KWARGS = {
     "activation_scheme": "dynamic",
@@ -380,15 +381,16 @@ def _is_fp8_weight(name, model):
         # high precision and were cast element-wise into FP8 params whose block
         # scales kept their previous values.
         if not name.endswith(_NON_QUANTIZED_SUFFIXES):
+            fp8_dtype = fp8_e4m3_dtype()
             module = _get_module_from_param_name(model, name)
             # We currently only quantize linear layers
             if module is not None and (
                 isinstance(module, LinearBase)
-                and module.weight.dtype == torch.float8_e4m3fn
+                and module.weight.dtype == fp8_dtype
                 or (
                     is_fused_moe_module(module)
-                    and module.w13_weight.dtype == torch.float8_e4m3fn
-                    and module.w2_weight.dtype == torch.float8_e4m3fn
+                    and module.w13_weight.dtype == fp8_dtype
+                    and module.w2_weight.dtype == fp8_dtype
                 )
             ):
                 fp8_state.fp8_param_names.add(name)
@@ -461,8 +463,11 @@ def cast_tensor_to_fp8_blockwise(
             data_hp, (0, pad1, 0, pad0), mode="constant", value=data_hp[-1, -1]
         )
 
-    # FP8
-    max_dtype = torch.finfo(torch.float8_e4m3fn).max
+    # FP8. The e4m3 encoding is resolved per device: CDNA3 uses e4m3fnuz,
+    # whose finfo max differs from OCP e4m3fn, so clamping to the wrong one
+    # either saturates early or overflows on the cast.
+    fp8_dtype = fp8_e4m3_dtype()
+    max_dtype = torch.finfo(fp8_dtype).max
 
     original_shape = data_hp.shape
     blk_m, blk_n = data_hp.shape[0] // block_size0, data_hp.shape[1] // block_size1
@@ -506,7 +511,7 @@ def cast_tensor_to_fp8_blockwise(
     # Scale and saturate cast the data elements to max of target dtype
     data_lp = torch.clamp(data_hp * scale_fp, min=-1 * max_dtype, max=max_dtype)
 
-    fp_data = data_lp.to(torch.float8_e4m3fn)
+    fp_data = data_lp.to(fp8_dtype)
 
     # (BLK_M, BLK_N, BLOCK_SIZE_M * BLOCK_SIZE_N) to (M, N)
     fp_data = (

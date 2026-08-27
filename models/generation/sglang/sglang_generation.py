@@ -22,6 +22,7 @@ from dockyard_rl.models.generation.interfaces import (
     GenerationOutputSpec,
 )
 from dockyard_rl.models.generation.sglang.config import SGLangConfig
+from dockyard_rl.utils.device_query import visible_devices_env
 
 if TYPE_CHECKING:
     # SlicedDataDict is only referenced in a (never-evaluated) local annotation;
@@ -106,11 +107,13 @@ class SGLangGeneration(GenerationInterface):
         worker_builder = RayWorkerBuilder(worker_cls, config)
 
         env_vars = {}
-        global_cvd = os.environ.get("CUDA_VISIBLE_DEVICES", None)
-        if global_cvd:
-            # Explicitly pass CUDA_VISIBLE_DEVICES to workers via env_vars
-            # This ensures all workers see the same global value, even though
-            env_vars["CUDA_VISIBLE_DEVICES"] = global_cvd
+        # Pass the visible-device list to the workers explicitly so every one of
+        # them sees the same global value. The variable *name* travels with it:
+        # writing CUDA_VISIBLE_DEVICES on a host pinned by HIP_VISIBLE_DEVICES
+        # would leave the workers reading a value nothing else agrees with.
+        visible = visible_devices_env()
+        if visible is not None:
+            env_vars[visible[0]] = visible[1]
 
         # Allocate bundles for each server
         # Each server gets consecutive bundles

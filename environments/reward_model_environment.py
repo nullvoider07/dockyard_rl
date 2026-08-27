@@ -13,6 +13,7 @@ from dockyard_rl.distributed.virtual_cluster import RayVirtualCluster
 from dockyard_rl.environments.interfaces import EnvironmentInterface, EnvironmentReturn
 from dockyard_rl.models.generation.interfaces import GenerationDatumSpec
 from dockyard_rl.models.generation.vllm.config import VllmConfig
+from dockyard_rl.utils.device_query import clear_visible_devices
 
 class RewardModelEnvironmentConfig(TypedDict):
     """Configuration for RewardModelEnvironment.
@@ -117,8 +118,9 @@ class RewardModelEnvironment(EnvironmentInterface):
 
         self.task_data_spec = TaskDataSpec(task_name="reward_model_env")
 
-        # Remove CUDA_VISIBLE_DEVICES so Ray can control GPU allocation fully.
-        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        # Drop every visible-device restriction so Ray controls GPU allocation
+        # fully; leaving one vendor's variable set would remap what Ray picks.
+        clear_visible_devices()
 
         self.virtual_cluster = RayVirtualCluster(
             name="grpo_reward_model_cluster",
