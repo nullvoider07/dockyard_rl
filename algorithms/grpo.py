@@ -41,6 +41,15 @@ from dockyard_rl.algorithms.effort_reward import (
     effort_reward_metrics,
     validate_effort_reward_config,
 )
+from dockyard_rl.algorithms.rollout_allocation import (
+    GRADED_ALLOCATION_GROUP_KEY,
+    GradedAllocationConfig,
+    allocate_rollout_budget,
+    assign_group_ids,
+    graded_allocation_enabled,
+    graded_allocation_metrics,
+    validate_graded_allocation_config,
+)
 from dockyard_rl.algorithms.reward_functions import (
     RewardShapingConfig,
     apply_invalid_action_penalty,
@@ -146,6 +155,10 @@ class GRPOConfig(TypedDict):
     # Difficulty-gated effort reward (F2). Disabled by default; the disabled
     # path is byte-unchanged.
     effort_reward:                              NotRequired[EffortRewardConfig | None]
+    # Graded rollout allocation (F3a) -- how the train batch is spent when more
+    # rollouts survive dynamic sampling's variance gate than it needs. Disabled
+    # by default, which is the head truncation that ran before.
+    graded_allocation:                          NotRequired[GradedAllocationConfig | None]
     # Native invalid-action / malformed-thinking reward penalty (#2656).
     invalid_action_penalty:                     NotRequired[InvalidActionPenaltyConfig | None]
     # Structured (Hermes) tool-use protocol. Disabled (default) is a strict
@@ -232,6 +245,22 @@ def _validate_effort_reward_compat(master_config: MasterConfig) -> None:
     validate_effort_reward_config(
         grpo_cfg.get("effort_reward"),
         estimator_name=estimator,
+        trainer="sync",
+    )
+
+
+def _validate_graded_allocation_compat(master_config: MasterConfig) -> None:
+    """Marshal config for ``validate_graded_allocation_config`` (F3a).
+
+    Inert when graded allocation is disabled. Runs at setup so a config that
+    enables it without dynamic sampling -- where there is no surplus to
+    allocate and the setting would do nothing -- is refused before any worker is
+    constructed.
+    """
+    grpo_cfg = master_config.grpo
+    validate_graded_allocation_config(
+        grpo_cfg.get("graded_allocation"),
+        use_dynamic_sampling=bool(grpo_cfg.get("use_dynamic_sampling", False)),
         trainer="sync",
     )
 
@@ -645,6 +674,7 @@ def setup(
     # vLLM-engine configs before any worker is constructed.
     _validate_router_replay_compat(master_config, generation_config, backend)
     _validate_effort_reward_compat(master_config)
+    _validate_graded_allocation_compat(master_config)
 
     if backend == "vllm":
         generation_config = cast(VllmConfig, generation_config)
@@ -861,9 +891,45 @@ def dynamic_sampling(
                 dynamic_sampling_metrics[
                     "dynamic_sampling_num_discarded_valid_samples"
                 ] = num_discarded
-                filtered_repeated_batch = filtered_repeated_batch.select(
-                    slice(0, train_prompts_size)
-                )
+                alloc_cfg = master_config.grpo.get("graded_allocation")
+                if alloc_cfg is not None and graded_allocation_enabled(alloc_cfg):
+                    # F3a: spend the surplus by group variance instead of by
+                    # arrival order. Same row count, so the step costs the same.
+                    if GRADED_ALLOCATION_GROUP_KEY not in filtered_repeated_batch:
+                        raise ValueError(
+                            "grpo.graded_allocation.enabled=true but the batch "
+                            f"carries no {GRADED_ALLOCATION_GROUP_KEY!r} column. "
+                            "It is attached from the same prompt tensor the "
+                            "baseline groups on, immediately before this call; "
+                            "without it the allocation has no groups and would "
+                            "silently fall back to truncation."
+                        )
+                    kept_indices = allocate_rollout_budget(
+                        filtered_repeated_batch[GRADED_ALLOCATION_GROUP_KEY],
+                        filtered_repeated_batch["std"],
+                        train_prompts_size,
+                        min_rollouts_per_prompt=alloc_cfg.get(
+                            "min_rollouts_per_prompt", 1
+                        ),
+                        variance_exponent=alloc_cfg.get("variance_exponent", 1.0),
+                    )
+                    dynamic_sampling_metrics.update(
+                        graded_allocation_metrics(
+                            filtered_repeated_batch[GRADED_ALLOCATION_GROUP_KEY],
+                            kept_indices,
+                            train_prompts_size,
+                        )
+                    )
+                    filtered_repeated_batch = (
+                        filtered_repeated_batch.select_indices(kept_indices)
+                    )
+                    # The group id is the allocator's private key; the cache
+                    # keeps its own copy for the next generation batch.
+                    filtered_repeated_batch.pop(GRADED_ALLOCATION_GROUP_KEY, None)
+                else:
+                    filtered_repeated_batch = filtered_repeated_batch.select(
+                        slice(0, train_prompts_size)
+                    )
 
     batch_to_return = (
         filtered_repeated_batch
@@ -1711,6 +1777,21 @@ def grpo_train(
                                 "use_leave_one_out_baseline"
                             ],
                             std_rewards=std_rewards,
+                        )
+
+                    if graded_allocation_enabled(
+                        master_config.grpo.get("graded_allocation")
+                    ):
+                        # F3a groups by the same tensor the baseline above
+                        # partitions on, so the two partitions are identical by
+                        # construction. The generation-batch ordinal keeps
+                        # groups from separate batches -- which carry separate
+                        # baselines -- from merging inside the cache.
+                        repeated_batch[GRADED_ALLOCATION_GROUP_KEY] = (
+                            assign_group_ids(
+                                input_ids,
+                                gen_batch_ordinal=dynamic_sampling_num_gen_batches,
+                            )
                         )
 
                     repeated_batch, is_batch_complete, batch_cache, ds_metrics = (

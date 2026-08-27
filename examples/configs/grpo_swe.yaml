@@ -72,6 +72,15 @@ grpo:
     difficulty_floor: 0.125          # 1 / num_generations_per_prompt
     max_response_tokens: 4096
 
+  # Graded rollout allocation (F3a). Decides how the train batch is spent when
+  # more rollouts survive dynamic sampling's variance gate than it needs;
+  # disabled is the head truncation that ran before. Requires
+  # use_dynamic_sampling: true.
+  graded_allocation:
+    enabled: false
+    min_rollouts_per_prompt: 1
+    variance_exponent: 1.0
+
   reward_scaling:
     enabled: false
     source_min: 0.0
