@@ -5,6 +5,7 @@ OPDAdvantageEstimator math.
 The teacher worker group + async-GRPO orchestration are GPU/cluster-deferred.
 """
 
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -253,32 +254,49 @@ def test_the_guard_is_inert_when_opd_is_off():
 
 # -- collector teacher scoring (routing + DP padding + stitching) -------------
 
-def _make_collector_with_teacher(teacher_logprob_fn, dp_size=1):
-    """Bypass-construct an AsyncTrajectoryCollectorImpl with one fake teacher."""
-    import threading
-    from collections import defaultdict
-    from unittest.mock import MagicMock
+class _FakeScorer:
+    """A TeacherScorer that runs nowhere.
 
+    This is the point of the protocol: the collector's routing, row-slicing and
+    stitching are exercised with no cluster, no sharding and no transport. It
+    pads nothing -- batch-axis padding is an implementation's own business now,
+    so a scorer that needs none has none, and the collector must not assume
+    otherwise.
+    """
+
+    requires_prepadded_input = False
+    sequence_pad_multiple = 1
+
+    def __init__(self, alias="t1", logprob_fn=None, seen=None):
+        self.alias = alias
+        self._logprob_fn = logprob_fn or (
+            lambda ids: torch.zeros(ids.shape, dtype=torch.float32)
+        )
+        self._seen = seen
+        self.calls = 0
+
+    def score(self, data):
+        self.calls += 1
+        if self._seen is not None:
+            self._seen[self.alias] = data
+        return self._logprob_fn(data["input_ids"])
+
+    def shutdown(self):
+        return True
+
+
+def _make_collector_with_teacher(teacher_logprob_fn, dp_size=1):
+    """Bypass-construct an AsyncTrajectoryCollectorImpl with one fake scorer."""
     from dockyard_rl.algorithms.async_utils import trajectory_collector as tc
 
     col = tc.AsyncTrajectoryCollectorImpl.__new__(tc.AsyncTrajectoryCollectorImpl)
-    teacher = MagicMock()
-    teacher.sharding_annotations.get_axis_size.return_value = dp_size
-
-    def _get_logprobs(sub_data):
-        from dockyard_rl.distributed.batched_data_dict import BatchedDataDict
-        return BatchedDataDict(
-            {"reference_logprobs": teacher_logprob_fn(sub_data["input_ids"])}
-        )
-
-    teacher.get_logprobs.side_effect = _get_logprobs
+    teacher = _FakeScorer(logprob_fn=teacher_logprob_fn)
     col._teacher_worker_groups = {"t1": teacher}
     col._alias_to_group_alias = {"t1": "t1"}
     col._on_policy_distillation_cfg = {
         "teacher_model_by_agent_name": {"t1": "m1"},
         "default_teacher_alias": "t1",
     }
-    col._teacher_locks = defaultdict(threading.Lock)
     return col, teacher
 
 
@@ -293,47 +311,28 @@ def test_collector_teacher_logprobs_routes_and_stitches():
     assert torch.allclose(result, torch.arange(12, dtype=torch.float32).reshape(3, 4))
 
 
-def test_collector_teacher_logprobs_dp_padding_trimmed():
-    # dp_size=2 with 3 samples -> padded to 4 for the forward, trimmed back to 3.
-    seen_batch = {}
+def test_the_collector_does_not_pad_the_batch_axis_itself():
+    """It hands over the rows it routed; padding is the scorer's own business.
 
-    def _fn(ids):
-        seen_batch["B"] = ids.shape[0]
-        return torch.ones(ids.shape, dtype=torch.float32)
+    A collector that padded here would be padding for a sharding a remote or
+    API scorer does not have.
+    """
+    col, seen = _collector_capturing_sub_data()
 
-    col, _ = _make_collector_with_teacher(_fn, dp_size=2)
-    input_ids = torch.zeros(3, 5, dtype=torch.long)
-    agent_refs = [{"name": "t1"}] * 3
-    result, _t = col._compute_teacher_logprobs(input_ids, agent_refs)
-    assert seen_batch["B"] == 4  # padded up to a multiple of dp_size
-    assert result.shape == (3, 5)  # trimmed back
+    col._compute_teacher_logprobs(
+        torch.zeros(3, 5, dtype=torch.long), [{"name": "t1"}] * 3
+    )
+
+    assert seen["t1"]["input_ids"].shape[0] == 3
 
 
 def _collector_capturing_sub_data(dp_size=1, aliases=("t1",)):
-    """Collector whose fake teachers record the BatchedDataDict they were given."""
-    import threading
-    from collections import defaultdict
-    from unittest.mock import MagicMock
-
+    """Collector whose fake scorers record the BatchedDataDict they were given."""
     from dockyard_rl.algorithms.async_utils import trajectory_collector as tc
-    from dockyard_rl.distributed.batched_data_dict import BatchedDataDict
 
     col = tc.AsyncTrajectoryCollectorImpl.__new__(tc.AsyncTrajectoryCollectorImpl)
     seen: dict[str, Any] = {}
-    groups = {}
-    for alias in aliases:
-        teacher = MagicMock()
-        teacher.sharding_annotations.get_axis_size.return_value = dp_size
-
-        def _get_logprobs(sub_data, _alias=alias):
-            seen[_alias] = sub_data
-            ids = sub_data["input_ids"]
-            return BatchedDataDict(
-                {"reference_logprobs": torch.zeros(ids.shape, dtype=torch.float32)}
-            )
-
-        teacher.get_logprobs.side_effect = _get_logprobs
-        groups[alias] = teacher
+    groups = {alias: _FakeScorer(alias=alias, seen=seen) for alias in aliases}
 
     col._teacher_worker_groups = groups
     col._alias_to_group_alias = {a: a for a in aliases}
@@ -341,7 +340,6 @@ def _collector_capturing_sub_data(dp_size=1, aliases=("t1",)):
         "teacher_model_by_agent_name": {a: f"m_{a}" for a in aliases},
         "default_teacher_alias": aliases[0],
     }
-    col._teacher_locks = defaultdict(threading.Lock)
     return col, seen
 
 
@@ -378,25 +376,97 @@ def test_each_teacher_receives_only_its_own_rows():
     assert seen["t2"]["image_sizes"] == ["img1"]
 
 
-def test_dp_padding_repeats_the_same_row_in_every_column():
-    """The padding half of #3430b.
+class TestTheWorkerGroupPadsItsOwnBatchAxis:
+    """The padding half of #3430b, now tested where the padding lives.
 
-    input_ids is padded up to a multiple of dp_size by repeating the sub-batch's
-    last row. A multimodal column padded with anything else -- or not padded --
-    arrives one row short or misaligned, and the teacher scores row i's tokens
-    against row j's image.
+    A DTensor teacher needs its batch to divide by its data-parallel size, so
+    `score` repeats the last row up to a multiple and trims the result back. The
+    caller never sees it. Multimodal columns must repeat the *same* row: padded
+    with anything else -- or not padded -- a column arrives misaligned and the
+    teacher scores row i's tokens against row j's image.
     """
-    col, seen = _collector_capturing_sub_data(dp_size=2)
 
-    col._compute_teacher_logprobs(
-        torch.zeros(3, 5, dtype=torch.long),
-        [{"name": "t1"}] * 3,
-        multimodal_data={"image_sizes": ["a", "b", "c"]},
-    )
+    def _group(self, dp_size, seen):
+        from dockyard_rl.distributed.batched_data_dict import BatchedDataDict
+        from dockyard_rl.models.policy.teacher_worker_group import TeacherWorkerGroup
 
-    sub = seen["t1"]
-    assert sub["input_ids"].shape[0] == 4  # padded to a multiple of dp_size
-    assert sub["image_sizes"] == ["a", "b", "c", "c"]  # same row repeated
+        group = TeacherWorkerGroup.__new__(TeacherWorkerGroup)
+        group._dp_size = dp_size
+        group._score_lock = threading.Lock()
+
+        def _get_logprobs(data, micro_batch_size=None):
+            seen.append(data)
+            ids = data["input_ids"]
+            return BatchedDataDict(
+                {
+                    "reference_logprobs": torch.arange(
+                        ids.shape[0], dtype=torch.float32
+                    )
+                    .unsqueeze(-1)
+                    .expand(ids.shape)
+                    .clone()
+                }
+            )
+
+        group.get_logprobs = _get_logprobs  # type: ignore[method-assign]
+        return group
+
+    def test_the_batch_is_padded_up_and_the_result_trimmed_back(self):
+        from dockyard_rl.distributed.batched_data_dict import BatchedDataDict
+
+        seen: list[Any] = []
+        group = self._group(2, seen)
+
+        out = group.score(
+            BatchedDataDict({"input_ids": torch.zeros(3, 5, dtype=torch.long)})
+        )
+
+        assert seen[0]["input_ids"].shape[0] == 4
+        assert out.shape == (3, 5)
+
+    def test_the_pad_repeats_the_same_row_in_every_column(self):
+        from dockyard_rl.distributed.batched_data_dict import BatchedDataDict
+
+        seen: list[Any] = []
+        group = self._group(2, seen)
+
+        group.score(
+            BatchedDataDict(
+                {
+                    "input_ids": torch.zeros(3, 5, dtype=torch.long),
+                    "image_sizes": ["a", "b", "c"],
+                }
+            )
+        )
+
+        assert seen[0]["input_ids"].shape[0] == 4
+        assert seen[0]["image_sizes"] == ["a", "b", "c", "c"]
+
+    def test_an_already_divisible_batch_is_passed_through_untouched(self):
+        """Inert on the common path: no copy, no new dict."""
+        from dockyard_rl.distributed.batched_data_dict import BatchedDataDict
+
+        seen: list[Any] = []
+        group = self._group(2, seen)
+        data = BatchedDataDict({"input_ids": torch.zeros(4, 5, dtype=torch.long)})
+
+        group.score(data)
+
+        assert seen[0] is data
+
+    def test_the_pad_rows_never_reach_the_caller(self):
+        """A leaked pad row shifts every later row onto the wrong sample."""
+        from dockyard_rl.distributed.batched_data_dict import BatchedDataDict
+
+        seen: list[Any] = []
+        group = self._group(4, seen)
+
+        out = group.score(
+            BatchedDataDict({"input_ids": torch.zeros(3, 2, dtype=torch.long)})
+        )
+
+        assert seen[0]["input_ids"].shape[0] == 4
+        torch.testing.assert_close(out[:, 0], torch.tensor([0.0, 1.0, 2.0]))
 
 
 def test_a_packed_tensor_column_is_sliced_by_row():

@@ -236,26 +236,36 @@ def get_teacher_routing_metrics(
 
 
 def teacher_seq_pad_multiple(
-    teacher_worker_groups: dict[str, Any], policy_make_seq_div_by: int
+    teacher_scorers: dict[str, Any], policy_make_seq_div_by: int
 ) -> int:
     """Sequence divisor to pre-pad teacher logprob inputs to.
 
-    Packed teachers re-pad internally, so no pre-pad is needed (1). Non-packed
-    teachers need the ``[B, S]`` forward pre-padded to the policy divisor, which
-    must be a multiple of every teacher's ``sequence_length_pad_multiple``. All
-    teachers must share one packing mode.
+    The sequence axis is the one padding decision that stays outside the
+    ``TeacherScorer`` boundary: every teacher scores the same flattened batch,
+    so the pad has to satisfy all of them at once and cannot be chosen per
+    teacher (the batch axis can, and is -- see ``TeacherScorer.score``).
+
+    A scorer that re-pads its own forward needs no pre-pad (1). One that does
+    not needs the ``[B, S]`` forward pre-padded to the policy divisor, which
+    must be a multiple of every such scorer's ``sequence_pad_multiple``. All
+    scorers must agree on whether they want the pre-pad.
     """
-    packing_modes = {twg.use_sequence_packing for twg in teacher_worker_groups.values()}
-    if len(packing_modes) > 1:
-        raise ValueError("All teachers must use the same sequence-packing mode.")
-    if packing_modes != {False}:
-        return 1  # no teachers, or all packed (they re-pad internally)
-    for alias, twg in teacher_worker_groups.items():
-        if policy_make_seq_div_by % twg.sequence_length_pad_multiple:
+    prepad_modes = {s.requires_prepadded_input for s in teacher_scorers.values()}
+    if len(prepad_modes) > 1:
+        raise ValueError(
+            "All teachers must agree on sequence pre-padding: some of these "
+            "scorers re-pad their own forward and some require the caller to. "
+            "One flattened batch is scored by all of them, so it cannot be "
+            "padded both ways."
+        )
+    if prepad_modes != {True}:
+        return 1  # no teachers, or none wants a pre-pad
+    for alias, scorer in teacher_scorers.items():
+        if policy_make_seq_div_by % scorer.sequence_pad_multiple:
             raise ValueError(
                 f"policy.make_sequence_length_divisible_by ({policy_make_seq_div_by}) "
                 f"must be a multiple of teacher '{alias}'s pad requirement "
-                f"({twg.sequence_length_pad_multiple})."
+                f"({scorer.sequence_pad_multiple})."
             )
     return policy_make_seq_div_by
 

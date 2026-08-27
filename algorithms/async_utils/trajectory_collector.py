@@ -167,9 +167,6 @@ class AsyncTrajectoryCollectorImpl:
         # collector scores each generated trajectory through the routed teacher
         # and stamps `teacher_reference_logprobs` onto the batch so the trainer's
         # OPDAdvantageEstimator can form `Â = sg[teacher - student]`.
-        import threading
-        from collections import defaultdict
-
         from dockyard_rl.algorithms import opd as _opd_module
 
         self._teacher_worker_groups: dict[str, Any] = teacher_worker_groups or {}
@@ -177,9 +174,6 @@ class AsyncTrajectoryCollectorImpl:
         self._teacher_seq_pad_multiple = int(teacher_seq_pad_multiple)
         self._has_distillation_teachers = bool(self._teacher_worker_groups)
         self._on_policy_distillation_cfg = _opd_module._opd_cfg(master_config)
-        # One lock per teacher group: serialize forwards on a given teacher to
-        # avoid NCCL collective desync when groups are fanned out concurrently.
-        self._teacher_locks: dict[str, Any] = defaultdict(threading.Lock)
 
         grpo_cfg = master_config.grpo
         self._num_generations_per_prompt = int(grpo_cfg["num_generations_per_prompt"])
@@ -636,31 +630,6 @@ class AsyncTrajectoryCollectorImpl:
         )
         repeated_batch["teacher_reference_logprobs"] = teacher_logprobs
 
-    @staticmethod
-    def _select_multimodal_rows(key: str, value: Any, row_indices: list[int]) -> Any:
-        """Row-select one multimodal column for a teacher's sub-batch.
-
-        ``get_multimodal_dict(as_tensors=False)`` yields a ``PackedTensor`` (one
-        entry per sample) or, for a plain tensor column, the list form -- both
-        sample-indexed, so both are selected by row. Anything else is refused
-        rather than forwarded whole: a column that cannot be row-selected would
-        reach the teacher misaligned with the rows it is scoring, which is the
-        failure this fix exists to remove.
-        """
-        import torch
-
-        slicer = getattr(value, "slice", None)
-        if callable(slicer):
-            return slicer(row_indices)
-        if isinstance(value, torch.Tensor):
-            return value[row_indices]
-        if isinstance(value, (list, tuple)):
-            return [value[i] for i in row_indices]
-        raise TypeError(
-            f"multimodal column {key!r} is a {type(value).__name__}, which cannot "
-            "be row-selected for a per-teacher sub-batch"
-        )
-
     def _compute_teacher_logprobs(
         self,
         input_ids: Any,
@@ -687,6 +656,7 @@ class AsyncTrajectoryCollectorImpl:
 
         from dockyard_rl.algorithms.opd import resolve_reference_aliases
         from dockyard_rl.distributed.batched_data_dict import BatchedDataDict
+        from dockyard_rl.models.policy.teacher_scorer import select_rows
 
         opd_cfg = self._on_policy_distillation_cfg
         teacher_model_by_agent_name = opd_cfg.get("teacher_model_by_agent_name", {})
@@ -711,41 +681,19 @@ class AsyncTrajectoryCollectorImpl:
             return result, 0.0
 
         def _get_logprobs_for_group(group_key, indices):
-            twg = self._teacher_worker_groups[group_key]
-            sub_input_ids = input_ids[indices]
-            sub_lengths = input_lengths[indices] if input_lengths is not None else None
-
-            # Pad the sub-batch to a multiple of the teacher's DP size.
-            dp_size = twg.sharding_annotations.get_axis_size("data_parallel")
-            actual_batch_size = sub_input_ids.shape[0]
-            remainder = actual_batch_size % dp_size
-            # Rows of the flattened batch this sub-batch covers, in the order the
-            # teacher receives them. The DP pad repeats the sub-batch's last row,
-            # so the multimodal columns have to repeat the same one -- padding
-            # them with anything else, or not at all, puts every column out of
-            # step with input_ids.
-            row_indices = list(indices)
-            if remainder != 0:
-                pad_count = dp_size - remainder
-                pad_rows = sub_input_ids[-1:].expand(pad_count, -1)
-                sub_input_ids = torch.cat([sub_input_ids, pad_rows], dim=0)
-                row_indices = row_indices + [row_indices[-1]] * pad_count
-                if sub_lengths is not None:
-                    sub_lengths = torch.cat(
-                        [sub_lengths, sub_lengths[-1:].expand(pad_count)], dim=0
-                    )
-
-            sub_data = BatchedDataDict({"input_ids": sub_input_ids})
-            if sub_lengths is not None:
-                sub_data["input_lengths"] = sub_lengths
+            # Slice the flattened batch down to the rows routed to this teacher.
+            # Every column is selected by the same row list, so the multimodal
+            # columns stay in step with input_ids. Batch-axis padding for the
+            # scorer's own sharding, and any serialization its transport needs,
+            # happen inside score() -- see TeacherScorer.
+            scorer = self._teacher_worker_groups[group_key]
+            sub_data = BatchedDataDict({"input_ids": input_ids[indices]})
+            if input_lengths is not None:
+                sub_data["input_lengths"] = input_lengths[indices]
             for key, value in (multimodal_data or {}).items():
-                sub_data[key] = self._select_multimodal_rows(key, value, row_indices)
+                sub_data[key] = select_rows(key, value, list(indices))
 
-            # Serialize forwards on a given teacher (NCCL collective safety).
-            with self._teacher_locks[group_key]:
-                logprobs_result = twg.get_logprobs(sub_data)
-            logprobs = logprobs_result["reference_logprobs"][:actual_batch_size]
-            return indices, logprobs
+            return indices, scorer.score(sub_data)
 
         t_total_start = time.time()
         with concurrent.futures.ThreadPoolExecutor(

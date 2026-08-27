@@ -8,16 +8,19 @@ training policy used for teacher scoring in async on-policy distillation.
 
 from __future__ import annotations
 
+import threading
 import warnings
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Optional
 
+import torch
 from transformers import PreTrainedTokenizerBase
 
 from dockyard_rl.algorithms.opd import TeacherResourceConfig
 from dockyard_rl.distributed.batched_data_dict import BatchedDataDict
 from dockyard_rl.distributed.virtual_cluster import RayVirtualCluster
+from dockyard_rl.models.policy.teacher_scorer import select_rows
 
 
 @dataclass
@@ -185,14 +188,61 @@ class TeacherWorkerGroup:
         self.cfg = cfg
         self._micro_batch_size = teacher_cfg.micro_batch_size
 
-        # Expose the worker group + sharding for health checks, teardown, and
-        # the collector's DP-padding (mirrors the training policy interface used
-        # by the OPD setup + scoring helpers).
+        # The worker group stays exposed for the readiness check and teardown
+        # in create_teacher_worker_groups, which builds local groups and so
+        # already knows they are local. Sharding does not: the batch-axis
+        # padding it exists to drive now happens inside score().
         self.worker_group = self.policy.worker_group
-        self.sharding_annotations = self.policy.sharding_annotations
-        self.use_sequence_packing = self.policy.use_sequence_packing
-        # SP-forward divisor; the collector reads it to pre-pad non-packed inputs.
-        self.sequence_length_pad_multiple = cp * 2 * tp if cp > 1 else tp
+        self._dp_size = self.policy.sharding_annotations.get_axis_size(
+            "data_parallel"
+        )
+        self._packs_internally = self.policy.use_sequence_packing
+        # SP-forward divisor. Reported through sequence_pad_multiple; the caller
+        # pre-pads the shared flattened batch with it, because that axis is
+        # shared by every teacher scoring the same batch.
+        self._sequence_pad_multiple = cp * 2 * tp if cp > 1 else tp
+        # Forwards on one worker group are serialized here rather than by the
+        # caller: the group's workers run NCCL collectives per forward, so two
+        # overlapping calls would interleave them. It is a property of this
+        # implementation, not of scoring, so it belongs on this side of the
+        # TeacherScorer boundary.
+        self._score_lock = threading.Lock()
+
+    @property
+    def requires_prepadded_input(self) -> bool:
+        """Packed teachers re-pad their own forward; unpacked ones need the pad."""
+        return not self._packs_internally
+
+    @property
+    def sequence_pad_multiple(self) -> int:
+        return self._sequence_pad_multiple
+
+    def score(self, data: BatchedDataDict[Any]) -> torch.Tensor:
+        """Per-token logprobs for ``data``'s rows, one row out per row in.
+
+        The batch axis is padded up to a multiple of this group's data-parallel
+        size and trimmed back afterwards. Every column is padded by repeating
+        the same final row -- padding the token ids alone, or padding a
+        multimodal column with anything else, puts that column out of step with
+        ``input_ids`` and the teacher scores an input the student never saw.
+        """
+        input_ids = data["input_ids"]
+        rows = int(input_ids.shape[0])
+        remainder = rows % self._dp_size
+        padded = data
+        if remainder != 0:
+            pad_count = self._dp_size - remainder
+            row_indices = list(range(rows)) + [rows - 1] * pad_count
+            padded = BatchedDataDict(
+                {
+                    key: select_rows(key, value, row_indices)
+                    for key, value in data.items()
+                }
+            )
+
+        with self._score_lock:
+            result = self.get_logprobs(padded)
+        return result["reference_logprobs"][:rows]
 
     def get_logprobs(
         self,
