@@ -171,6 +171,9 @@ class AsyncTrajectoryCollectorImpl:
 
         self._teacher_worker_groups: dict[str, Any] = teacher_worker_groups or {}
         self._alias_to_group_alias: dict[str, str] = alias_to_group_alias or {}
+        # F3c panel cost accounting, refreshed per teacher-scoring pass and
+        # merged into the rollout metrics that reach the trainer's logger.
+        self._teacher_panel_metrics: dict[str, float] = {}
         self._teacher_seq_pad_multiple = int(teacher_seq_pad_multiple)
         self._has_distillation_teachers = bool(self._teacher_worker_groups)
         self._on_policy_distillation_cfg = _opd_module._opd_cfg(master_config)
@@ -414,6 +417,10 @@ class AsyncTrajectoryCollectorImpl:
                     await loop.run_in_executor(
                         None, self._score_teacher_logprobs, repeated_batch
                     )
+                    # F3c: what the panel burst cost this batch, on the metrics
+                    # dict that already travels with the trajectory. Empty (and
+                    # so a no-op) when no panel is configured.
+                    rollout_metrics.update(self._teacher_panel_metrics)
                 except Exception as exc:  # noqa: BLE001 - surface and continue
                     self._record_failure("teacher_scoring", exc)
                     if not self.is_healthy():
@@ -706,7 +713,80 @@ class AsyncTrajectoryCollectorImpl:
             for future in concurrent.futures.as_completed(futures):
                 indices, logprobs = future.result()
                 result[indices] = logprobs
+
+        self._burst_teacher_panel(result, input_lengths, _get_logprobs_for_group)
         return result, time.time() - t_total_start
+
+    def _burst_teacher_panel(
+        self,
+        result: Any,
+        input_lengths: Optional[Any],
+        score_group,
+    ) -> None:
+        """F3c: re-score the routed teacher's least-likely rows with the panel.
+
+        Mutates ``result`` in place on the escalated rows only. Inert -- and the
+        base path byte-unchanged -- when no panel is configured, which is why it
+        runs after the base pass rather than replacing it.
+
+        The signal is the base pass's own output: mean logprob over each row's
+        valid tokens, lowest first. Nothing extra is computed to decide where to
+        spend, so the decision itself is free.
+        """
+        import concurrent.futures
+
+        from dockyard_rl.algorithms.teacher_panel import (
+            combine_panel_logprobs,
+            mean_valid_logprob,
+            select_escalation_rows,
+            teacher_panel_cfg,
+            teacher_panel_enabled,
+            teacher_panel_metrics,
+        )
+
+        opd_cfg = self._on_policy_distillation_cfg
+        if not teacher_panel_enabled(opd_cfg):
+            return
+
+        panel = teacher_panel_cfg(opd_cfg)
+        panel_aliases = list(panel.get("panel_aliases", []) or [])
+        surprise = mean_valid_logprob(result, input_lengths)
+        escalated = select_escalation_rows(
+            surprise, float(panel.get("escalation_fraction", 0.0))
+        )
+        self._teacher_panel_metrics = teacher_panel_metrics(
+            escalated, int(result.shape[0]), len(panel_aliases), surprise
+        )
+        if not escalated:
+            return
+
+        # Panel aliases route through the same dedup map as agent aliases, so
+        # two panel members sharing a checkpoint share one worker group rather
+        # than scoring the same rows twice.
+        group_keys: list[str] = []
+        for alias in panel_aliases:
+            gk = self._alias_to_group_alias.get(alias, alias)
+            if gk not in group_keys and gk in self._teacher_worker_groups:
+                group_keys.append(gk)
+        if not group_keys:
+            return
+
+        panel_rows = []
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(group_keys)
+        ) as executor:
+            futures = [
+                executor.submit(score_group, gk, escalated) for gk in group_keys
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                _indices, logprobs = future.result()
+                panel_rows.append(logprobs)
+
+        combined = combine_panel_logprobs(
+            [result[escalated]] + panel_rows,
+            combine=str(panel.get("combine", "mixture")),
+        )
+        result[escalated] = combined
 
 
 @ray.remote  # pragma: no cover

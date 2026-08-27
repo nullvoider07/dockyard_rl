@@ -60,6 +60,30 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
 
 
 # ── Validation
+def _validate_teacher_panel_scope(config: MasterConfig) -> None:
+    """Refuse teacher-panel bursting on a run that scores no teachers (F3c).
+
+    On-policy distillation builds its teacher worker groups only in
+    ``async_grpo_train``; nothing on the sync path calls a teacher. So a panel
+    configured without async GRPO is not a slower burst -- it is no burst at all,
+    on a config that reads as one. `validate_teacher_panel_config` catches the
+    other half (aliases, fraction, combine) where the groups are built, which is
+    a point a sync run never reaches.
+    """
+    from dockyard_rl.algorithms.teacher_panel import teacher_panel_enabled
+
+    opd_cfg = getattr(config, "on_policy_distillation", None)
+    if not teacher_panel_enabled(opd_cfg):
+        return
+    if not config.grpo.get("async_grpo", {}).get("enabled", False):
+        raise NotImplementedError(
+            "on_policy_distillation.teacher_panel.enabled=true requires "
+            "grpo.async_grpo.enabled=true: teachers are scored only by the "
+            "async trajectory collector, so on the sync trainer no teacher is "
+            "called and the panel would never burst."
+        )
+
+
 def _validate_async_grpo_config(config: MasterConfig) -> None:
     """Raise NotImplementedError for features incompatible with async GRPO."""
     async_cfg = config.grpo.get("async_grpo", {})
@@ -130,6 +154,7 @@ def main() -> None:
     # Validate async GRPO constraints early to surface errors before
     # any expensive model loading.
     _validate_async_grpo_config(config)
+    _validate_teacher_panel_scope(config)
 
     # Initialise Ray cluster.
     init_ray(log_dir=config.logger.get("log_dir"))

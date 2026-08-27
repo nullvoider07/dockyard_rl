@@ -53,6 +53,24 @@ class NonColocatedTeachersConfig(BaseModel, extra="allow"):
     teacher_overrides: dict[str, TeacherResourceConfig] = Field(default_factory=dict)
 
 
+class TeacherPanelConfig(BaseModel, extra="allow"):
+    """Panel bursting (F3c): re-score the routed teacher's least-likely rows.
+
+    Disabled by default, and the disabled path is byte-unchanged -- every row is
+    scored once by its routed teacher, exactly as before.
+    """
+
+    enabled: bool = False
+    # Teachers to escalate to. Each must be a key of teacher_model_by_agent_name,
+    # or it names a worker group that was never built.
+    panel_aliases: list[str] = Field(default_factory=list)
+    # Upper bound on the share of rows re-scored. 0.0 bursts nothing.
+    escalation_fraction: float = 0.0
+    # "mixture" (logsumexp - log n, the uniform mixture of teacher
+    # distributions) or "geometric" (mean of logprobs, a product of experts).
+    combine: str = "mixture"
+
+
 class OnPolicyDistillationConfig(BaseModel, extra="allow"):
     """User-facing config for the top-level ``on_policy_distillation`` block."""
 
@@ -62,6 +80,7 @@ class OnPolicyDistillationConfig(BaseModel, extra="allow"):
     strict_agent_name_match: bool = False
     deduplicate_shared_teacher_checkpoints: bool = True
     non_colocated_teachers: Optional[NonColocatedTeachersConfig] = None
+    teacher_panel: Optional[TeacherPanelConfig] = None
 
 
 # ---------------------------------------------------------------------------
@@ -348,6 +367,18 @@ def create_teacher_worker_groups(
     # Reject a mixed/incompatible teacher packing config (raises).
     teacher_seq_pad_multiple(
         teacher_worker_groups, policy_config["make_sequence_length_divisible_by"]
+    )
+
+    # F3c: refuse a panel naming a teacher this run did not build. Placed here
+    # because this is the one point where the alias map and the constructed
+    # groups are both in hand -- a panel alias with no worker group is a burst
+    # that silently never happens.
+    from dockyard_rl.algorithms.teacher_panel import validate_teacher_panel_config
+
+    validate_teacher_panel_config(
+        opd_cfg,
+        available_aliases=list(teacher_model_by_agent_name.keys()),
+        trainer="async",
     )
 
     # Build alias -> group_alias mapping for deduplication.
