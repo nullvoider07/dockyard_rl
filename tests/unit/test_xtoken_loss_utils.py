@@ -457,3 +457,43 @@ def test_projection_readers_do_not_disable_weights_only():
         "files are operator-supplied artifacts, so that is arbitrary code "
         "execution from a path in the config"
     )
+
+
+def test_projection_allowlist_excludes_object_capable_dtypes():
+    """The numpy allowlist must stay numeric-only.
+
+    `numpy._core.multiarray.scalar(dtype, bytes)` on an object-carrying dtype
+    reinterprets the payload bytes as a PyObject pointer and dereferences it --
+    a type-confusion primitive. Reaching it needs the pickle BUILD opcode to
+    call __setstate__ on a VoidDType/ObjectDType, which torch's weights_only
+    unpickler only permits for types that are themselves allowlisted. Keeping
+    the allowlist to np.dtype plus the four numeric DTypes is what closes it,
+    so widening it to fix a load failure would reopen it.
+    """
+    import numpy as np
+
+    allowed = lu._projection_safe_globals()
+    for name in ("VoidDType", "ObjectDType"):
+        cls = getattr(np.dtypes, name, None)
+        if cls is not None:
+            assert cls not in allowed, (
+                f"{name} is allowlisted; an object-carrying dtype makes "
+                "numpy scalar reconstruction a type-confusion primitive"
+            )
+
+
+def test_projection_allowlist_does_not_leak_process_wide(tmp_path):
+    """safe_globals must be scoped to the load, not left armed afterwards.
+
+    A leaked allowlist would widen every other torch.load in the process --
+    the replay-buffer resume among them.
+    """
+    before = {id(g) for g in torch.serialization.get_safe_globals()}
+    p = tmp_path / "dense.pt"
+    _save_dense_projection(p, [[0], [1]], [[1.0], [1.0]])
+    lu.parse_projection_file(p)
+    after = {id(g) for g in torch.serialization.get_safe_globals()}
+    assert after == before, (
+        "the projection allowlist stayed armed after the load; other "
+        "torch.load calls in this process would inherit it"
+    )
