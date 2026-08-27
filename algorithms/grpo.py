@@ -41,6 +41,14 @@ from dockyard_rl.algorithms.effort_reward import (
     effort_reward_metrics,
     validate_effort_reward_config,
 )
+from dockyard_rl.algorithms.routing_diversity import (
+    ROUTING_DIVERSITY_KEY,
+    RoutingDiversityConfig,
+    routing_diversity_enabled,
+    routing_diversity_from_message_log,
+    routing_diversity_metrics,
+    validate_routing_diversity_config,
+)
 from dockyard_rl.algorithms.rollout_allocation import (
     GRADED_ALLOCATION_GROUP_KEY,
     GradedAllocationConfig,
@@ -159,6 +167,9 @@ class GRPOConfig(TypedDict):
     # rollouts survive dynamic sampling's variance gate than it needs. Disabled
     # by default, which is the head truncation that ran before.
     graded_allocation:                          NotRequired[GradedAllocationConfig | None]
+    # Routing diversity (F3b) -- measured, never rewarded, read only by the
+    # allocation weight above. Requires policy.router_replay.enabled.
+    routing_diversity:                          NotRequired[RoutingDiversityConfig | None]
     # Native invalid-action / malformed-thinking reward penalty (#2656).
     invalid_action_penalty:                     NotRequired[InvalidActionPenaltyConfig | None]
     # Structured (Hermes) tool-use protocol. Disabled (default) is a strict
@@ -261,6 +272,32 @@ def _validate_graded_allocation_compat(master_config: MasterConfig) -> None:
     validate_graded_allocation_config(
         grpo_cfg.get("graded_allocation"),
         use_dynamic_sampling=bool(grpo_cfg.get("use_dynamic_sampling", False)),
+        trainer="sync",
+    )
+
+
+def _validate_routing_diversity_compat(master_config: MasterConfig) -> None:
+    """Marshal config for ``validate_routing_diversity_config`` (F3b).
+
+    Inert when the signal is disabled. Reads ``policy.router_replay`` because
+    that capture is what produces the per-token route the signal reduces, and
+    ``grpo.graded_allocation`` because the allocation weight is its only
+    consumer -- enabled without either, the column would be computed every step
+    and read by nothing.
+    """
+    grpo_cfg = master_config.grpo
+    router_replay_cfg = master_config.policy.get("router_replay")
+    router_replay_on = bool(
+        router_replay_cfg.get("enabled", False)
+        if isinstance(router_replay_cfg, dict)
+        else getattr(router_replay_cfg, "enabled", False)
+    )
+    validate_routing_diversity_config(
+        grpo_cfg.get("routing_diversity"),
+        router_replay_enabled=router_replay_on,
+        graded_allocation_enabled=graded_allocation_enabled(
+            grpo_cfg.get("graded_allocation")
+        ),
         trainer="sync",
     )
 
@@ -675,6 +712,7 @@ def setup(
     _validate_router_replay_compat(master_config, generation_config, backend)
     _validate_effort_reward_compat(master_config)
     _validate_graded_allocation_compat(master_config)
+    _validate_routing_diversity_compat(master_config)
 
     if backend == "vllm":
         generation_config = cast(VllmConfig, generation_config)
@@ -904,6 +942,7 @@ def dynamic_sampling(
                             "without it the allocation has no groups and would "
                             "silently fall back to truncation."
                         )
+                    diversity_cfg = master_config.grpo.get("routing_diversity")
                     kept_indices = allocate_rollout_budget(
                         filtered_repeated_batch[GRADED_ALLOCATION_GROUP_KEY],
                         filtered_repeated_batch["std"],
@@ -912,6 +951,15 @@ def dynamic_sampling(
                             "min_rollouts_per_prompt", 1
                         ),
                         variance_exponent=alloc_cfg.get("variance_exponent", 1.0),
+                        diversity=filtered_repeated_batch.get(
+                            ROUTING_DIVERSITY_KEY
+                        ),
+                        diversity_exponent=(
+                            diversity_cfg.get("allocation_exponent", 0.0)
+                            if diversity_cfg is not None
+                            and routing_diversity_enabled(diversity_cfg)
+                            else 0.0
+                        ),
                     )
                     dynamic_sampling_metrics.update(
                         graded_allocation_metrics(
@@ -926,6 +974,7 @@ def dynamic_sampling(
                     # The group id is the allocator's private key; the cache
                     # keeps its own copy for the next generation batch.
                     filtered_repeated_batch.pop(GRADED_ALLOCATION_GROUP_KEY, None)
+                    filtered_repeated_batch.pop(ROUTING_DIVERSITY_KEY, None)
                 else:
                     filtered_repeated_batch = filtered_repeated_batch.select(
                         slice(0, train_prompts_size)
@@ -1777,6 +1826,29 @@ def grpo_train(
                                 "use_leave_one_out_baseline"
                             ],
                             std_rewards=std_rewards,
+                        )
+
+                    if routing_diversity_enabled(
+                        master_config.grpo.get("routing_diversity")
+                    ):
+                        # F3b: reduced here, at the reward stage, because the
+                        # per-token route rides the message log and the sentinel
+                        # backfill that pads non-generated messages runs later
+                        # (:1858) -- so the routed_experts key is present on
+                        # exactly the rollout-generated turns. Measured only;
+                        # the reward pipeline above has already run and never
+                        # sees this column.
+                        _diversity, _diversity_positions = (
+                            routing_diversity_from_message_log(
+                                repeated_batch["message_log"]
+                            )
+                        )
+                        if _diversity is not None:
+                            repeated_batch[ROUTING_DIVERSITY_KEY] = _diversity
+                        metrics_logging_data.update(
+                            routing_diversity_metrics(
+                                _diversity, _diversity_positions
+                            )
                         )
 
                     if graded_allocation_enabled(

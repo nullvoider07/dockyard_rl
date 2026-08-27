@@ -81,6 +81,14 @@ grpo:
     min_rollouts_per_prompt: 1
     variance_exponent: 1.0
 
+  # Routing diversity (F3b). Measured, never rewarded -- it only moves budget
+  # between prompt groups, which is what makes it ungameable: the policy is
+  # never paid for it. Requires policy.router_replay.enabled (the capture that
+  # produces the route) and graded_allocation.enabled (its only consumer).
+  routing_diversity:
+    enabled: false
+    allocation_exponent: 0.0
+
   reward_scaling:
     enabled: false
     source_min: 0.0

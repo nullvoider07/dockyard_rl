@@ -244,6 +244,41 @@ def _apportion(
     return quotas
 
 
+def _diversity_factor(
+    rows_per_group: list[list[int]],
+    diversity: Optional[torch.Tensor],
+    exponent: float,
+) -> list[float]:
+    """Per-group multiplier from routing diversity.
+
+    Deliberately un-normalized, and the reason is a property of the consumers
+    rather than of the signal: `_apportion` divides every weight by the active
+    total, and the floor squeeze only ranks, so scaling the whole weight vector
+    by any positive constant moves no row at all. That is what lets the signal
+    stay in raw nats -- no normalizer is needed because none would be observable.
+    An earlier revision divided by the batch mean and documented it as
+    load-bearing; it was not, and the mutation sweep is what said so.
+
+    Exponent 0 returns all ones (`v ** 0 == 1`), which is F3a's allocation
+    unchanged; the explicit branch is a fast path, not a behavioural one.
+    """
+    if diversity is None or exponent == 0.0:
+        return [1.0] * len(rows_per_group)
+
+    flat = diversity.reshape(-1).to(torch.float64).tolist()
+    per_group = [
+        max(0.0, sum(flat[r] for r in rows) / len(rows)) for rows in rows_per_group
+    ]
+    if sum(per_group) <= 0.0:
+        # No routing spread anywhere in the batch. This one IS observable:
+        # every factor would be zero, the apportionment would see a zero total
+        # and fall back to round-robin, and F3a's variance grading would be
+        # silently discarded on precisely the batches the signal says nothing
+        # about.
+        return [1.0] * len(rows_per_group)
+    return [value**exponent for value in per_group]
+
+
 def allocate_rollout_budget(
     group_ids: torch.Tensor,
     weights: torch.Tensor,
@@ -251,6 +286,8 @@ def allocate_rollout_budget(
     *,
     min_rollouts_per_prompt: int = 1,
     variance_exponent: float = 1.0,
+    diversity: Optional[torch.Tensor] = None,
+    diversity_exponent: float = 0.0,
 ) -> list[int]:
     """Choose which `budget` rows to train on, graded by group variance.
 
@@ -269,6 +306,13 @@ def allocate_rollout_budget(
                                  the highest-weight groups first.
         variance_exponent:       Exponent applied to each group's weight. 0
                                  gives a uniform split.
+        diversity:               (batch,) optional routing-diversity signal
+                                 (F3b). Never a reward -- it only moves budget
+                                 between groups, so the policy is not paid for
+                                 it and cannot game it.
+        diversity_exponent:      Exponent on each group's diversity relative to
+                                 the batch mean. 0.0 ignores `diversity`
+                                 entirely.
 
     Returns:
         Row indices to keep, in ascending order.
@@ -287,15 +331,24 @@ def allocate_rollout_budget(
     ]
     available = [len(rows) for rows in rows_per_group]
 
+    # One graded weight, read by both branches below. Ranking the floor squeeze
+    # by the same quantity the apportionment uses matters once F3b's diversity
+    # factor is in play: `std ** e` alone is monotone in `std`, so the two
+    # rankings agreed before, and with a second factor they no longer would.
+    factor = _diversity_factor(rows_per_group, diversity, diversity_exponent)
+    graded = [
+        (w**variance_exponent) * factor[i] for i, w in enumerate(group_weight)
+    ]
+
     floor = max(0, int(min_rollouts_per_prompt))
     quotas = [min(floor, avail) for avail in available]
 
     if sum(quotas) > budget:
         # Not every group can be represented. Spend the floors on the groups
-        # with the most variance rather than on whichever came first.
+        # worth the most rather than on whichever came first.
         ranked = sorted(
             range(len(quotas)),
-            key=lambda i: (-group_weight[i], i),
+            key=lambda i: (-graded[i], -group_weight[i], i),
         )
         quotas = [0] * len(quotas)
         left = budget
@@ -307,7 +360,6 @@ def allocate_rollout_budget(
             left -= take
     else:
         headroom = [available[i] - quotas[i] for i in range(len(quotas))]
-        graded = [w**variance_exponent for w in group_weight]
         extra = _apportion(graded, headroom, budget - sum(quotas))
         quotas = [quotas[i] + extra[i] for i in range(len(quotas))]
 
