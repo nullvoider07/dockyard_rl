@@ -71,7 +71,7 @@ class SequencePackingLossWrapper:
             seq_end   = int(seq_ends[seq_idx].item())
 
             # get sequence and unpad all 'data' tensors. The data dict is a BatchedDataDict of unpacked tensors
-            seq_data = data.slice(seq_idx, seq_idx + 1)
+            seq_data = data.select(slice(seq_idx, seq_idx + 1))
             unpadded_seq_data = {}
             for k, v in seq_data.items():
                 if isinstance(v, torch.Tensor) and v.ndim > 1 and v.shape[1] > 1:

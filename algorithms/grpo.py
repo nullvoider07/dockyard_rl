@@ -778,9 +778,18 @@ def dynamic_sampling(
             filtered_repeated_batch["std"]      = std[keep_prompt_indices]
             filtered_repeated_batch["baseline"] = baseline[keep_prompt_indices]
 
-            filtered_rewards = filtered_repeated_batch["total_reward"]
-            filtered_repeated_batch["total_reward"]    = total_rewards
-            filtered_repeated_batch["filtered_reward"] = filtered_rewards
+            # The surviving rows' rewards are what training reads, under
+            # "filtered_reward". The unfiltered tensor rides the metrics dict
+            # rather than the batch: assigning a [B_original] column onto a
+            # [B_kept] batch trips BatchedDataDict's batch-size invariant
+            # (batched_data_dict.py:222) and raises, which made this whole
+            # branch unreachable the moment it filtered anything.
+            filtered_repeated_batch["filtered_reward"] = filtered_repeated_batch[
+                "total_reward"
+            ]
+            dynamic_sampling_metrics["dynamic_sampling_unfiltered_reward"] = (
+                total_rewards
+            )
 
             if filtered_repeated_batch.size > 0:
                 batch_cache = (
@@ -826,8 +835,8 @@ def dynamic_sampling(
                 dynamic_sampling_metrics[
                     "dynamic_sampling_num_discarded_valid_samples"
                 ] = num_discarded
-                filtered_repeated_batch = filtered_repeated_batch.slice(
-                    0, train_prompts_size
+                filtered_repeated_batch = filtered_repeated_batch.select(
+                    slice(0, train_prompts_size)
                 )
 
     batch_to_return = (
@@ -1965,7 +1974,13 @@ def grpo_train(
                     )
                 if master_config.grpo["use_dynamic_sampling"]:
                     metrics["filtered_reward"] = rewards.numpy()
-                    metrics["reward"]           = repeated_batch["total_reward"].numpy()
+                    # Unfiltered rewards for this generation batch, so the logged
+                    # reward curve reflects every rollout rather than only the
+                    # ones that cleared the variance gate. Popped so the raw key
+                    # spread in from ds_metrics does not also ship.
+                    metrics["reward"] = metrics.pop(
+                        "dynamic_sampling_unfiltered_reward"
+                    ).numpy()
 
                 metrics.update(train_results["all_mb_metrics"])
                 metrics.update(gen_step_metrics)
