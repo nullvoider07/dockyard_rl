@@ -196,7 +196,15 @@ class CheckpointManager:
             PathLike: Path to the temporary checkpoint directory.
         """
         save_dir = self.checkpoint_dir / f"tmp_step_{step}"
-        save_dir.mkdir(parents=True, exist_ok=True)
+        # An interrupted save leaves tmp_step_{step} behind with partial
+        # contents. Creating with exist_ok=True would reuse it, and finalize
+        # renames the directory wholesale -- so any file the new save does not
+        # happen to overwrite (a shard from a different world size, a
+        # replay_buffer.pt from a run that no longer writes one) rides into
+        # step_{step} and the checkpoint reads as complete. Start clean.
+        if save_dir.exists():
+            shutil.rmtree(save_dir)
+        save_dir.mkdir(parents=True)
 
         # save training info
         with open(save_dir / "training_info.json", "w") as f:

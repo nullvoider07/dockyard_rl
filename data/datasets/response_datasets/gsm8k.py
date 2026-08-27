@@ -13,12 +13,15 @@ class GSM8KDataset(RawDataset):
     Args:
         split: Split name for the dataset, default is "train"
         extract_answer: Whether to extract the answer from the dataset, default is True
+        subset: HuggingFace config name. GSM8K ships "main" and "socratic";
+            the latter was unreachable while this was hardcoded.
     """
 
     def __init__(
         self,
         split: str = "train",
         extract_answer: bool = True,
+        subset: str = "main",
         system_prompt_file: str | None = None,
         **kwargs,
     ) -> None:
@@ -26,7 +29,7 @@ class GSM8KDataset(RawDataset):
         self.extract_answer = extract_answer
 
         # load from huggingface
-        self.dataset = load_dataset("openai/gsm8k", "main")[split]
+        self.dataset = load_dataset("openai/gsm8k", subset)[split]
 
         # format the dataset
         self.dataset = self.dataset.map(

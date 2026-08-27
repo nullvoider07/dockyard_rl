@@ -186,3 +186,42 @@ class TestUnchangedBehaviour:
         mgr = _manager(tmp_path, "m", higher_is_better=True, keep_top_k=2)
         mgr.remove_old_checkpoints(exclude_latest=False)
         assert _surviving_steps(tmp_path) == {10, 20}
+
+
+class TestStaleTmpCheckpoint:
+    """An interrupted save must not leak files into the next checkpoint.
+
+    init_tmp_checkpoint used to create tmp_step_{step} with exist_ok=True, and
+    finalize renames the directory wholesale. Any file the new save did not
+    happen to overwrite therefore rode into step_{step}, which then read as a
+    complete checkpoint.
+    """
+
+    def test_stale_tmp_contents_do_not_survive_into_the_checkpoint(self, tmp_path):
+        mgr = _manager(tmp_path, None, True, None)
+
+        # An interrupted save at step 5 left a partial directory behind.
+        stale = tmp_path / "tmp_step_5"
+        stale.mkdir(parents=True)
+        (stale / "shard_from_a_wider_world.pt").write_text("stale")
+        (stale / "replay_buffer.pt").write_text("stale")
+
+        save_dir = Path(mgr.init_tmp_checkpoint(5, {"step": 5}))
+        assert save_dir == stale
+        leftovers = {p.name for p in save_dir.iterdir()} - {"training_info.json"}
+        assert leftovers == set(), (
+            f"an interrupted save's files survived into the new checkpoint: {leftovers}"
+        )
+
+    def test_a_clean_save_is_unaffected(self, tmp_path):
+        mgr = _manager(tmp_path, None, True, None)
+        save_dir = Path(mgr.init_tmp_checkpoint(7, {"step": 7}))
+        assert save_dir.is_dir()
+        assert (save_dir / "training_info.json").exists()
+
+    def test_finalize_still_promotes_the_tmp_directory(self, tmp_path):
+        mgr = _manager(tmp_path, None, True, None)
+        save_dir = mgr.init_tmp_checkpoint(3, {"step": 3})
+        mgr.finalize_checkpoint(save_dir)
+        assert (tmp_path / "step_3" / "training_info.json").exists()
+        assert not (tmp_path / "tmp_step_3").exists()
