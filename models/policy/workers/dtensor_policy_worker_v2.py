@@ -40,6 +40,7 @@ from dockyard_rl.models.dtensor.moe import (
     is_moe_surgery_supported,
     iter_expanded_refit_tensors,
     parallelize_grouped_experts,
+    refit_tensor_dtype,
     register_expert_bias_update_hook,
     resolve_moe_parallelizer,
 )
@@ -198,7 +199,7 @@ class DTensorPolicyWorkerV2Impl(DTensorPolicyWorkerImpl):  # type: ignore[misc]
         return cast(
             Iterable[tuple[str, torch.Tensor]],
             iter_expanded_refit_tensors(
-                self.model.state_dict().items(),
+                self._refit_state_dict().items(),
                 materialize=lambda t: t.full_tensor() if isinstance(t, DTensor) else t,
             ),
         )
@@ -209,17 +210,21 @@ class DTensorPolicyWorkerV2Impl(DTensorPolicyWorkerImpl):  # type: ignore[misc]
         """Refit metadata with fused-expert entries expanded per-expert.
 
         Mirrors ``_iter_refit_state_dict`` on the metadata side so the inference
-        backend's name->(shape, dtype) map matches the streamed tensors.
+        backend's name->(shape, dtype) map matches the streamed tensors, dtype
+        included -- both read ``refit_tensor_dtype``. Expanded per-expert
+        tensors are unbound views of the fused param, so they inherit its dtype.
         """
+        state_dict = self._refit_state_dict()
         result: dict[str, Any] = {}
-        for name, tensor in self.model.state_dict().items():
+        for name, tensor in state_dict.items():
+            dtype = refit_tensor_dtype(name, tensor, self.dtype)
             if is_grouped_expert_key(name):
                 for exp_name, exp_shape in expand_grouped_expert_info(
                     name, tuple(tensor.shape)
                 ):
-                    result[exp_name] = (torch.Size(exp_shape), self.dtype)
+                    result[exp_name] = (torch.Size(exp_shape), dtype)
             else:
-                result[name] = (tensor.shape, self.dtype)
+                result[name] = (tensor.shape, dtype)
         return result
 
     def _setup_moe_load_balancing(self) -> None:

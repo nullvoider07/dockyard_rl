@@ -35,6 +35,10 @@ from transformers.models.gemma3.modeling_gemma3 import (
 
 from dockyard_rl.data_plane.worker_mixin import TQWorkerMixin
 from dockyard_rl.distributed.batched_data_dict import BatchedDataDict
+from dockyard_rl.models.dtensor.moe.refit import (
+    check_refit_names,
+    refit_tensor_dtype,
+)
 from dockyard_rl.models.dtensor.moe.router_replay import (
     resolve_router_replay_enabled,
     router_replay_context,
@@ -1836,6 +1840,17 @@ class DTensorPolicyWorkerImpl(
         """Return the model configuration as a dictionary."""
         return cast(dict[str, Any], self.model.config)
 
+    def _refit_state_dict(self) -> dict[str, torch.Tensor]:
+        """Model state dict, gated on carrying only transferable names.
+
+        Both refit seams start here -- the streamed tensors and the metadata
+        map -- so trainer-only state is refused once, on every transport, before
+        any of them moves a byte.
+        """
+        state_dict = self.model.state_dict()
+        check_refit_names(state_dict.keys())
+        return state_dict
+
     @torch.no_grad()
     def _iter_refit_state_dict(self) -> Iterable[tuple[str, torch.Tensor]]:
         """Named tensors streamed during refit.
@@ -1845,13 +1860,23 @@ class DTensorPolicyWorkerImpl(
         iterate. The v2 worker overrides this to expand native GroupedExperts
         params into per-expert HF-named tensors (EP-layout reshard).
         """
-        return self.model.state_dict().items()
+        return self._refit_state_dict().items()
 
     def prepare_refit_info(self, state_dict_info: Optional[dict[str, Any]] = None) -> Optional[dict[str, Any]]:
-        """Prepare state dict metadata for weight refitting."""
+        """Prepare state dict metadata for weight refitting.
+
+        The declared dtype comes from ``refit_tensor_dtype``, the same function
+        the transports stream with: the IPC receiver sizes its slice of the
+        packed buffer from this map, so a name declared at one width and sent at
+        another is read at the wrong offset.
+        """
+        state_dict = self._refit_state_dict()
         result: dict[str, Any] = {}
-        for name, tensor in self.model.state_dict().items():
-            result[name] = (tensor.shape, self.dtype)
+        for name, tensor in state_dict.items():
+            result[name] = (
+                tensor.shape,
+                refit_tensor_dtype(name, tensor, self.dtype),
+            )
         return result
 
     @torch.no_grad()
@@ -1905,7 +1930,8 @@ class DTensorPolicyWorkerImpl(
             for name, tensor in self._iter_refit_state_dict():
                 if isinstance(tensor, DTensor):
                     tensor = tensor.full_tensor()
-                yield name, tensor.to(self.dtype, non_blocking=True)
+                dtype = refit_tensor_dtype(name, tensor, self.dtype)
+                yield name, tensor.to(dtype, non_blocking=True)
 
         try:
             stream_weights_via_ipc_zmq_impl(
@@ -1966,13 +1992,16 @@ class DTensorPolicyWorkerImpl(
             )
             self.model = self.move_to_cuda(self.model)
 
-        def _dtensor_post_iter_func(tensor, dtype):
+        def _dtensor_post_iter_func(name, tensor, default_dtype):
             if isinstance(tensor, DTensor):
                 tensor = tensor.full_tensor()
+            dtype = refit_tensor_dtype(name, tensor, default_dtype)
             tensor = tensor.to(dtype, non_blocking=True)
             return tensor
 
-        dtensor_post_iter_func = lambda x: _dtensor_post_iter_func(x[1], self.dtype)
+        dtensor_post_iter_func = lambda x: _dtensor_post_iter_func(
+            x[0], x[1], self.dtype
+        )
 
         packed_broadcast_producer(
             iterator=iter(self._iter_refit_state_dict()),
@@ -2015,7 +2044,8 @@ class DTensorPolicyWorkerImpl(
             for name, tensor in self._iter_refit_state_dict():
                 if isinstance(tensor, DTensor):
                     tensor = tensor.full_tensor()
-                yield name, tensor.to(self.dtype, non_blocking=True)
+                dtype = refit_tensor_dtype(name, tensor, self.dtype)
+                yield name, tensor.to(dtype, non_blocking=True)
 
         try:
             stream_weights_via_http_impl(

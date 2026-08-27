@@ -21,6 +21,8 @@ from __future__ import annotations
 
 from typing import Callable, Iterable, Iterator, TypeVar
 
+import torch
+
 # Native fused-expert param suffix -> HF per-expert projection name. The SwiGLU
 # convention matches Mixtral / Qwen3-MoE: w1=gate (silu), w3=up (multiply),
 # w2=down (output).
@@ -88,3 +90,62 @@ def iter_expanded_refit_tensors(
                 yield expand_grouped_expert_key(name, i), full[i]  # type: ignore[index]
         else:
             yield name, tensor
+
+
+# Router state the inference engine holds in fp32 regardless of the model dtype.
+# The aux-loss-free correction bias is added to the router scores before top-k
+# and steps by the load-balance coefficient (order 1e-3) per update, so casting
+# it to a bf16 refit dtype quantizes it at roughly one step and the rollout
+# engine can rank experts differently from the trainer that produced it. vLLM
+# creates it as an fp32 nn.Parameter on every noaux_tc model and narrows it only
+# on the ROCm AITER path (deepseek_v2.py:317, :395).
+_FP32_REFIT_SUFFIXES: frozenset[str] = frozenset({"e_score_correction_bias"})
+
+# Trainer-side router state with no inference-side counterpart. dockyard's
+# MoEBlock registers expert_bias_E when load_balance_coeff is set; vLLM's
+# Qwen3-MoE router -- the family apply_moe_surgery supports -- carries no
+# correction-bias parameter at all, and AutoWeightsLoader raises on a name it
+# cannot place (model_executor/models/utils.py:395).
+_UNTRANSFERABLE_REFIT_SUFFIXES: dict[str, str] = {
+    "expert_bias_E": (
+        "policy.dtensor_cfg.moe_parallelizer.load_balance_coeff is set, which "
+        "registers an aux-loss-free routing bias on every MoEBlock. The "
+        "inference engine has no parameter to receive it: vLLM's Qwen3-MoE "
+        "router carries no correction bias, so refit would abort inside vLLM's "
+        "weight loader -- and dropping the key instead would let the rollout "
+        "engine route without the bias the trainer routes with, which is the "
+        "train/generation divergence the bias itself is meant to avoid. Set "
+        "load_balance_coeff to null for runs that refit a generation backend."
+    ),
+}
+
+
+def refit_tensor_dtype(
+    name: str, tensor: torch.Tensor, default_dtype: torch.dtype
+) -> torch.dtype:
+    """Dtype to stream ``name`` in: ``default_dtype``, except fp32 router state.
+
+    The single place the refit dtype is decided. Both the tensor-streaming
+    transports and the ``prepare_refit_info`` metadata maps read it, because the
+    IPC receiver slices its buffer using that metadata -- a name streamed at one
+    width and declared at another is read at the wrong offset, not merely at the
+    wrong precision.
+    """
+    if tensor.dtype != torch.float32:
+        return default_dtype
+    if name.rsplit(".", 1)[-1] in _FP32_REFIT_SUFFIXES:
+        return tensor.dtype
+    return default_dtype
+
+
+def check_refit_names(names: Iterable[str]) -> None:
+    """Refuse a refit stream carrying trainer-only state, naming the config key.
+
+    Called where the refit metadata is prepared, so an unsupported combination
+    fails before the first rollout rather than inside the inference engine's
+    weight loader after one.
+    """
+    for name in names:
+        reason = _UNTRANSFERABLE_REFIT_SUFFIXES.get(name.rsplit(".", 1)[-1])
+        if reason is not None:
+            raise ValueError(f"refit cannot transfer {name!r}: {reason}")

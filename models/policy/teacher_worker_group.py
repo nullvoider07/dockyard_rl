@@ -84,6 +84,37 @@ def create_teacher_configs_from_opd_config(
     return configs
 
 
+def disable_student_only_features(cfg: dict[str, Any], *, alias: str) -> None:
+    """Clear student-only features from a teacher's copy of the policy config.
+
+    A teacher config is a deep copy of the student's, so every student-side
+    feature arrives switched on. A frozen teacher trains nothing, refits
+    nothing and adds no parameters, so each of these is at best inert on it --
+    and ``router_replay`` is not inert: the teacher's worker still runs
+    ``validate_router_replay_config``, which refuses a model with no MoEBlock,
+    so a dense teacher under an MoE student fails at startup naming a key the
+    operator set for the student. Replay has nothing to bind there in any case:
+    it re-applies a rollout's recorded routing to a second forward over the
+    same tokens, and the teacher scores the student's trajectory from a batch
+    that carries no ``routed_experts`` column.
+
+    Mutates ``cfg`` in place. Keys absent from the config are left absent
+    rather than introduced.
+    """
+    if "peft" in cfg:
+        cfg["peft"]["enabled"] = False
+    if "draft" in cfg:
+        cfg["draft"]["enabled"] = False
+    if isinstance(cfg.get("router_replay"), dict):
+        cfg["router_replay"]["enabled"] = False
+    if cfg.get("quant_cfg") is not None:
+        warnings.warn(
+            f"Teacher '{alias}': quantization is not supported for "
+            "teachers; running the teacher unquantized (ignoring quant_cfg)."
+        )
+        cfg["quant_cfg"] = None
+
+
 class TeacherWorkerGroup:
     """Inference-only DTensor Policy for a single teacher model.
 
@@ -120,16 +151,7 @@ class TeacherWorkerGroup:
 
         if "precision" in cfg:
             cfg["precision"] = teacher_cfg.precision
-        if "peft" in cfg:
-            cfg["peft"]["enabled"] = False
-        if "draft" in cfg:
-            cfg["draft"]["enabled"] = False
-        if cfg.get("quant_cfg") is not None:
-            warnings.warn(
-                f"Teacher '{self.alias}': quantization is not supported for "
-                "teachers; running the teacher unquantized (ignoring quant_cfg)."
-            )
-            cfg["quant_cfg"] = None
+        disable_student_only_features(cfg, alias=self.alias)
 
         tp = teacher_cfg.tensor_parallel_size
         cp = teacher_cfg.context_parallel_size

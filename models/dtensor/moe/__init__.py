@@ -42,10 +42,12 @@ from dockyard_rl.models.dtensor.moe.parallelize_moe import (
     parallelize_router_gate,
 )
 from dockyard_rl.models.dtensor.moe.refit import (
+    check_refit_names,
     expand_grouped_expert_info,
     expand_grouped_expert_key,
     is_grouped_expert_key,
     iter_expanded_refit_tensors,
+    refit_tensor_dtype,
 )
 from dockyard_rl.models.dtensor.moe.sharding import (
     num_local_experts,
@@ -99,6 +101,8 @@ __all__ = [
     "expand_grouped_expert_key",
     "is_grouped_expert_key",
     "iter_expanded_refit_tensors",
+    "check_refit_names",
+    "refit_tensor_dtype",
     "build_token_dispatcher",
     "read_num_routed_experts",
     "resolve_moe_parallelizer",

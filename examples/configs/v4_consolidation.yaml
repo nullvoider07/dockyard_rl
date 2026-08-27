@@ -202,7 +202,10 @@ policy:
     moe_parallelizer:
       token_dispatcher: local        # 'local' (ep=1) | 'alltoall' (ep>1; HV-10, not yet built)
       grouped_gemm: true             # routed experts via torch._grouped_mm (only true supported)
-      load_balance_coeff: null       # aux-loss-free routing-bias step size (DeepSeek 2408.15664); null = off
+      # Aux-loss-free routing-bias step size (DeepSeek 2408.15664); null = off.
+      # Refit refuses a non-null value: the bias it registers has no parameter
+      # to land in on the inference side, so a run that refits must leave it null.
+      load_balance_coeff: null
     custom_parallel_plan: null
     automodel_kwargs: {}
     lora_cfg:
