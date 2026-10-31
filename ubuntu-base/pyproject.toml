@@ -40,7 +40,7 @@ dependencies = [
     "torch==2.13.0",
     "torchvision==0.28.0",
     "torchaudio==2.11.0",
-    "vllm==0.27.1"
+    "vllm==0.32.0"
 ]
 
 # Fetch PyTorch from the cu130 wheel index — matches the cuda13.2 image base and
